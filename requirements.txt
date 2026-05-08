@@ -1,7 +1,6 @@
 numpy
 CoolProp
 numba
-line_profiler
 sympy
-scipy
+line_profiler
 plotly

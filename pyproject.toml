@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydrogen"
+version = "0.1.0"
+description = "Symbolic DAE/ODE solver for fluid-system dynamics."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "CoolProp",
+    "numba",
+    "sympy",
+    "line_profiler",
+    "plotly",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["hydrogen*"]
+exclude = ["examples*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
