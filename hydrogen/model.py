@@ -16,33 +16,72 @@ Time stepping uses Crank-Nicolson on every `DifferentialVariable`.
 
 from __future__ import annotations
 
+import gc
 import time
 
 import line_profiler
 import numpy as np
 import sympy as sp
 
-from .numerics import fast_error_norm, fast_linear_solve, lambdify_compat
+from .caching import (
+    lambda_cache_default_dir,
+    lambda_cache_key,
+    load_lambdified_source,
+    save_lambdified_source,
+)
+from .numerics import fast_error_norm, fast_linear_solve, fast_sparse_solve, lambdify_compat
 
 
 class Model:
+    # Shared symbols used by every Model/Variable instance.  Previously each
+    # `Variable.__init__` re-allocated a fresh triple, which for a system with
+    # thousands of variables was thousands of unused sympy `Symbol` objects on
+    # the heap.  Sympy's `Symbol` cache makes these structurally identical, but
+    # holding distinct Python objects per variable still wastes memory.
+    t_symbols = [
+        sp.symbols('t', real=True),
+        sp.symbols('t_prev', real=True),
+        sp.symbols('dt', real=True),
+    ]
+
     def __init__(self):
         self.can_evaluate = True
         self.components = {}
-        self.t_symbols = [
-            sp.symbols('t', real=True),
-            sp.symbols('t_prev', real=True),
-            sp.symbols('dt', real=True),
-        ]
+        # Variable-pair connections registered by `declare_equations` via
+        # `add_connection`.  These are short-circuited at instantiate time
+        # (union-find) instead of being threaded through the symbolic
+        # trivial-equation reducer, which is much faster for large systems
+        # where the bulk of the trivial equations are connection equalities.
+        self.connections = []
         self.t_values = [0.0, 0.0, 0.0]
         self.declare_components()
-        self.raw_vars_references, self.raw_param_references = self.get_vars_references()
+        # Lazy: only `instantiate()` actually needs the flattened
+        # vars/params reference lists, so we build them once at the top
+        # level instead of having every nested `Model.__init__` walk its
+        # own subtree (which made the old code O(depth^2) over the tree).
+        self._raw_refs_cache = None
         self.record = {
             'time': [],
             'state': [],
-            'vars_names': [v.name for v in self.raw_vars_references],
+            'vars_names': [],
             'subs': [],
         }
+
+    @property
+    def raw_vars_references(self):
+        cache = getattr(self, "_raw_refs_cache", None)
+        if cache is None:
+            cache = self.get_vars_references()
+            self._raw_refs_cache = cache
+        return cache[0]
+
+    @property
+    def raw_param_references(self):
+        cache = getattr(self, "_raw_refs_cache", None)
+        if cache is None:
+            cache = self.get_vars_references()
+            self._raw_refs_cache = cache
+        return cache[1]
 
     # --- composition / declaration ----------------------------------------------------
 
@@ -66,6 +105,39 @@ class Model:
     def declare_equations(self):
         """Override to return a list of sympy expressions, each implicitly == 0."""
         return []
+
+    def add_connection(self, var_a, var_b):
+        """Declare that two `Variable`s must always hold the same value.
+
+        This is a hint to `instantiate()` that lets the framework collapse the
+        two variables into one via union-find, BEFORE the symbolic-equation
+        machinery runs.  Functionally equivalent to returning `var_a.symbol -
+        var_b.symbol` from `declare_equations()`, but much cheaper at scale:
+          * no sympy `Add` is built per connection,
+          * the connection never enters the equation list,
+          * the trivial-equation reducer doesn't have to discover it.
+
+        Use it for any "same physical port wired together" relationships
+        (pipe-to-pipe segment continuity, splitter outlet -> child inlet,
+        etc.).  Use the regular `declare_equations` return value for any
+        constraint that is genuinely non-trivial.
+        """
+        self.connections.append((var_a, var_b))
+
+    def collect_connections(self):
+        """Recursively gather every `(var_a, var_b)` connection registered in
+        the tree.  Mirror of `collect_equations` but for connections only.
+
+        IMPORTANT: connections are declared *inside* `declare_equations`
+        (because that's where the user has access to sub-components), so
+        callers MUST call `collect_equations` first to flush them onto each
+        component's `connections` list.
+        """
+        conns = list(self.connections)
+        for c in self.components.values():
+            if isinstance(c, Model) and c.is_composite():
+                conns.extend(c.collect_connections())
+        return conns
 
     def is_composite(self):
         for c in self.components.values():
@@ -160,122 +232,201 @@ class Model:
 
     # --- trivial-equation reduction ---------------------------------------------------
 
+    @staticmethod
+    def _classify_linear(eq):
+        """Try to express `eq` as `c0 + sum(ci * vi) == 0` where every `vi` is a
+        sympy Symbol and every coefficient is a Number.
+
+        Returns `(const_term, {symbol: coeff})` if successful, otherwise `None`.
+
+        Implemented as a recursive structural walk over `Add`/`Mul`/`Symbol`/`Number`
+        nodes -- crucially this never builds a `Poly` (which is the slow operation
+        the previous `is_polynomial()`/`as_poly().degree()` path was triggering on
+        every equation, including the many CoolProp-laden ones that are obviously
+        non-linear).
+        """
+        if isinstance(eq, sp.Symbol):
+            return sp.S.Zero, {eq: sp.S.One}
+        if eq.is_Number:
+            return eq, {}
+        if eq.is_Mul:
+            coeff = sp.S.One
+            sym = None
+            for arg in eq.args:
+                if arg.is_Number:
+                    coeff = coeff * arg
+                elif isinstance(arg, sp.Symbol):
+                    if sym is not None:
+                        return None  # x*y -> not linear
+                    sym = arg
+                else:
+                    return None
+            if sym is None:
+                return coeff, {}
+            return sp.S.Zero, {sym: coeff}
+        if eq.is_Add:
+            const = sp.S.Zero
+            coeffs = {}
+            for term in eq.args:
+                sub = Model._classify_linear(term)
+                if sub is None:
+                    return None
+                c, syms = sub
+                const = const + c
+                for s, sc in syms.items():
+                    if s in coeffs:
+                        coeffs[s] = coeffs[s] + sc
+                    else:
+                        coeffs[s] = sc
+            return const, coeffs
+        return None
+
+    @staticmethod
+    def _close_substitutions(substitutions):
+        """Resolve chains in `substitutions` so each value only references symbols
+        that are NOT themselves keys. O(|subs| * average expression size) using a
+        memoised DFS, instead of the previous O(|subs|^2) fixed-point iteration.
+
+        Cycles (which would indicate an inconsistent system) raise `ValueError`.
+        """
+        keys = set(substitutions.keys())
+        cache = {}
+        visiting = set()
+
+        def resolve(k):
+            if k in cache:
+                return cache[k]
+            if k in visiting:
+                raise ValueError(f"Cycle in trivial-equation substitutions involving {k}")
+            visiting.add(k)
+            v = substitutions[k]
+            deps = v.free_symbols & keys
+            if deps:
+                v = v.xreplace({d: resolve(d) for d in deps})
+            visiting.discard(k)
+            cache[k] = v
+            return v
+
+        for k in list(substitutions.keys()):
+            substitutions[k] = resolve(k)
+        return substitutions
+
     @line_profiler.profile
     def remove_trivial_equations(self, equations, var_symbols):
-        """
-        Process equations to remove trivial ones (e.g., x - y = 0 or x - 5 = 0) and apply substitutions.
-        Returns reduced equations, updated variable symbols, and substitutions.
+        """Eliminate trivially-linear equations (`a*x + b*y + c == 0` with `a,b,c`
+        constants and `x,y` symbols) without invoking `sp.solve`/`sp.Poly`.
+
+        Strategy:
+          1. Walk every equation once. Use `_classify_linear` to detect those that
+             are linear in their free symbols. For each, pick one surviving free
+             Variable to eliminate and store the substitution (current side and the
+             mirrored prev-step side).
+          2. Close the substitution dict via memoised DFS so each value only
+             references surviving symbols.
+          3. Apply the closed substitutions to every kept equation once.
+
+        This avoids the previous code's two big costs:
+          * `sp.Poly` / `sp.solve` per equation (replaced by a structural walk),
+          * an O(|subs|^2) fixed-point xreplace loop to flatten substitution chains
+            (replaced by an O(|subs| * expr_size) DFS).
         """
         substitutions = {}
         new_eqs = []
         removed_vars = set()
+        kept_indices = []  # for progress logging only
 
         var_symbols_list = list(var_symbols)
-        # Surviving-symbol set (incl. params + t) and the strictly-Variable set. We only
-        # ever eliminate a symbol that (a) currently survives and (b) is a true Variable.
-        # Eliminating a Parameter or `t`/`dt` would shrink `all_improved_symbols` while
-        # `values` keeps its original size, causing a positional-arg mismatch downstream.
         var_set = set(var_symbols_list)
         raw_var_set = set(self.raw_var_symbols)
-
-        # Map each current-variable symbol to its previous-step counterpart so we can
-        # mirror any substitution we make on the "current" side onto the "previous" side
-        # (e.g. der_y = -y  =>  der_y_prev = -y_prev). Built once, reused per equation.
         current_to_prev = {var.symbol: var.prev_symbol for var in self.raw_vars_references}
 
-        # Step 1: Identify and solve trivial equations, applying substitutions immediately
-        keep_eq = False
-        print("Identifying trivial equations")
-        for eq in equations:
-            eq_substituted = eq
+        print("Identifying trivial equations (structural)")
+        for idx, eq in enumerate(equations):
+            classified = Model._classify_linear(eq)
+            if classified is None:
+                new_eqs.append(eq)
+                continue
 
-            vars_in_eq = eq_substituted.free_symbols
-            if len(vars_in_eq) == 2:
-                if eq_substituted.is_polynomial() and eq_substituted.as_poly().degree() == 1:
-                    eq_substituted = eq_substituted.xreplace(substitutions)
-                    # Only eliminate a free Variable: if e.g. one side is a Parameter,
-                    # we must solve for the Variable. If neither symbol is a current
-                    # surviving Variable (both are params, or one was already removed),
-                    # we can't safely eliminate anything; keep the equation.
-                    candidates = sorted(
-                        [
-                            s for s in vars_in_eq
-                            if s in raw_var_set and s in var_set and s not in removed_vars
-                        ],
-                        key=str,
-                    )
-                    if not candidates:
-                        keep_eq = True
-                        if keep_eq:
-                            new_eqs.append(eq_substituted)
-                        continue
-                    var1 = candidates[0]
-                    try:
-                        sol = sp.solve(eq_substituted, var1)
-                        if sol:
-                            substitutions[var1] = sol[0]
-                            removed_vars.add(var1)
+            c0, coeffs = classified
+            # drop zero coefficients (e.g. `x - x` style cancellations)
+            coeffs = {s: c for s, c in coeffs.items() if c != 0}
+            # Match the previous reducer's semantics: only act on 2-symbol equations
+            # (`a*x + b*y + c == 0`).  Single-symbol equations (`a*x + c == 0`, which
+            # would fully fix `x` to a constant) are deliberately left in the system
+            # so downstream code that expects at least one surviving variable / row
+            # keeps working.
+            if len(coeffs) != 2:
+                new_eqs.append(eq)
+                continue
 
-                            # Mirror the substitution onto the prev_symbol layer. For ANY
-                            # solved RHS (a bare symbol like `y`, a negated symbol `-y`,
-                            # or a more general linear expression `2*y - z + 5`), the
-                            # equivalent constraint at the previous time step is obtained
-                            # by replacing every current-variable symbol with its
-                            # prev_symbol. xreplace handles all of those cases uniformly,
-                            # unlike a `var.symbol == sol[0]` lookup which silently
-                            # fails for non-Symbol RHSs.
-                            var1_prev_symbol = current_to_prev.get(var1)
-                            if var1_prev_symbol is not None:
-                                sol_0_prev = sol[0].xreplace(current_to_prev)
-                                substitutions[var1_prev_symbol] = sol_0_prev
-                                removed_vars.add(var1_prev_symbol)
-                            continue
-                        else:
-                            keep_eq = True
-                    except Exception:
-                        keep_eq = True
-                else:
-                    keep_eq = True
-            else:
-                keep_eq = True
-            if keep_eq:
-                new_eqs.append(eq_substituted)
+            # Only true Variables that are still surviving and not already eliminated
+            # this pass are eligible.
+            candidates = [
+                s for s in coeffs
+                if s in raw_var_set and s in var_set and s not in removed_vars
+            ]
+            if not candidates:
+                new_eqs.append(eq)
+                continue
 
-        # Step 2: Apply final substitutions to all remaining equations
-        print("Applying substitutions")
-        for k, sub in enumerate(substitutions.items()):
-            for i in range(len(new_eqs)):
-                new_eqs[i] = new_eqs[i].subs(*sub)
-            print(f"Applied {k+1}/{len(substitutions)} substitutions ({(k+1)/len(substitutions)*100:.2f}%)", end="\r")
-        if len(substitutions) == 0:
+            var1 = min(candidates, key=lambda s: s.name)  # deterministic
+            coeff1 = coeffs[var1]
+            # var1 = -(c0 + sum_{s != var1} c_s * s) / coeff1
+            rest = -c0
+            for s, c in coeffs.items():
+                if s is var1:
+                    continue
+                rest = rest - c * s
+            sol = rest / coeff1
+
+            substitutions[var1] = sol
+            removed_vars.add(var1)
+            kept_indices.append(idx)
+
+            var1_prev = current_to_prev.get(var1)
+            if var1_prev is not None:
+                sol_prev = sol.xreplace(current_to_prev) if sol.free_symbols else sol
+                substitutions[var1_prev] = sol_prev
+                removed_vars.add(var1_prev)
+
+        if substitutions:
+            print(f"Closing {len(substitutions)} substitutions")
+            Model._close_substitutions(substitutions)
+            print(f"Applying substitutions to {len(new_eqs)} equations")
+            new_eqs = [e.xreplace(substitutions) for e in new_eqs]
+        else:
             print("No substitutions applied")
-        print()
-        simplified_eqs = new_eqs
 
-        # Step 3: Resolve chains in substitutions so each RHS only references surviving
-        # symbols. Without this, an entry like {a: b} can become stale once b itself is
-        # eliminated by a later trivial equation. The downstream consumer (plot
-        # reconstruction) relies on every RHS being expressed in surviving symbols only.
-        for _ in range(len(substitutions) + 1):
-            changed = False
-            for k in list(substitutions.keys()):
-                new_v = substitutions[k].xreplace(substitutions)
-                if new_v != substitutions[k]:
-                    substitutions[k] = new_v
-                    changed = True
-            if not changed:
-                break
-
-        # Step 4: Update variable symbols (remove substituted variables)
         updated_var_symbols = [v for v in var_symbols_list if v not in removed_vars]
-
-        return simplified_eqs, updated_var_symbols, substitutions
+        return new_eqs, updated_var_symbols, substitutions
 
     # --- compilation ------------------------------------------------------------------
 
     @line_profiler.profile
-    def instantiate(self, cse=True, aditional_modules=[], max_remove_trival_passes=1):
+    def instantiate(self, cse=True, aditional_modules=None, max_remove_trival_passes=1,
+                    lambda_cache_dir=None):
+        if aditional_modules is None:
+            aditional_modules = []
         all_modules = ["numpy"] + aditional_modules
+
+        # Disk cache for the lambdified residual + Jacobian source.  When the
+        # same (geometry, medium, sympy version) has been compiled before, this
+        # turns the multi-second `lambdify` calls into a sub-second source-load.
+        # Pass `lambda_cache_dir=False` to disable; default uses ~/.cache/hydrogen.
+        if lambda_cache_dir is False:
+            self._lambda_cache_dir = None
+        elif lambda_cache_dir is None:
+            self._lambda_cache_dir = lambda_cache_default_dir()
+        else:
+            from pathlib import Path as _P
+            self._lambda_cache_dir = _P(lambda_cache_dir)
+        # Module signature for cache keying: function names brought in via the
+        # `modules` arg.  Each medium contributes a unique prefix so the key
+        # never collides across media.
+        self._lambda_modules_sig = []
+        for m in aditional_modules:
+            if isinstance(m, dict):
+                self._lambda_modules_sig.extend(m.keys())
 
         print("Instantiating model")
 
@@ -296,6 +447,74 @@ class Model:
         self.improved_equations = self.all_raw_equations
         self.all_improved_symbols = self.all_raw_symbols
         self.improve_subs = {}
+
+        # Step 10: short-circuit explicit `add_connection` pairs via union-find
+        # BEFORE the symbolic trivial-equation reducer runs.  Components that
+        # use `add_connection` (in-tree: StraightPipe, Splitter; example tree
+        # nodes: BranchNode, TreeSystem) thereby skip building the Add(symA,
+        # -symB) sympy expression entirely, and the reducer doesn't have to
+        # rediscover them.
+        connections = self.collect_connections()
+        if connections:
+            uf_start = time.time()
+            uf_parent = {}
+
+            def find(s):
+                parent = uf_parent.get(s, s)
+                if parent is s:
+                    return s
+                root = find(parent)
+                uf_parent[s] = root
+                return root
+
+            def union(a, b):
+                ra, rb = find(a), find(b)
+                if ra is rb:
+                    return
+                # deterministic: smaller symbol-name wins as representative
+                if rb.name < ra.name:
+                    ra, rb = rb, ra
+                uf_parent[rb] = ra
+
+            raw_var_set = set(self.raw_var_symbols)
+            deferred_eqs = []
+            for var_a, var_b in connections:
+                sa, sb = var_a.symbol, var_b.symbol
+                if sa is None or sb is None:
+                    continue
+                if sa not in raw_var_set or sb not in raw_var_set:
+                    # One side is a Parameter / t -- can't union with a non-Variable;
+                    # defer to the symbolic trivial reducer.
+                    deferred_eqs.append(sa - sb)
+                    continue
+                union(sa, sb)
+
+            current_to_prev = {var.symbol: var.prev_symbol for var in self.raw_vars_references}
+            connection_subs = {}
+            for s in list(uf_parent.keys()):
+                rep = find(s)
+                if rep is s:
+                    continue
+                connection_subs[s] = rep
+                ps = current_to_prev.get(s)
+                pr = current_to_prev.get(rep)
+                if ps is not None and pr is not None:
+                    connection_subs[ps] = pr
+
+            if connection_subs:
+                self.improved_equations = [
+                    eq.xreplace(connection_subs) for eq in self.improved_equations
+                ]
+                self.improve_subs.update(connection_subs)
+                removed = set(connection_subs.keys())
+                self.all_improved_symbols = [
+                    s for s in self.all_improved_symbols if s not in removed
+                ]
+            if deferred_eqs:
+                self.improved_equations = list(self.improved_equations) + deferred_eqs
+            print(f"add_connection short-circuited {len(connection_subs)} symbols "
+                  f"from {len(connections)} pairs ({len(deferred_eqs)} deferred) "
+                  f"in {time.time() - uf_start:.2f} s")
 
         if max_remove_trival_passes > 0:
             print("Removing trivial equations")
@@ -326,32 +545,235 @@ class Model:
         print(f"Remaining variables and equations: {self.n_v}")
         self.values = np.zeros(2 * self.n_v + self.n_p + self.n_t)
         self.delta_values = np.zeros(self.n_v)
-        self.improved_equations = sp.Matrix(self.improved_equations)
+        improved_equations_list = list(self.improved_equations)
+        self.improved_equations = sp.Matrix(improved_equations_list)
         self.all_improved_symbols_matrix = sp.Matrix(self.all_improved_symbols)
 
         print("Lambdifying improved equations")
         start_time = time.time()
-        self.lambdified_eqs = lambdify_compat(self.all_improved_symbols_matrix, self.improved_equations, modules=all_modules, cse=cse, docstring_limit=-1)
+        self.lambdified_eqs = self._lambdify_with_cache(
+            "residual", self.all_improved_symbols_matrix, self.improved_equations,
+            all_modules, cse,
+        )
         print(f"Equations lambdified in {time.time() - start_time} s")
 
+        # Sparse symbolic Jacobian: only differentiate every equation against
+        # the variables that actually appear in its `free_symbols` (instead of
+        # forming the full M*N dense Matrix and asking sympy to differentiate
+        # every entry).  For the pipe-tree topology the Jacobian is < 1% dense,
+        # so this is a huge cut in both symbolic-diff time and lambdify cost.
+        #
+        # Template caching (step 9): every equation produced by the same
+        # component kind (e.g. `TwoPortSegment.declare_equations`) has the same
+        # structural shape; the equations differ only in *which* symbols they
+        # are built from.  We normalise each equation to a placeholder template
+        # and cache `sp.diff(template, placeholder_k)` per template -- so a
+        # tree with 75 segments x 4 eqs ends up doing ~4 sympy diffs instead
+        # of ~300 diffs (each of which previously walked the full expression).
         start_time = time.time()
-        self.jacobian = self.improved_equations.jacobian(self.improved_vars)
-        print(f"Jacobian generated in {time.time() - start_time} s")
+        var_to_col = {v: j for j, v in enumerate(self.improved_vars)}
+        var_set = set(self.improved_vars)
+        sparse_rows = []
+        sparse_cols = []
+        sparse_exprs = []
+
+        # Build placeholder cache once and reuse across calls.
+        _ph_pool = []
+
+        def _placeholder(k):
+            while len(_ph_pool) <= k:
+                _ph_pool.append(sp.Symbol(f"_jac_ph_{len(_ph_pool)}", real=True))
+            return _ph_pool[k]
+
+        diff_template_cache = {}
+        diff_cache_hits = 0
+        diff_cache_misses = 0
+
+        for i, eq in enumerate(improved_equations_list):
+            # Sort by symbol name so the resulting sparse Jacobian's row/col
+            # ordering is deterministic across runs (hash randomisation
+            # otherwise reorders `eq.free_symbols & var_set` per process).
+            fs = sorted(eq.free_symbols & var_set, key=lambda s: s.name)
+            if not fs:
+                continue
+            # Normalise: walk in preorder, give each distinct Symbol a positional
+            # placeholder; record the order so we can map results back.
+            sym_order = []
+            sym_to_ph = {}
+            for atom in sp.preorder_traversal(eq):
+                if isinstance(atom, sp.Symbol) and atom not in sym_to_ph:
+                    ph = _placeholder(len(sym_to_ph))
+                    sym_to_ph[atom] = ph
+                    sym_order.append(atom)
+            template = eq.xreplace(sym_to_ph)
+
+            cached = diff_template_cache.get(template)
+            if cached is None:
+                diff_cache_misses += 1
+                cached = [
+                    sp.diff(template, _placeholder(k))
+                    for k in range(len(sym_order))
+                ]
+                diff_template_cache[template] = cached
+            else:
+                diff_cache_hits += 1
+
+            ph_to_sym = {sym_to_ph[s]: s for s in sym_order}
+            for v in fs:
+                k = sym_order.index(v)
+                d_template = cached[k]
+                if d_template == 0:
+                    continue
+                d = d_template.xreplace(ph_to_sym) if ph_to_sym else d_template
+                if d == 0:
+                    continue
+                sparse_rows.append(i)
+                sparse_cols.append(var_to_col[v])
+                sparse_exprs.append(d)
+        if diff_cache_hits + diff_cache_misses:
+            print(
+                f"Jacobian template cache: {diff_cache_hits} hits / "
+                f"{diff_cache_misses} misses "
+                f"({100.0 * diff_cache_hits / (diff_cache_hits + diff_cache_misses):.1f}%)"
+            )
+        self._jac_sparse_rows = np.asarray(sparse_rows, dtype=np.int64)
+        self._jac_sparse_cols = np.asarray(sparse_cols, dtype=np.int64)
+        self._jac_nnz = len(sparse_exprs)
+        print(f"Jacobian generated in {time.time() - start_time} s "
+              f"({self._jac_nnz} nonzeros, "
+              f"{100.0 * self._jac_nnz / max(1, self.n_v * len(improved_equations_list)):.2f}% dense)")
 
         start_time = time.time()
-        self.lambdified_jacobian = lambdify_compat(self.all_improved_symbols_matrix, self.jacobian, modules=all_modules, cse=cse, docstring_limit=-1)
+        # lambdify a flat column vector of nonzero entries; we'll scatter into
+        # the dense Jacobian at evaluation time.  Empty matrices break sympy's
+        # lambdify in the same way the dense path did, so guard against that.
+        if self._jac_nnz > 0:
+            jac_vec = sp.Matrix(sparse_exprs)
+            self._lambdified_jac_values = self._lambdify_with_cache(
+                "jac_values", self.all_improved_symbols_matrix, jac_vec,
+                all_modules, cse,
+            )
+        else:
+            self._lambdified_jac_values = None
+        # For backwards compatibility, expose `lambdified_jacobian` as a
+        # callable that returns a dense (n_eq x n_v) matrix.
+        n_eq = len(improved_equations_list)
+
+        def _eval_jacobian_dense(*args):
+            J = np.zeros((n_eq, self.n_v))
+            if self._lambdified_jac_values is None:
+                return J
+            vals = np.asarray(self._lambdified_jac_values(*args)).reshape(-1)
+            J[self._jac_sparse_rows, self._jac_sparse_cols] = vals
+            return J
+
+        self.lambdified_jacobian = _eval_jacobian_dense
+        # Drop the dense symbolic Jacobian -- nothing reads it after this point
+        # and it's by far the largest sympy object we'd otherwise keep alive.
+        self.jacobian = None
         print(f"Jacobian lambdified in {time.time() - start_time} s")
 
         self.active_vars_references = [var for var in self.raw_vars_references if var.symbol in self.improved_vars]
 
-        # Build a function that, given the current improved-state vector, returns the FULL
-        # set of original variables in `raw_vars_references` order. Surviving variables map
-        # to themselves; eliminated ones are rebuilt from their stored substitution
-        # expressions, which by now reference only surviving symbols.
-        raw_var_exprs = [self.improve_subs.get(var.symbol, var.symbol) for var in self.raw_vars_references]
-        self.raw_vars_matrix = sp.Matrix(raw_var_exprs) if raw_var_exprs else sp.Matrix([0])
-        self.lambdified_raw_vars = lambdify_compat(self.all_improved_symbols_matrix, self.raw_vars_matrix, modules=all_modules, cse=cse, docstring_limit=-1)
+        # The "raw vars reconstructor" maps the improved state vector to the FULL
+        # set of original variables (in `raw_vars_references` order).  For most
+        # variables this is just an index permutation; only the ones that were
+        # eliminated during trivial-equation removal need a substitution expr.
+        # We split into a cheap numpy gather (`_raw_passthrough_*`) plus a
+        # lambdified tail (`_lambdified_raw_subs`) that's built lazily on first
+        # use -- for runs that never call `record_state`/plot, this saves both a
+        # full lambdify and the closure RAM that comes with it.
+        improved_index = {s: i for i, s in enumerate(self.improved_vars)}
+        passthrough_dst = []
+        passthrough_src = []
+        sub_dst = []
+        sub_exprs = []
+        for dst, var in enumerate(self.raw_vars_references):
+            sub = self.improve_subs.get(var.symbol)
+            if sub is None and var.symbol in improved_index:
+                passthrough_dst.append(dst)
+                passthrough_src.append(improved_index[var.symbol])
+            else:
+                sub_dst.append(dst)
+                sub_exprs.append(sub if sub is not None else var.symbol)
+        self._raw_passthrough_dst = np.asarray(passthrough_dst, dtype=np.int64)
+        self._raw_passthrough_src = np.asarray(passthrough_src, dtype=np.int64)
+        self._raw_sub_dst = np.asarray(sub_dst, dtype=np.int64)
+        self._raw_sub_exprs = sub_exprs  # lambdified lazily
+        self._raw_total = len(self.raw_vars_references)
+        self._raw_modules = all_modules
+        self._raw_cse = cse
+        self._lambdified_raw_subs = None  # set by `_get_lambdified_raw_subs`
+        # Keep just the symbol matrix needed for the lazy raw-vars compile.
+        # The huge `improved_equations` Matrix can still be released below.
+        self._raw_symbols_matrix = self.all_improved_symbols_matrix
         self.record['subs'] = self.improve_subs
+
+        # Once everything that downstream code reads is captured in lambdified
+        # closures, the raw sympy AST can be released.  These objects (the
+        # equation list, the M*N improved-equations Matrix, the improved-vars
+        # list, the substitution dict) are by far the biggest chunks of Python
+        # heap left over from instantiation.  We deliberately keep references
+        # that are still consulted at runtime (`improved_vars` -> n_v ordering,
+        # `all_improved_symbols` -> nothing reads it post-instantiate but we
+        # zero it explicitly).
+        gc_targets = [
+            "all_raw_equations", "improved_equations",
+            "all_raw_symbols", "all_improved_symbols",
+            "all_improved_symbols_matrix",
+            "raw_var_symbols", "raw_prev_var_symbols", "raw_param_symbols",
+        ]
+        for attr in gc_targets:
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        # Keep `improve_subs` only for cases that actually need plotting/lazy
+        # raw-vars compilation.  When `_raw_sub_exprs` is empty there is
+        # nothing left to look up, so the dict can be dropped entirely.
+        if not self._raw_sub_exprs:
+            self.improve_subs = {}
+            self.record['subs'] = {}
+        gc.collect()
+
+    def _lambdify_with_cache(self, label, args, expr, modules, cse):
+        """Disk-cached `lambdify_compat`.
+
+        On a cache hit the expensive sympy code-gen + Python parse is skipped
+        and we just `exec` the previously-saved source string into a namespace
+        seeded with `numpy` + the medium's `Symbolic_property` callables (whose
+        names are baked into the saved source).
+        """
+        cache_dir = self._lambda_cache_dir
+        if cache_dir is not None:
+            key = lambda_cache_key(args, expr, self._lambda_modules_sig, cse)
+            namespace = self._build_lambdify_namespace(modules)
+            cached = load_lambdified_source(cache_dir, key, namespace)
+            if cached is not None:
+                print(f"  [lambda-cache HIT  for {label}: {key[:8]}]")
+                return cached
+        func = lambdify_compat(args, expr, modules=modules, cse=cse, docstring_limit=-1)
+        if cache_dir is not None:
+            save_lambdified_source(cache_dir, key, func, self._lambda_modules_sig)
+            print(f"  [lambda-cache MISS for {label}: {key[:8]} (saved)]")
+        return func
+
+    @staticmethod
+    def _build_lambdify_namespace(modules):
+        """Approximation of the namespace `sp.lambdify` builds internally, used
+        when re-exec'ing a cached source string.  We import numpy + each entry
+        from the user-supplied `modules` list so the source's bare function
+        names (e.g. `Air_rho_ph`) resolve at exec time.
+        """
+        import builtins as _b
+        ns = {"__builtins__": _b.__dict__}
+        try:
+            import numpy as _np
+            ns.update({k: getattr(_np, k) for k in dir(_np) if not k.startswith("_")})
+        except ImportError:
+            pass
+        for m in modules:
+            if isinstance(m, dict):
+                ns.update(m)
+        return ns
 
     # --- state vector accessors -------------------------------------------------------
 
@@ -423,9 +845,40 @@ class Model:
     def eval_delta(self):
         self.delta_values[:] = self.lambdified_delta(*self.values)
 
+    def _get_lambdified_raw_subs(self):
+        """Lambdify (and cache) the substituted-variable tail of the raw-vars
+        reconstructor on first use.  Variables that survived trivial-equation
+        removal are scattered with a numpy gather instead -- no lambdify
+        needed for them.
+        """
+        if self._lambdified_raw_subs is not None or len(self._raw_sub_exprs) == 0:
+            return self._lambdified_raw_subs
+        sub_matrix = sp.Matrix(self._raw_sub_exprs)
+        self._lambdified_raw_subs = lambdify_compat(
+            self._raw_symbols_matrix, sub_matrix,
+            modules=self._raw_modules, cse=self._raw_cse, docstring_limit=-1,
+        )
+        return self._lambdified_raw_subs
+
+    def lambdified_raw_vars(self, *values):
+        """Materialise the full original-variable vector from the improved-state values.
+
+        Kept callable-shaped so external code that previously did
+        `model.lambdified_raw_vars(*model.values)` keeps working.
+        """
+        full_state = np.empty(self._raw_total)
+        if self._raw_passthrough_dst.size:
+            improved_vec = np.asarray(values[: self.n_v])
+            full_state[self._raw_passthrough_dst] = improved_vec[self._raw_passthrough_src]
+        if self._raw_sub_dst.size:
+            f = self._get_lambdified_raw_subs()
+            sub_vals = np.asarray(f(*values)).reshape(-1)
+            full_state[self._raw_sub_dst] = sub_vals
+        return full_state
+
     def record_state(self):
         self.record['time'].append(self.get_t_value())
-        full_state = np.asarray(self.lambdified_raw_vars(*self.values)).reshape(-1)
+        full_state = self.lambdified_raw_vars(*self.values)
         self.record['state'].append(full_state)
 
     def next_step(self):
@@ -457,6 +910,25 @@ class Model:
         self.next_step()
 
     def update_delta(self):
+        # Sparse path: when we built a sparse-Jacobian evaluator at instantiate
+        # time, evaluate just the nonzero values and solve via scipy's SuperLU.
+        # This avoids both materialising a dense (n_eq x n_v) matrix and the
+        # cubic-time dense LU.  For the pipe-tree case the Jacobian is < 7%
+        # dense, so SuperLU wins both in time and memory.
+        if getattr(self, "_lambdified_jac_values", None) is not None:
+            self.set_vars_values(self.get_vars_values())  # no-op write to refresh `values`
+            jac_vals = np.asarray(self._lambdified_jac_values(*self.values)).reshape(-1)
+            r = np.asarray(self.eval_residuals(self.get_vars_values())).reshape(-1)
+            n_eq = self.delta_values.size  # square system: n_eq == n_v
+            self.delta_values[:] = fast_sparse_solve(
+                jac_vals,
+                self._jac_sparse_rows,
+                self._jac_sparse_cols,
+                (n_eq, self.n_v),
+                r,
+            )
+            return
+        # Dense fallback for legacy / non-sparse codepaths.
         j = self.eval_jacobian(self.get_vars_values())
         r = self.eval_residuals(self.get_vars_values())
         self.delta_values[:] = fast_linear_solve(j, r).T[0]
@@ -555,11 +1027,6 @@ class Variable(Model):
         self.can_evaluate = False
         self.is_connected = False
         self.connected_to = []
-        self.t_symbols = [
-            sp.symbols('t', real=True),
-            sp.symbols('t_prev', real=True),
-            sp.symbols('dt', real=True),
-        ]
 
     @property
     def symbol(self):

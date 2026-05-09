@@ -16,24 +16,27 @@ Build a balanced tree:
                 v                      v
        [leaf pipe] -> PressureOutlet  [leaf pipe] -> PressureOutlet   <- depth N
 
-Tree topology knobs (top of file):
+Tree topology knobs (passed to `TreeSystem.__init__`):
 
-    N - depth: number of `Splitter` levels between source and leaves
-    K - branching: number of children per `Splitter`
-    M - segments per `StraightPipe`
-    L - common pipe length [m]
+    medium    - a `CoolPropMedium` instance (Air, Hydrogen, Water, ...)
+    N         - depth: number of `Splitter` levels between source and leaves
+    K         - branching: number of children per `Splitter`
+    M         - segments per `StraightPipe`
+    L         - common pipe length [m]
+    D         - pipe diameter [m]
+    epsilon   - pipe roughness [m]
+    P_source, T_source, P_outlet, T_outlet - boundary state
 
 Counts (closed-form):
     pipes      = (K^(N+1) - 1) / (K - 1)
     splitters  = (K^N - 1) / (K - 1)
     outlets    = K^N
 
-In the symmetric case (every pipe geometrically identical, every leaf at the same
-ambient pressure) the steady state has all pipes at the same depth carrying the
-same velocity, with the velocity dropping by a factor `K` at each splitter (since
-each branch has the same area as the inlet, total outlet area = K * A_in, so
-mass conservation forces `w_out = w_in / K`). This script prints the velocity at
-every pipe inlet so you can see the splits explicitly.
+Multiple `TreeSystem` instances can co-exist in one Python process -- each gets
+its own `CoolPropMedium` (so the symbolic property functions are *unique
+sympy.Function classes* per instance, see `medium.py`) and its own lambdified
+residual + Jacobian. `main()` below builds and solves an Air tree and a
+Hydrogen tree side by side to demonstrate.
 """
 
 from __future__ import annotations
@@ -57,21 +60,6 @@ from hydrogen import (  # noqa: E402
     StraightPipe,
     plot_results,
 )
-
-# --- tree geometry --------------------------------------------------------------------
-N = 2          # depth (number of splitter levels)
-K = 2          # branches per splitter
-M = 2          # segments per pipe
-L = 0.5        # m, common pipe length
-D = 0.005      # m, common pipe diameter
-EPSILON = 1e-6
-A_PIPE = np.pi * D ** 2 / 4
-
-# --- boundary conditions --------------------------------------------------------------
-P_SOURCE = 1.2e5      # Pa  (1.2 bar -> ~20 kPa drop across the whole tree)
-T_SOURCE = 293.15     # K
-P_OUTLET = 1.013e5    # Pa  (atmospheric)
-T_OUTLET = 293.15     # K
 
 
 class BranchNode(Model):
@@ -97,13 +85,14 @@ class BranchNode(Model):
         super().__init__()
 
     def declare_components(self):
+        A_pipe = np.pi * self.D ** 2 / 4
         self.add_component('pipe', StraightPipe(
             self.medium, self.D, self.L, self.epsilon,
             z_in=0.0, z_out=0.0, n_segments=self.M, adiabatic=True,
         ))
         if self.depth_remaining > 0:
             self.add_component('splitter', Splitter(
-                self.medium, self.K, A_in=A_PIPE, A_out=A_PIPE,
+                self.medium, self.K, A_in=A_pipe, A_out=A_pipe,
             ))
             for k in range(self.K):
                 self.add_component(f'child_{k}', BranchNode(
@@ -115,62 +104,114 @@ class BranchNode(Model):
             self.add_component('outlet', PressureOutlet(self.medium, self.p_outlet, self.T_outlet))
 
     def declare_equations(self):
-        eqs = []
+        # All inter-component wiring here is variable-equality -- route via the
+        # union-find `add_connection` API so the trivial-equation reducer never
+        # sees these as sympy expressions.
         if self.depth_remaining > 0:
-            # pipe -> splitter
-            eqs.append(self['pipe']['p_out'].symbol - self['splitter']['p_in'].symbol)
-            eqs.append(self['pipe']['h_out'].symbol - self['splitter']['h_in'].symbol)
-            eqs.append(self['pipe']['w_out'].symbol - self['splitter']['w_in'].symbol)
-            # splitter -> K children
+            for io in ('p', 'h', 'w'):
+                self.add_connection(self['pipe'][f'{io}_out'], self['splitter'][f'{io}_in'])
             for k in range(self.K):
-                eqs.append(self['splitter'][f'p_out_{k}'].symbol - self[f'child_{k}']['pipe']['p_in'].symbol)
-                eqs.append(self['splitter'][f'h_out_{k}'].symbol - self[f'child_{k}']['pipe']['h_in'].symbol)
-                eqs.append(self['splitter'][f'w_out_{k}'].symbol - self[f'child_{k}']['pipe']['w_in'].symbol)
+                for io in ('p', 'h', 'w'):
+                    self.add_connection(
+                        self['splitter'][f'{io}_out_{k}'],
+                        self[f'child_{k}']['pipe'][f'{io}_in'],
+                    )
         else:
-            # leaf pipe -> outlet
-            eqs.append(self['pipe']['p_out'].symbol - self['outlet']['p_in'].symbol)
-            eqs.append(self['pipe']['h_out'].symbol - self['outlet']['h_in'].symbol)
-            eqs.append(self['pipe']['w_out'].symbol - self['outlet']['w_in'].symbol)
-        return eqs
+            for io in ('p', 'h', 'w'):
+                self.add_connection(self['pipe'][f'{io}_out'], self['outlet'][f'{io}_in'])
+        return []
 
 
 class TreeSystem(Model):
-    """`PressureSource -> BranchNode(depth=N)` rooted at the source."""
+    """`PressureSource -> BranchNode(depth=N)` rooted at the source.
+
+    All inputs (medium, geometry, boundary state) are constructor arguments, so
+    multiple `TreeSystem`s with different fluids or sizes can co-exist in the same
+    Python process and be `instantiate()`-d / `initialise()`-d independently.
+    """
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        *,
+        N: int = 2,
+        K: int = 2,
+        M: int = 2,
+        L: float = 0.5,
+        D: float = 0.005,
+        epsilon: float = 1e-6,
+        P_source: float = 1.2e5,
+        T_source: float = 293.15,
+        P_outlet: float = 1.013e5,
+        T_outlet: float = 293.15,
+    ):
+        self.medium = medium
+        self.N = N
+        self.K = K
+        self.M = M
+        self.L = L
+        self.D = D
+        self.epsilon = epsilon
+        self.P_source = P_source
+        self.T_source = T_source
+        self.P_outlet = P_outlet
+        self.T_outlet = T_outlet
+        super().__init__()
+
+    @property
+    def A_pipe(self):
+        return np.pi * self.D ** 2 / 4
+
+    def topology(self):
+        if self.K == 1:
+            n_pipes, n_splitters = self.N + 1, self.N
+        else:
+            n_pipes = (self.K ** (self.N + 1) - 1) // (self.K - 1)
+            n_splitters = (self.K ** self.N - 1) // (self.K - 1)
+        n_outlets = self.K ** self.N
+        return n_pipes, n_splitters, n_outlets
 
     def declare_components(self):
-        self.medium = CoolPropMedium("Air", disable_warnings=True)
-        self.add_component('source', PressureSource(self.medium, P_SOURCE, T_SOURCE))
+        self.add_component('source', PressureSource(self.medium, self.P_source, self.T_source))
         self.add_component('tree', BranchNode(
-            self.medium, N, K, M, L, D, EPSILON, P_OUTLET, T_OUTLET,
+            self.medium, self.N, self.K, self.M, self.L, self.D, self.epsilon,
+            self.P_outlet, self.T_outlet,
         ))
 
     def declare_equations(self):
-        return [
-            self['source']['p_out'].symbol - self['tree']['pipe']['p_in'].symbol,
-            self['source']['h_out'].symbol - self['tree']['pipe']['h_in'].symbol,
-            self['source']['w_out'].symbol - self['tree']['pipe']['w_in'].symbol,
-        ]
+        for io in ('p', 'h', 'w'):
+            self.add_connection(self['source'][f'{io}_out'], self['tree']['pipe'][f'{io}_in'])
+        return []
 
 
-def _topology_summary():
-    if K == 1:
-        n_pipes, n_splitters = N + 1, N
-    else:
-        n_pipes = (K ** (N + 1) - 1) // (K - 1)
-        n_splitters = (K ** N - 1) // (K - 1)
-    n_outlets = K ** N
-    return n_pipes, n_splitters, n_outlets
+def _bernoulli_warm_start(system: TreeSystem, fraction: float = 0.4) -> float:
+    """Heuristic warm-start velocity that scales with the fluid -- the Newton solve
+    needs `w` non-zero so the energy-equation row (`h_total = h + w**2/2`) is well
+    conditioned, and the right magnitude depends on the medium's density at the
+    source state. Lower density (e.g. hydrogen) -> much higher velocity for the
+    same pressure drop. We pick a conservative fraction of the inviscid Bernoulli
+    estimate so over-shoot doesn't push CoolProp into negative enthalpies on the
+    first Newton step."""
+    h_total = float(system.medium.eval_h_pT(system.P_source, system.T_source))
+    rho = float(system.medium.eval_rho_ph(system.P_source, h_total))
+    delta_p = max(system.P_source - system.P_outlet, 1.0)
+    return float(fraction * np.sqrt(2.0 * delta_p / rho))
 
 
-def main():
-    n_pipes, n_splitters, n_outlets = _topology_summary()
-    print(f"Tree topology: N={N}, K={K}, M={M}, L={L} m, D={D * 1000:.1f} mm")
+def run_tree(label: str, system: TreeSystem, *, warm_w: float | None = None,
+             output_html: str | None = None) -> None:
+    """Instantiate, initialise, time-step, and report on `system`. The label is
+    used as a prefix for the printed report and the default plot filename."""
+
+    n_pipes, n_splitters, n_outlets = system.topology()
+    print(f"=========================  {label}  =========================")
+    print(f"medium = {system.medium.medium}")
+    print(f"Tree topology: N={system.N}, K={system.K}, M={system.M}, "
+          f"L={system.L} m, D={system.D * 1000:.1f} mm")
     print(f"  -> {n_pipes} pipes, {n_splitters} splitters, {n_outlets} leaf outlets")
-    print(f"  -> source = {P_SOURCE / 1e5:.3f} bar, leaf outlets = {P_OUTLET / 1e5:.3f} bar")
+    print(f"  -> source = {system.P_source / 1e5:.3f} bar @ {system.T_source:.2f} K, "
+          f"leaf outlets = {system.P_outlet / 1e5:.3f} bar")
     print()
-
-    print("Building model...")
-    system = TreeSystem()
 
     print("Instantiating (symbolic Jacobian + lambdify can take a while)...")
     t0 = time.time()
@@ -180,28 +221,19 @@ def main():
     )
     print(f"  instantiate: {time.time() - t0:.2f} s")
 
-    # Warm-start velocities to keep Newton well-conditioned at t = 0. The default
-    # initial guess is `w ~ 0.1 m/s`, but with a meaningful pressure differential
-    # the energy equation `h_total = h_out + w**2/2` has a near-singular row at
-    # small `w` (its w-derivative is `-w`), so Newton overshoots into negative
-    # enthalpies and crashes CoolProp. A moderate uniform warm start works.
-    WARM_W = 15.0
+    if warm_w is None:
+        warm_w = _bernoulli_warm_start(system)
+    print(f"Warm-starting velocity unknowns to {warm_w:.2f} m/s")
     for var in system.active_vars_references:
         full = getattr(var, 'full_name', '')
-        if (
-            full.endswith('.w_in')
-            or full.endswith('.w_out')
-            or '.w_out_' in full
-        ):
-            var.value = WARM_W
+        if full.endswith('.w_in') or full.endswith('.w_out') or '.w_out_' in full:
+            var.value = warm_w
 
     print("Initialising (damped Newton)...")
     t0 = time.time()
     system.initialise(relaxation=0.5, max_iter=400)
     print(f"  initialise:  {time.time() - t0:.2f} s")
 
-    # A handful of time steps verifies the solution actually is steady; with
-    # adiabatic, no-storage components, no transient should remain after t = 0.
     print("Time-stepping (5 steps of 0.05 s) to verify steady state...")
     t0 = time.time()
     for _ in range(5):
@@ -219,49 +251,85 @@ def main():
         return state[-1, idx]
 
     # Group every pipe by depth (number of `.child_*.` segments in the dotted path).
-    pipe_inlet_w_names = sorted(n for n in names if n.endswith('.pipe.w_in'))
-    pipes_by_depth: dict[int, list[tuple[str, float]]] = {}
-    for n in pipe_inlet_w_names:
+    pipe_outlet_names = sorted(n for n in names if n.endswith('.pipe.w_out'))
+    pipes_by_depth: dict[int, list[tuple[str, float, float, float]]] = {}
+    for n in pipe_outlet_names:
         depth = n.count('.child_')
+        prefix = n[: -len('w_out')]
         w_val = state[-1, names.index(n)]
-        pipes_by_depth.setdefault(depth, []).append((n, w_val))
+        p_val = state[-1, names.index(prefix + 'p_out')]
+        h_val = state[-1, names.index(prefix + 'h_out')]
+        pipes_by_depth.setdefault(depth, []).append((n, w_val, p_val, h_val))
 
     print()
-    print("=== Steady-state velocities at every pipe inlet ===")
+    print(f"=== Steady-state pipe-outlet conditions ({label}) ===")
     for depth in sorted(pipes_by_depth):
-        ws = [w for _, w in pipes_by_depth[depth]]
-        print(f"  depth {depth} ({len(ws):2d} pipe{'s' if len(ws) != 1 else ''}): "
-              f"w_in min={min(ws):.4f}, max={max(ws):.4f} m/s, "
-              f"spread={(max(ws) - min(ws)):.2e}")
-    print("(spread should be ~0 for a balanced symmetric tree -- rounding only.)")
+        rows = pipes_by_depth[depth]
+        ws = [w for _, w, _, _ in rows]
+        ps = [p for _, _, p, _ in rows]
+        print(
+            f"  depth {depth} ({len(rows):2d} pipe{'s' if len(rows) != 1 else ''}):"
+            f"  w_out min={min(ws):9.4f} max={max(ws):9.4f} m/s,"
+            f"  p_out min={min(ps) / 1e5:6.4f} max={max(ps) / 1e5:6.4f} bar,"
+            f"  spread(w)={(max(ws) - min(ws)):.2e}"
+        )
 
-    # Mass-conservation check at every level: sum of mass flows on a level = source mass flow.
     rho_source = float(system.medium.eval_rho_ph(
         float(trace_last('.source.p_out')),
         float(trace_last('.source.h_out')),
     ))
-    m_dot_source = trace_last('.source.w_out') * A_PIPE * rho_source
+    m_dot_source = trace_last('.source.w_out') * system.A_pipe * rho_source
     print()
-    print(f"Source mass flow: {m_dot_source * 1000:.4f} g/s")
-    print()
-    print("Mass conservation across each level (sum_branches w * A * rho):")
+    print(f"Mass conservation ({label}):")
+    print(f"  source m_dot                        = {m_dot_source * 1000:9.4f} g/s")
     for depth in sorted(pipes_by_depth):
-        n_pipes_d = K ** depth
-        # Velocity is uniform per level by symmetry, so use the mean.
-        w_mean = float(np.mean([w for _, w in pipes_by_depth[depth]]))
-        # Density also depends on local p, h; for symmetry we sample one pipe at this depth.
-        sample_name = pipes_by_depth[depth][0][0]
-        prefix = sample_name[: -len('w_in')]
-        p_sample = float(trace_last(prefix + 'p_in'))
-        h_sample = float(trace_last(prefix + 'h_in'))
-        rho_sample = float(system.medium.eval_rho_ph(p_sample, h_sample))
-        m_dot_d = n_pipes_d * w_mean * A_PIPE * rho_sample
-        print(f"  depth {depth}: {n_pipes_d:3d} x w*A*rho = {m_dot_d * 1000:.4f} g/s  "
-              f"(deficit vs source: {(m_dot_d - m_dot_source) * 1000:+.2e} g/s)")
+        rows = pipes_by_depth[depth]
+        m_dot_d = 0.0
+        for _, w, p, h in rows:
+            rho = float(system.medium.eval_rho_ph(float(p), float(h)))
+            m_dot_d += rho * float(w) * system.A_pipe
+        rel_err = abs(m_dot_d - m_dot_source) / max(abs(m_dot_source), 1e-30)
+        print(
+            f"  depth {depth} ({system.K ** depth:2d} pipes) m_dot   = {m_dot_d * 1000:9.4f} g/s"
+            f"  (rel err vs source: {rel_err:.2e})"
+        )
 
-    plot_results(system.record, "pipe_tree.html", show=False)
+    if output_html is None:
+        # Sanitise label into a usable filename.
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in label.lower())
+        output_html = f"pipe_tree_{safe}.html"
+    plot_results(system.record, output_html, show=False)
     print()
-    print("Plot written to pipe_tree.html")
+    print(f"Plot written to {output_html}")
+    print()
+
+
+def main():
+    # Two trees with different media -- same geometry, same boundary pressures, but
+    # very different densities (hydrogen ~14x less dense than air at the same state),
+    # which is what drives the large difference in steady-state velocities.
+    N = 2
+    K = 2
+    M = 2
+    L = 0.5
+    D = 0.005
+    air_tree = TreeSystem(
+        CoolPropMedium("Air", disable_warnings=True),
+        N=N, K=K, M=M, L=L, D=D,
+    )
+    hydrogen_tree = TreeSystem(
+        CoolPropMedium("Hydrogen", disable_warnings=True),
+        N=N, K=K, M=M, L=L, D=D,
+    )
+
+    carbon_dioxide_tree = TreeSystem(
+        CoolPropMedium("CarbonDioxide", disable_warnings=True),
+        N=N, K=K, M=M, L=L, D=D,
+    )
+
+    run_tree("Air", air_tree)
+    run_tree("Hydrogen", hydrogen_tree)
+    run_tree("CarbonDioxide", carbon_dioxide_tree)
 
 
 if __name__ == "__main__":

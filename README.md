@@ -61,7 +61,7 @@ print(f"max |y − cos(ωt)| = {np.max(np.abs(y - np.cos(2*np.pi*t))):.3e}")
 
 ## Examples
 
-Two ready-to-run demos in `examples/`. Both write an interactive Plotly HTML next to the script.
+Three ready-to-run demos in `examples/`. Each writes an interactive Plotly HTML next to the script.
 
 ### `examples/run_system.py` — heated mass-flow loop
 
@@ -88,6 +88,29 @@ Vessel pressure has closed 100.0% of the gap to source pressure.
 python examples/fill_vessel.py
 ```
 
+### `examples/pipe_tree.py` — recursive K-ary tree of pipes
+
+Build a balanced flow tree from four knobs at the top of the file: depth `N`, branching factor `K`, segments per pipe `M`, common pipe length `L`. The example wires:
+
+```
+PressureSource  →  root pipe  →  Splitter  →  K * (pipe → Splitter → ...)  →  pipe → PressureOutlet
+```
+
+so the whole system has `(K^(N+1) - 1) / (K - 1)` pipes, `(K^N - 1) / (K - 1)` splitters and `K^N` leaves. Defaults `N=2, K=2, M=2`, giving 7 pipes / 3 splitters / 4 leaves. Output prints the steady-state outlet conditions at every depth and confirms the symmetry of the solution:
+
+```
+=== Steady-state pipe-outlet conditions, by tree depth ===
+  depth 0 ( 1 pipe ):  w_out min= 81.59 max= 81.59 m/s,  p_out min=1.0525 max=1.0525 bar,  spread(w)=0.00e+00
+  depth 1 ( 2 pipes):  w_out min= 41.40 max= 41.40 m/s,  p_out min=1.0221 max=1.0221 bar,  spread(w)=0.00e+00
+  depth 2 ( 4 pipes):  w_out min= 20.79 max= 20.79 m/s,  p_out min=1.0130 max=1.0130 bar,  spread(w)=0.00e+00
+```
+
+Velocity drops by ~`K` at each splitter (mass conservation with constant area), and `spread(w) = 0` confirms every pipe at the same depth carries the same flow.
+
+```bash
+python examples/pipe_tree.py
+```
+
 ## Component catalogue (`hydrogen.components`)
 
 | Class | Boundary type | Use it when… |
@@ -95,7 +118,9 @@ python examples/fill_vessel.py
 | `AmbientInlet` | Mass-flow-imposed inlet at ambient `(p, T)` | You know `ṁ` upstream |
 | `AmbientOutlet` | Mass-flow-imposed outlet at ambient `(p, T)` | You know `ṁ` downstream |
 | `PressureSource` | Stagnation reservoir at fixed `(p, T)` | You want flow driven by Δp; system finds `ṁ` |
+| `PressureOutlet` | Fixed-pressure outlet (forces `p_in = p_ambient`) | Pressure-imposed termination; system finds `ṁ` |
 | `PressureVessel` | Lumped rigid-volume vessel filling through one port | Charging / discharging dynamics |
+| `Splitter` | Ideal `K`-way junction (no Δp, no Δh) | Building flow trees / manifolds |
 | `TwoPortSegment` | One discrete CV of a 1D duct (continuity + momentum + energy) | Building block; rarely used directly |
 | `StraightPipe` | Pipe split into N `TwoPortSegment`s with Churchill friction + smoothed Nusselt | Plumbing two boundaries together |
 | `AdiabaticPump` | Adiabatic-pump segment with a custom `f = a_iz / (Re·Dh)` friction model | Idealised pump element |
@@ -155,7 +180,8 @@ hydrogen/
 │   └── test_models.py       # IntegrationTest + small ODE fixtures
 ├── examples/
 │   ├── run_system.py        # heated-pipe flow demo
-│   └── fill_vessel.py       # pressure-driven charging demo
+│   ├── fill_vessel.py       # pressure-driven charging demo
+│   └── pipe_tree.py         # recursive K-ary pipe tree (Splitter + PressureOutlet)
 ├── tests/                   # pytest suite (caching, integrator, naming, vessel, …)
 ├── pyproject.toml
 └── solver.py                # back-compat shim for the original single-file layout

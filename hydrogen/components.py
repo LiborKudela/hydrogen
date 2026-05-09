@@ -265,10 +265,12 @@ class Splitter(Model):
             self.add_component(f'w_out_{k}', Variable(1.0, "m/s"))
 
     def declare_equations(self):
-        eqs = []
+        # The K pressure and K enthalpy equalities are pure variable-equality
+        # constraints -- short-circuit them via union-find instead of building
+        # 2K sympy Add nodes for the trivial reducer to chew through later.
         for k in range(self.K):
-            eqs.append(self[f'p_out_{k}'].symbol - self['p_in'].symbol)
-            eqs.append(self[f'h_out_{k}'].symbol - self['h_in'].symbol)
+            self.add_connection(self[f'p_out_{k}'], self['p_in'])
+            self.add_connection(self[f'h_out_{k}'], self['h_in'])
 
         rho_in = self.medium.rho_ph(self['p_in'].symbol, self['h_in'].symbol)
         m_in = rho_in * self['w_in'].symbol * self['A_in'].symbol
@@ -276,8 +278,7 @@ class Splitter(Model):
         for k in range(self.K):
             rho_k = self.medium.rho_ph(self[f'p_out_{k}'].symbol, self[f'h_out_{k}'].symbol)
             m_out = m_out + rho_k * self[f'w_out_{k}'].symbol * self['A_out'].symbol
-        eqs.append(m_in - m_out)
-        return eqs
+        return [m_in - m_out]
 
 
 class PressureSource(Model):
@@ -502,18 +503,26 @@ class StraightPipe(Model):
             )
 
     def declare_equations(self):
-        res = []
-        res.append(self['p_in'].symbol - self['pipe_segment_0']['p_in'].symbol)
-        res.append(self['h_in'].symbol - self['pipe_segment_0']['h_out'].symbol)
-        res.append(self['w_in'].symbol - self['pipe_segment_0']['w_out'].symbol)
-
+        # Wire the pipe-level (p, h, w)_in/out ports to the matching ports of the
+        # first / last segment. Using `segment_0.{h,w}_in` (rather than `_out`) is
+        # important: the inlet ports of the pipe must represent the axial station at
+        # the actual pipe entrance, otherwise upstream connections (a `Splitter`,
+        # another pipe, a vessel) compare values across mismatched stations and the
+        # resulting "mass conservation" through the wiring is off by the small
+        # frictional density change across the first segment.
+        #
+        # All of these are pure variable-equality constraints, so we route them
+        # through `add_connection` (union-find at instantiate time) rather than
+        # building a sympy `Add` per pair and letting the trivial reducer eat them.
+        for port in ('p_in', 'h_in', 'w_in'):
+            self.add_connection(self[port], self['pipe_segment_0'][port])
         for i in range(self.n_segments - 1):
-            res.append(self[f'pipe_segment_{i}']['p_out'].symbol - self[f'pipe_segment_{i+1}']['p_in'].symbol)
-            res.append(self[f'pipe_segment_{i}']['h_out'].symbol - self[f'pipe_segment_{i+1}']['h_in'].symbol)
-            res.append(self[f'pipe_segment_{i}']['w_out'].symbol - self[f'pipe_segment_{i+1}']['w_in'].symbol)
-
-        res.append(self['p_out'].symbol - self[f'pipe_segment_{self.n_segments-1}']['p_out'].symbol)
-        res.append(self['h_out'].symbol - self[f'pipe_segment_{self.n_segments-1}']['h_out'].symbol)
-        res.append(self['w_out'].symbol - self[f'pipe_segment_{self.n_segments-1}']['w_out'].symbol)
-
-        return res
+            for io in ('p', 'h', 'w'):
+                self.add_connection(
+                    self[f'pipe_segment_{i}'][f'{io}_out'],
+                    self[f'pipe_segment_{i + 1}'][f'{io}_in'],
+                )
+        last = f'pipe_segment_{self.n_segments - 1}'
+        for port in ('p_out', 'h_out', 'w_out'):
+            self.add_connection(self[port], self[last][port])
+        return []
