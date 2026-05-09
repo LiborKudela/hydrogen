@@ -16,10 +16,13 @@ Time stepping uses Crank-Nicolson on every `DifferentialVariable`.
 
 from __future__ import annotations
 
+import contextvars
 import gc
+import os
 import time
 
 import line_profiler
+import multiprocessing as _mp
 import numpy as np
 import sympy as sp
 
@@ -30,6 +33,87 @@ from .caching import (
     save_lambdified_source,
 )
 from .numerics import fast_error_norm, fast_linear_solve, fast_sparse_solve, lambdify_compat
+
+
+# Module-globals seeded by `_init_lambdify_worker` (only used in worker
+# processes spawned by the `multiprocessing.Pool` in `instantiate`).  We pass
+# state via globals (fork-inherited from the parent) instead of pickled task
+# arguments because:
+#
+#   - `Symbolic_property` (dynamically-built sympy `Function` subclasses for
+#     CoolProp callbacks) cannot be pickled (`attribute lookup … failed`).
+#     Templates and modules embed these, so they can never round-trip through
+#     `multiprocessing.Pool.map`'s queue.
+#   - With the `fork` start method the parent's globals (including these
+#     templates and `aditional_modules`) are already present in every worker
+#     via copy-on-write -- no pickling required.
+_WORKER_MODULES = None
+_WORKER_MODULES_SIG = None
+_WORKER_CACHE_DIR = None
+_WORKER_PAYLOADS = None  # list of (label, key, args_mat, block, cse), indexed by task
+
+
+# Step B's `declare_equations()` template cache (see `Model.collect_equations`).
+#
+# Scoped to ONE `Model.instantiate()` call via a `ContextVar` rather than a
+# class attribute, because the SAME component class (e.g. `StraightPipe`) can
+# legitimately produce DIFFERENT symbolic equations across instantiate calls
+# in the same process -- the medium-bound `Symbolic_property` Function classes
+# (`Air_rho_ph`, `Hydrogen_rho_ph`, ...) are baked into the cached eqs and
+# survive `xreplace` (which only renames Symbol atoms, not outer Function
+# nodes).  A class-level cache caused cross-medium contamination when
+# `pipe_tree.py` ran Air -> Hydrogen in the same process: Hydrogen's lambdified
+# source would emit `Air_rho_ph(...)` calls that didn't exist in Hydrogen's
+# module namespace, raising `NameError` at evaluation time.
+#
+# `instantiate()` sets a fresh dict on entry and tears it down on exit (in a
+# `try/finally`) so that any state -- known today or added later -- that
+# influences `declare_equations()` is naturally partitioned per call.
+# When the var is `None` (e.g. for direct `collect_equations()` calls outside
+# of `instantiate()`) the cache is silently disabled.
+_eq_cache_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "hydrogen_eq_cache", default=None
+)
+
+
+# Numpy doesn't ship a single-arg `Heaviside` (`np.heaviside` is
+# 2-arg: `heaviside(x, h0)`), so `sp.lambdify(..., modules=['numpy', ...])`
+# emits the bare name `Heaviside(x)` which then NameErrors at call time.
+# `Heaviside` shows up in the Jacobian of every `sp.Max`/`sp.Min` -- the
+# `StraightPipe` heat-transfer correlation uses both, so any non-adiabatic
+# pipe hits this.  Provide a single-arg shim with `H(0) = 0.5` (sympy's
+# default) so both fresh-lambdify and cached-source re-exec resolve it.
+def _heaviside_compat(x):
+    return np.heaviside(x, 0.5)
+
+
+_NUMPY_LAMBDIFY_COMPAT = {
+    "Heaviside": _heaviside_compat,
+}
+
+
+def _init_lambdify_worker(modules, modules_sig, cache_dir, payloads):
+    global _WORKER_MODULES, _WORKER_MODULES_SIG, _WORKER_CACHE_DIR, _WORKER_PAYLOADS
+    _WORKER_MODULES = modules
+    _WORKER_MODULES_SIG = modules_sig
+    _WORKER_CACHE_DIR = cache_dir
+    _WORKER_PAYLOADS = payloads
+
+
+def _lambdify_worker_task(task_idx):
+    """Worker entry: lambdify a single template, write the source to disk, return its key.
+
+    We deliberately do NOT return the lambdified function itself -- function
+    objects pickle poorly, and the parent re-loads from the on-disk cache anyway
+    (which is a one-time `exec` of stored Python source).  The args/expr live
+    in `_WORKER_PAYLOADS`, populated by the Pool initializer; `task_idx` indexes
+    into that list.
+    """
+    label, key, args, expr, cse = _WORKER_PAYLOADS[task_idx]
+    func = lambdify_compat(args, expr, modules=_WORKER_MODULES, cse=cse, docstring_limit=-1)
+    if _WORKER_CACHE_DIR is not None:
+        save_lambdified_source(_WORKER_CACHE_DIR, key, func, _WORKER_MODULES_SIG)
+    return task_idx, label, key
 
 
 class Model:
@@ -43,6 +127,21 @@ class Model:
         sp.symbols('t_prev', real=True),
         sp.symbols('dt', real=True),
     ]
+
+    # Step B: per-Model-subclass cache of the SYMBOLIC OUTPUT of
+    # `declare_equations()`.  After the first instance of a given subclass has
+    # run its `declare_equations`, we capture (template_eqs, sym_path_map),
+    # validate against the second instance to make sure the structure is
+    # genuinely shared, and from the third instance onward we skip the costly
+    # CoolProp-laden `Symbolic_property` builds entirely -- replaying the
+    # template via `xreplace(symbol_remap)`.
+    #
+    # The cache lives in `_eq_cache_var` (module-level `ContextVar`) and is
+    # scoped to ONE `instantiate()` call -- see the var's docstring for why
+    # a class-level cache caused cross-medium contamination.
+    #
+    # State machine per subclass: 'first' -> 'cached' (after one match) or
+    # 'no-cache' (any mismatch / has connections / has side effects).
 
     def __init__(self):
         self.can_evaluate = True
@@ -213,10 +312,107 @@ class Model:
             print("Symbols assigned")
             return vars, prev_vars, params, vars_map, params_map
 
+    def _build_sym_paths(self):
+        """Recursive `(path_tuple) -> Symbol` map for every Variable/Parameter
+        leaf reachable from this Model.  Used by the Step-B per-class equation
+        cache to remap a cached template's symbols onto a fresh instance's
+        symbols by structural path (e.g., `('pipe_segment_0', 'p_in')`).
+        """
+        out = {}
+        for name, c in self.components.items():
+            if isinstance(c, (Variable, Parameter)):
+                sym = getattr(c, 'symbol', None)
+                if sym is not None:
+                    out[(name,)] = sym
+                prev_sym = getattr(c, 'prev_symbol', None)
+                if prev_sym is not None:
+                    out[(name, '__prev__')] = prev_sym
+            elif isinstance(c, Model) and c.is_composite():
+                for sub_path, sym in c._build_sym_paths().items():
+                    out[(name,) + sub_path] = sym
+        return out
+
     @line_profiler.profile
     def collect_equations(self):
         eqs = []
-        eqs.extend(self.declare_equations())
+        cls = self.__class__
+        eq_cache = _eq_cache_var.get()
+        # `eq_cache is None` -> running outside `instantiate()` (e.g. via
+        # `get_current_system()` or a unit test).  Just rebuild equations
+        # every time; the cache exists purely as an `instantiate()` speed-up.
+        cache = eq_cache.get(cls) if eq_cache is not None else None
+
+        # Path A: third+ instance of a class whose template has been validated.
+        # Replay equations from cached template via a cheap path-based symbol
+        # remap + a single `xreplace` per equation -- much faster than calling
+        # `declare_equations()` again because it skips all the CoolProp-laden
+        # `Symbolic_property` instantiations and sympy `Add`/`Mul` building.
+        if cache is not None and cache.get('state') == 'cached':
+            sym_paths = self._build_sym_paths()
+            mapping = {}
+            ok = True
+            for first_sym, path in cache['sym_to_path'].items():
+                target = sym_paths.get(path)
+                if target is None:
+                    ok = False
+                    break
+                mapping[first_sym] = target
+            if ok:
+                eqs.extend(eq.xreplace(mapping) if eq.free_symbols else eq
+                           for eq in cache['eqs'])
+            else:
+                eqs.extend(self.declare_equations())
+        # Path B: first or second instance of this class -- run normally and
+        # either capture (first) or validate (second).  Classes that emit
+        # `add_connection` side effects are conservatively marked 'no-cache'
+        # because their `declare_equations` is already light (it just appends
+        # to `self.connections`); replaying them via path lookup turned out
+        # measurably slower than just re-calling `declare_equations`.
+        else:
+            n_conns_before = len(self.connections)
+            run_eqs = self.declare_equations()
+            has_new_conns = len(self.connections) > n_conns_before
+            if eq_cache is not None:
+                if cache is None:
+                    if has_new_conns:
+                        eq_cache[cls] = {'state': 'no-cache'}
+                    else:
+                        sym_paths = self._build_sym_paths()
+                        sym_to_path = {s: p for p, s in sym_paths.items()}
+                        used_syms = set()
+                        for eq in run_eqs:
+                            used_syms.update(eq.free_symbols)
+                        eq_cache[cls] = {
+                            'state': 'first',
+                            'eqs': run_eqs,
+                            'sym_to_path': {s: sym_to_path[s] for s in used_syms
+                                            if s in sym_to_path},
+                        }
+                elif cache['state'] == 'first':
+                    if has_new_conns:
+                        cache['state'] = 'no-cache'
+                    else:
+                        sym_paths = self._build_sym_paths()
+                        mapping = {}
+                        can_replay = True
+                        for first_sym, path in cache['sym_to_path'].items():
+                            target = sym_paths.get(path)
+                            if target is None:
+                                can_replay = False
+                                break
+                            mapping[first_sym] = target
+                        if can_replay:
+                            replayed = [eq.xreplace(mapping) if eq.free_symbols else eq
+                                        for eq in cache['eqs']]
+                            if (len(replayed) == len(run_eqs)
+                                    and all(a == b for a, b in zip(replayed, run_eqs))):
+                                cache['state'] = 'cached'
+                            else:
+                                cache['state'] = 'no-cache'
+                        else:
+                            cache['state'] = 'no-cache'
+            eqs.extend(run_eqs)
+
         for c in self.components.values():
             if c.is_composite():
                 eqs.extend(c.collect_equations())
@@ -392,8 +588,102 @@ class Model:
         if substitutions:
             print(f"Closing {len(substitutions)} substitutions")
             Model._close_substitutions(substitutions)
-            print(f"Applying substitutions to {len(new_eqs)} equations")
-            new_eqs = [e.xreplace(substitutions) for e in new_eqs]
+            sub_keys = set(substitutions.keys())
+
+            # Step A: cache the xreplace step by template.  A naive
+            # `[e.xreplace(substitutions) for e in new_eqs]` makes sympy walk
+            # the FULL tree of every survivor (~389 CoolProp-laden equations
+            # at N=4) just to discover that ~9 out of 10 of them never touch
+            # any symbol in `substitutions`.  Two stacked optimisations:
+            #
+            #   1. **Pre-filter:** equations whose `free_symbols` are disjoint
+            #      from `sub_keys` keep their identity -- no tree allocated.
+            #
+            #   2. **Per-template cache:** equations that DO touch a sub_key
+            #      are normalised to a `(structural_template, mask)` key
+            #      where `mask` is the tuple of placeholder positions whose
+            #      backing Symbol appears in `substitutions`.  Two equations
+            #      sharing the same `(template, mask)` produce structurally
+            #      identical xreplace results -- we compute the substituted
+            #      *template* once and re-bind placeholders -> actual symbols
+            #      per instance.  Combined with `_close_substitutions` having
+            #      already inlined chains, this turns the per-equation tree
+            #      walk into a per-template tree walk + a cheap re-bind.
+            _ph_pool_a = []
+
+            def _ph(k):
+                while len(_ph_pool_a) <= k:
+                    _ph_pool_a.append(sp.Symbol(f"_red_ph_{len(_ph_pool_a)}", real=True))
+                return _ph_pool_a[k]
+
+            template_subbed_cache = {}
+            n_skipped = 0
+            n_applied = 0
+            n_template_hit = 0
+            new_eqs_out = []
+            for e in new_eqs:
+                if not (e.free_symbols & sub_keys):
+                    new_eqs_out.append(e)
+                    n_skipped += 1
+                    continue
+                # Normalise this equation's symbols to placeholders, then
+                # mark which placeholder indices are being substituted AND
+                # the structural template of the substitution RHS.  Two
+                # instances share a cache slot iff they have the same
+                # equation template AND the same per-placeholder substitution
+                # RHS template (with all RHS-external symbols themselves
+                # placeholder-normalised in a per-equation-extension pool).
+                sym_order = []
+                sym_to_ph = {}
+                for atom in sp.preorder_traversal(e):
+                    if isinstance(atom, sp.Symbol) and atom not in sym_to_ph:
+                        sym_to_ph[atom] = _ph(len(sym_to_ph))
+                        sym_order.append(atom)
+                template_e = e.xreplace(sym_to_ph)
+
+                # Build the placeholder-space substitution dict for this
+                # instance, extending the placeholder pool as needed for any
+                # symbols present only on RHS values.
+                full_sym_to_ph = dict(sym_to_ph)
+                rhs_sym_orders = []
+                ph_subs_template = {}
+                rhs_templates_for_key = []
+                for k, sym in enumerate(sym_order):
+                    if sym not in substitutions:
+                        continue
+                    rhs = substitutions[sym]
+                    rhs_extra_order = []
+                    for rhs_atom in sp.preorder_traversal(rhs):
+                        if isinstance(rhs_atom, sp.Symbol) and rhs_atom not in full_sym_to_ph:
+                            full_sym_to_ph[rhs_atom] = _ph(len(full_sym_to_ph))
+                            rhs_extra_order.append(rhs_atom)
+                    rhs_template = rhs.xreplace(full_sym_to_ph) if rhs.free_symbols else rhs
+                    ph_subs_template[_ph(k)] = rhs_template
+                    rhs_sym_orders.append(rhs_extra_order)
+                    rhs_templates_for_key.append((k, rhs_template))
+
+                cache_key = (template_e, tuple(rhs_templates_for_key))
+                cached = template_subbed_cache.get(cache_key)
+                if cached is None:
+                    cached = template_e.xreplace(ph_subs_template)
+                    template_subbed_cache[cache_key] = cached
+                else:
+                    n_template_hit += 1
+
+                # Re-bind: the cached substituted template has placeholders
+                # `_red_ph_*` whose intended actual symbols are recorded in
+                # `full_sym_to_ph`.  Reverse the map and xreplace.
+                ph_to_sym = {ph: sym for sym, ph in full_sym_to_ph.items()}
+                new_eqs_out.append(cached.xreplace(ph_to_sym) if ph_to_sym else cached)
+                n_applied += 1
+
+            print(
+                f"Applying substitutions to {n_applied}/{len(new_eqs)} equations "
+                f"(skipped {n_skipped} disjoint, "
+                f"{n_template_hit} template-cache hits / "
+                f"{len(template_subbed_cache)} unique templates)"
+            )
+            new_eqs = new_eqs_out
         else:
             print("No substitutions applied")
 
@@ -405,9 +695,36 @@ class Model:
     @line_profiler.profile
     def instantiate(self, cse=True, aditional_modules=None, max_remove_trival_passes=1,
                     lambda_cache_dir=None):
+        # Step B's `declare_equations()` template cache is scoped to this single
+        # `instantiate()` call to avoid cross-call contamination (e.g. Air's
+        # `Air_rho_ph` Function nodes leaking into a subsequent Hydrogen
+        # instantiation).  Set a fresh dict on entry and reset on exit
+        # regardless of whether `instantiate()` returns or raises.
+        _eq_cache_token = _eq_cache_var.set({})
+        try:
+            return self._instantiate_impl(
+                cse=cse,
+                aditional_modules=aditional_modules,
+                max_remove_trival_passes=max_remove_trival_passes,
+                lambda_cache_dir=lambda_cache_dir,
+            )
+        finally:
+            _eq_cache_var.reset(_eq_cache_token)
+
+    @line_profiler.profile
+    def _instantiate_impl(self, cse=True, aditional_modules=None,
+                          max_remove_trival_passes=1, lambda_cache_dir=None):
         if aditional_modules is None:
             aditional_modules = []
-        all_modules = ["numpy"] + aditional_modules
+        # `_NUMPY_LAMBDIFY_COMPAT` patches sympy callables that `lambdify`
+        # doesn't know how to translate to numpy by default (e.g. `Heaviside`,
+        # which appears in the Jacobian of any `sp.Max`/`sp.Min`).  Inserted
+        # AFTER `'numpy'` so numpy's own names win, but BEFORE the medium
+        # modules so the compat dict is part of the runtime namespace used
+        # by both fresh-lambdify code-gen AND cached-source re-exec.  Kept
+        # out of `_lambda_modules_sig` (we only signature `aditional_modules`)
+        # so the cache key stays stable across versions of the compat dict.
+        all_modules = ["numpy", _NUMPY_LAMBDIFY_COMPAT] + aditional_modules
 
         # Disk cache for the lambdified residual + Jacobian source.  When the
         # same (geometry, medium, sympy version) has been compiled before, this
@@ -431,15 +748,23 @@ class Model:
         print("Instantiating model")
 
         start_time = time.time()
-        self.all_raw_equations, self.raw_var_symbols, self.raw_prev_var_symbols, self.raw_param_symbols = self.get_current_system()
+        _t0 = time.time()
+        vars, prev_vars, params, vars_map, params_map = self.assign_symbols(top_level=True)
+        _t_assign = time.time() - _t0
+        _t0 = time.time()
+        # `collect_equations` consults `_eq_cache_var` (set by `instantiate`)
+        # so that only the first 1-2 instances of each `Model` subclass build
+        # their CoolProp-laden symbolic equations from scratch; subsequent
+        # siblings replay via a path-based symbol remap + a single `xreplace`
+        # per eq.
+        self.all_raw_equations = self.collect_equations()
+        _t_collect = time.time() - _t0
+        self.raw_var_symbols, self.raw_prev_var_symbols, self.raw_param_symbols = vars, prev_vars, params
         self.all_raw_symbols = self.raw_var_symbols + self.raw_prev_var_symbols + self.raw_param_symbols + self.t_symbols
-        # `assign_symbols` (called by get_current_system) just stamped each leaf with a
-        # dotted hierarchical name like "System.ambient_inlet.p_out". Use those for
-        # plotting so legends are unambiguous; fall back to the leaf name if a Variable
-        # was somehow added without going through assign_symbols.
         self.record['vars_names'] = [getattr(v, 'full_name', v.name) for v in self.raw_vars_references]
         print(len(self.all_raw_symbols))
-        print(f"Current system collected in {time.time() - start_time} s")
+        print(f"Current system collected in {time.time() - start_time:.2f} s "
+              f"(assign_symbols={_t_assign:.2f}s, collect_equations={_t_collect:.2f}s)")
 
         start_time = time.time()
 
@@ -525,17 +850,48 @@ class Model:
             for i in range(max_remove_trival_passes):
                 print(f"Removing trivial pass {i+1}")
                 self.improved_equations, self.all_improved_symbols, pass_subs = self.remove_trivial_equations(self.improved_equations, self.all_improved_symbols)
-                # Accumulate substitutions across passes: push the new pass's subs through
-                # the RHS of previously stored ones so every entry stays expressed in terms
-                # of the latest-surviving symbols, then merge the new entries in.
-                for prev_key in list(self.improve_subs.keys()):
-                    self.improve_subs[prev_key] = self.improve_subs[prev_key].xreplace(pass_subs)
-                self.improve_subs.update(pass_subs)
+                # Accumulate substitutions across passes ONLY when this pass produced
+                # new substitutions: the inner xreplace below would otherwise be 1k+
+                # no-op `xreplace({})` calls (each one allocates / boxes / returns).
+                if pass_subs:
+                    # Push the new pass's subs through the RHS of previously stored
+                    # ones so every entry stays expressed in terms of the latest-
+                    # surviving symbols, then merge the new entries in.
+                    for prev_key in list(self.improve_subs.keys()):
+                        self.improve_subs[prev_key] = self.improve_subs[prev_key].xreplace(pass_subs)
+                    self.improve_subs.update(pass_subs)
+                # Step C early-exit BEFORE the next pass walks every equation again.
+                #
+                # The reducer is deterministic per equation, so the only way the
+                # next pass can find a NEW trivial equation is if this pass's
+                # `xreplace` mutated the surviving equations in a way that made
+                # an equation newly fall into the "linear, exactly 2 symbols"
+                # bucket.  That requires the substitution's RHS to be a `Number`
+                # (a constant) -- which collapses one of the symbols in any
+                # `c0 + c1*var + c2*x + c3*y` shape down so it becomes `c0' +
+                # c2*x + c3*y` (newly linear in two symbols).  RHSs that are
+                # `Symbol`s or compound expressions never collapse the symbol
+                # count of any equation -- they only rename / inflate it.
+                #
+                # So: if no substitution from this pass has a `Number` RHS,
+                # subsequent passes can't find anything new, and we can stop
+                # without paying their `_classify_linear` walk.  This is the
+                # common case for the pipe-tree topology where every reducer
+                # substitution is a `Mul`/`Add` of CoolProp / time-step terms.
                 new_size = len(self.improved_equations)
                 if new_size == curent_size:
                     break
-                curent_size = len(self.improved_equations)
-            self.improved_vars = [s for s in self.raw_var_symbols if s in self.all_improved_symbols]
+                if not pass_subs or not any(
+                    rhs.is_Number for rhs in pass_subs.values()
+                ):
+                    break
+                curent_size = new_size
+            # `s in self.all_improved_symbols` was an O(N) list-scan per probe;
+            # for N=4 this turned into ~1M sympy `Symbol.__eq__` calls and
+            # dominated the entire trivial-reducer block (~13 s out of ~13 s).
+            # Hoist to a hash-set membership test once.
+            improved_symbols_set = set(self.all_improved_symbols)
+            self.improved_vars = [s for s in self.raw_var_symbols if s in improved_symbols_set]
             stop_time = time.time()
             print(f"Removed equations and variables: {len(self.raw_var_symbols) - len(self.improved_vars)} in {stop_time - start_time} s")
 
@@ -619,27 +975,116 @@ class Model:
         plan_jac_rows = []   # equation row in the global residual
         plan_jac_cols = []   # variable column in the global jacobian
 
+        # ---- Step D: parallelise per-template lambdify across processes -----
+        # For COLD-CACHE runs the dominant cost in this section is the 8x
+        # `lambdify_compat` calls (~1 s each at N=4 -> ~9 s sequential).  They
+        # are completely independent (different templates, no shared sympy
+        # state -- sympy's caches are per-process and CoolProp callables are
+        # pure functions).  Run them in a fork-based `multiprocessing.Pool`
+        # so cold-cache instantiate scales with `cpu_count() / n_templates`.
+        #
+        # Pass 1 (sequential): cheap symbolic prep + cache lookup.
+        prep_per_template = []
+        cache_misses = []
         for template, instances in template_to_instances.items():
-            tid = len(template_lambdas)
+            tid = len(prep_per_template)
             n_ph = len(instances[0][1])
             placeholders = [_placeholder(k) for k in range(n_ph)]
-            # Block lambda: residual (row 0) + every placeholder derivative
-            # (rows 1..n_ph).  CSE across these outputs collapses shared
-            # subexpressions like `rho_ph(p_in, h_in)` -- which appears in
-            # both the residual and several of its derivatives.
             block = sp.Matrix(
                 [template] + [sp.diff(template, ph) for ph in placeholders]
             )
-            f = self._lambdify_with_cache(
-                f"template_{tid:02d}",
-                sp.Matrix(placeholders), block,
-                all_modules, cse,
+            args_mat = sp.Matrix(placeholders)
+            label = f"template_{tid:02d}"
+            cached_func = None
+            key = None
+            if self._lambda_cache_dir is not None:
+                key = lambda_cache_key(args_mat, block, self._lambda_modules_sig, cse)
+                namespace = self._build_lambdify_namespace(all_modules)
+                cached_func = load_lambdified_source(self._lambda_cache_dir, key, namespace)
+                if cached_func is not None:
+                    print(f"  [lambda-cache HIT  for {label}: {key[:8]}]")
+            prep_per_template.append({
+                "label": label, "tid": tid, "n_ph": n_ph,
+                "instances": instances, "template": template,
+                "args_mat": args_mat, "block": block, "key": key,
+                "cached_func": cached_func,
+            })
+            if cached_func is None:
+                cache_misses.append(prep_per_template[-1])
+
+        # Pass 2 (parallel where it pays off): lambdify + write-to-disk for
+        # each cache miss.  Falls back to a sequential loop when there's <2
+        # misses (pool startup wouldn't pay off) or when the user opted out
+        # via `HYDROGEN_PARALLEL_LAMBDIFY=0`.
+        worker_procs = int(os.environ.get(
+            "HYDROGEN_PARALLEL_LAMBDIFY",
+            str(min(len(cache_misses), max(1, (os.cpu_count() or 1))))
+        ))
+        if cache_misses and worker_procs > 1 and self._lambda_cache_dir is not None:
+            payloads = [
+                (p["label"], p["key"], p["args_mat"], p["block"], cse)
+                for p in cache_misses
+            ]
+            t_par = time.time()
+            ctx = _mp.get_context("fork")
+            pool = ctx.Pool(
+                processes=min(worker_procs, len(cache_misses)),
+                initializer=_init_lambdify_worker,
+                initargs=(all_modules, self._lambda_modules_sig,
+                          self._lambda_cache_dir, payloads),
             )
+            try:
+                # Pass only integer task indices through the queue -- the
+                # actual templates are inherited via fork in `_WORKER_PAYLOADS`.
+                completed = pool.map(_lambdify_worker_task, range(len(payloads)))
+            finally:
+                pool.close()
+                pool.join()
+            print(f"  [parallel lambdify of {len(cache_misses)} templates "
+                  f"on {min(worker_procs, len(cache_misses))} procs: "
+                  f"{time.time() - t_par:.2f} s]")
+            # Each worker wrote its lambda's source to the on-disk cache; load
+            # those back in the parent.  This trades a (free) cache-load for
+            # the impossibility of pickling the lambda function across procs.
+            namespace_for_load = self._build_lambdify_namespace(all_modules)
+            completed_keys = {label: key for _, label, key in completed}
+            for prep in cache_misses:
+                key = completed_keys.get(prep["label"], prep["key"])
+                fn = load_lambdified_source(self._lambda_cache_dir, key, namespace_for_load)
+                if fn is None:
+                    fn = lambdify_compat(
+                        prep["args_mat"], prep["block"],
+                        modules=all_modules, cse=cse, docstring_limit=-1,
+                    )
+                prep["cached_func"] = fn
+                print(f"  [lambda-cache MISS for {prep['label']}: {key[:8] if key else '????????'} (saved)]")
+        elif cache_misses:
+            # Sequential fallback.
+            for prep in cache_misses:
+                fn = lambdify_compat(
+                    prep["args_mat"], prep["block"],
+                    modules=all_modules, cse=cse, docstring_limit=-1,
+                )
+                if self._lambda_cache_dir is not None and prep["key"] is not None:
+                    save_lambdified_source(
+                        self._lambda_cache_dir, prep["key"], fn,
+                        self._lambda_modules_sig,
+                    )
+                    print(f"  [lambda-cache MISS for {prep['label']}: {prep['key'][:8]} (saved)]")
+                prep["cached_func"] = fn
+
+        # Pass 3 (sequential): build the runtime plan from the (now fully
+        # populated) `cached_func`s, in deterministic insertion order.
+        for prep in prep_per_template:
+            tid = prep["tid"]
+            n_ph = prep["n_ph"]
+            template = prep["template"]
+            f = prep["cached_func"]
             template_lambdas.append(f)
             template_n_ph.append(n_ph)
             template_keys.append(template)
 
-            for eq_idx, sym_order in instances:
+            for eq_idx, sym_order in prep["instances"]:
                 inst_idx = len(plan_inst_template_id)
                 plan_inst_template_id.append(tid)
                 plan_inst_state_indices.append(
