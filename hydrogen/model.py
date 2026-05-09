@@ -546,38 +546,25 @@ class Model:
         self.values = np.zeros(2 * self.n_v + self.n_p + self.n_t)
         self.delta_values = np.zeros(self.n_v)
         improved_equations_list = list(self.improved_equations)
-        self.improved_equations = sp.Matrix(improved_equations_list)
         self.all_improved_symbols_matrix = sp.Matrix(self.all_improved_symbols)
+        # `improved_equations` Matrix is no longer needed for lambdify; the
+        # per-template path below builds tiny per-template Matrices instead.
+        self.improved_equations = improved_equations_list
 
-        print("Lambdifying improved equations")
-        start_time = time.time()
-        self.lambdified_eqs = self._lambdify_with_cache(
-            "residual", self.all_improved_symbols_matrix, self.improved_equations,
-            all_modules, cse,
-        )
-        print(f"Equations lambdified in {time.time() - start_time} s")
-
-        # Sparse symbolic Jacobian: only differentiate every equation against
-        # the variables that actually appear in its `free_symbols` (instead of
-        # forming the full M*N dense Matrix and asking sympy to differentiate
-        # every entry).  For the pipe-tree topology the Jacobian is < 1% dense,
-        # so this is a huge cut in both symbolic-diff time and lambdify cost.
-        #
-        # Template caching (step 9): every equation produced by the same
-        # component kind (e.g. `TwoPortSegment.declare_equations`) has the same
-        # structural shape; the equations differ only in *which* symbols they
-        # are built from.  We normalise each equation to a placeholder template
-        # and cache `sp.diff(template, placeholder_k)` per template -- so a
-        # tree with 75 segments x 4 eqs ends up doing ~4 sympy diffs instead
-        # of ~300 diffs (each of which previously walked the full expression).
+        # ---- Per-template residual + Jacobian (step 12) ---------------------
+        # Group equations by structural template (placeholder-normalised form),
+        # lambdify ONE block per template returning `[residual, d/dph_0, ...,
+        # d/dph_K-1]`, and at runtime loop over instances calling the right
+        # template lambda with the appropriate state values.  This collapses
+        # what used to be (a) one giant `lambdify` of all 197 residual eqs and
+        # (b) one giant `lambdify` of all 788 Jacobian nonzeros into ~8 small
+        # `lambdify` calls -- each of which trivially CSE-shares between an
+        # equation and its derivatives.
         start_time = time.time()
         var_to_col = {v: j for j, v in enumerate(self.improved_vars)}
         var_set = set(self.improved_vars)
-        sparse_rows = []
-        sparse_cols = []
-        sparse_exprs = []
+        all_sym_to_state_idx = {s: i for i, s in enumerate(self.all_improved_symbols)}
 
-        # Build placeholder cache once and reuse across calls.
         _ph_pool = []
 
         def _placeholder(k):
@@ -585,19 +572,13 @@ class Model:
                 _ph_pool.append(sp.Symbol(f"_jac_ph_{len(_ph_pool)}", real=True))
             return _ph_pool[k]
 
-        diff_template_cache = {}
-        diff_cache_hits = 0
-        diff_cache_misses = 0
-
+        # Pass 1: classify each equation by structural template.  Equations
+        # that vanished to a constant (`0`) after the trivial / connection
+        # reducer are dropped here -- they're tautologies that contribute
+        # nothing to either the residual or the Jacobian.
+        template_to_instances = {}
+        n_constant_dropped = 0
         for i, eq in enumerate(improved_equations_list):
-            # Sort by symbol name so the resulting sparse Jacobian's row/col
-            # ordering is deterministic across runs (hash randomisation
-            # otherwise reorders `eq.free_symbols & var_set` per process).
-            fs = sorted(eq.free_symbols & var_set, key=lambda s: s.name)
-            if not fs:
-                continue
-            # Normalise: walk in preorder, give each distinct Symbol a positional
-            # placeholder; record the order so we can map results back.
             sym_order = []
             sym_to_ph = {}
             for atom in sp.preorder_traversal(eq):
@@ -605,73 +586,169 @@ class Model:
                     ph = _placeholder(len(sym_to_ph))
                     sym_to_ph[atom] = ph
                     sym_order.append(atom)
-            template = eq.xreplace(sym_to_ph)
-
-            cached = diff_template_cache.get(template)
-            if cached is None:
-                diff_cache_misses += 1
-                cached = [
-                    sp.diff(template, _placeholder(k))
-                    for k in range(len(sym_order))
-                ]
-                diff_template_cache[template] = cached
-            else:
-                diff_cache_hits += 1
-
-            ph_to_sym = {sym_to_ph[s]: s for s in sym_order}
-            for v in fs:
-                k = sym_order.index(v)
-                d_template = cached[k]
-                if d_template == 0:
+            if not sym_order:
+                # Constant equation -- assert it actually evaluates to 0; if
+                # not, the reducer would have produced an infeasibility row
+                # which we keep so the Newton solver still surfaces it.
+                if eq == 0:
+                    n_constant_dropped += 1
                     continue
-                d = d_template.xreplace(ph_to_sym) if ph_to_sym else d_template
-                if d == 0:
-                    continue
-                sparse_rows.append(i)
-                sparse_cols.append(var_to_col[v])
-                sparse_exprs.append(d)
-        if diff_cache_hits + diff_cache_misses:
-            print(
-                f"Jacobian template cache: {diff_cache_hits} hits / "
-                f"{diff_cache_misses} misses "
-                f"({100.0 * diff_cache_hits / (diff_cache_hits + diff_cache_misses):.1f}%)"
+            template = eq.xreplace(sym_to_ph) if sym_order else eq
+            template_to_instances.setdefault(template, []).append((i, sym_order))
+
+        n_eq = len(improved_equations_list)
+        n_templates = len(template_to_instances)
+        print(f"Found {n_templates} unique equation templates "
+              f"covering {n_eq - n_constant_dropped}/{n_eq} equations "
+              f"({n_constant_dropped} dropped as constants)")
+
+        # Pass 2: lambdify per template and build the runtime plan.
+        # `template_lambdas[tid]` returns shape `(n_ph + 1, 1)`: row 0 is the
+        # residual value; row k+1 is d_residual/d_ph_k.
+        template_lambdas = []
+        template_n_ph = []
+        template_jac_outputs = []  # for each tid: list of placeholder indices that are vars in some instance (used for Jac)
+        template_keys = []
+
+        plan_inst_template_id = []     # int per instance
+        plan_inst_state_indices = []   # int array per instance
+        plan_inst_eq_idx = []          # int per instance
+
+        plan_jac_inst = []   # for each jac entry: which instance index
+        plan_jac_out = []    # for each jac entry: which row of the lambda output (k+1)
+        plan_jac_rows = []   # equation row in the global residual
+        plan_jac_cols = []   # variable column in the global jacobian
+
+        for template, instances in template_to_instances.items():
+            tid = len(template_lambdas)
+            n_ph = len(instances[0][1])
+            placeholders = [_placeholder(k) for k in range(n_ph)]
+            # Block lambda: residual (row 0) + every placeholder derivative
+            # (rows 1..n_ph).  CSE across these outputs collapses shared
+            # subexpressions like `rho_ph(p_in, h_in)` -- which appears in
+            # both the residual and several of its derivatives.
+            block = sp.Matrix(
+                [template] + [sp.diff(template, ph) for ph in placeholders]
             )
-        self._jac_sparse_rows = np.asarray(sparse_rows, dtype=np.int64)
-        self._jac_sparse_cols = np.asarray(sparse_cols, dtype=np.int64)
-        self._jac_nnz = len(sparse_exprs)
-        print(f"Jacobian generated in {time.time() - start_time} s "
-              f"({self._jac_nnz} nonzeros, "
-              f"{100.0 * self._jac_nnz / max(1, self.n_v * len(improved_equations_list)):.2f}% dense)")
-
-        start_time = time.time()
-        # lambdify a flat column vector of nonzero entries; we'll scatter into
-        # the dense Jacobian at evaluation time.  Empty matrices break sympy's
-        # lambdify in the same way the dense path did, so guard against that.
-        if self._jac_nnz > 0:
-            jac_vec = sp.Matrix(sparse_exprs)
-            self._lambdified_jac_values = self._lambdify_with_cache(
-                "jac_values", self.all_improved_symbols_matrix, jac_vec,
+            f = self._lambdify_with_cache(
+                f"template_{tid:02d}",
+                sp.Matrix(placeholders), block,
                 all_modules, cse,
             )
-        else:
-            self._lambdified_jac_values = None
-        # For backwards compatibility, expose `lambdified_jacobian` as a
-        # callable that returns a dense (n_eq x n_v) matrix.
-        n_eq = len(improved_equations_list)
+            template_lambdas.append(f)
+            template_n_ph.append(n_ph)
+            template_keys.append(template)
 
+            for eq_idx, sym_order in instances:
+                inst_idx = len(plan_inst_template_id)
+                plan_inst_template_id.append(tid)
+                plan_inst_state_indices.append(
+                    np.asarray([all_sym_to_state_idx[s] for s in sym_order],
+                               dtype=np.int64)
+                )
+                plan_inst_eq_idx.append(eq_idx)
+
+                # Jacobian: for each placeholder that maps to a Variable, the
+                # (k+1)-th lambda output is the partial derivative; we emit one
+                # sparse-Jacobian entry per such placeholder.  Sorted by name
+                # to match the pre-step-12 ordering -> identical residual
+                # fingerprints and a deterministic cache key.
+                var_phs = sorted(
+                    [(k, sym) for k, sym in enumerate(sym_order) if sym in var_set],
+                    key=lambda p: p[1].name,
+                )
+                for k, sym in var_phs:
+                    plan_jac_inst.append(inst_idx)
+                    plan_jac_out.append(k + 1)
+                    plan_jac_rows.append(eq_idx)
+                    plan_jac_cols.append(var_to_col[sym])
+
+        # Pack the plan into numpy arrays for fast scatter at runtime.
+        self._n_eq = n_eq
+        self._n_instances = len(plan_inst_template_id)
+        self._inst_template = np.asarray(plan_inst_template_id, dtype=np.int64)
+        self._inst_state_indices = plan_inst_state_indices  # list of arrays
+        self._inst_eq_idx = np.asarray(plan_inst_eq_idx, dtype=np.int64)
+
+        self._jac_sparse_rows = np.asarray(plan_jac_rows, dtype=np.int64)
+        self._jac_sparse_cols = np.asarray(plan_jac_cols, dtype=np.int64)
+        self._jac_inst = np.asarray(plan_jac_inst, dtype=np.int64)
+        self._jac_out = np.asarray(plan_jac_out, dtype=np.int64)
+        self._jac_nnz = len(plan_jac_rows)
+        self._template_lambdas = template_lambdas
+
+        elapsed = time.time() - start_time
+        print(f"Per-template lambdify done in {elapsed:.2f} s "
+              f"({n_templates} templates, {self._n_instances} instances, "
+              f"{self._jac_nnz} nonzeros, "
+              f"{100.0 * self._jac_nnz / max(1, self.n_v * n_eq):.2f}% dense)")
+
+        # Eval routines that mimic the previous lambda interface.
+        n_eq_local = n_eq
+
+        def _eval_per_template(*args):
+            """Returns `(residual_col_vector, jac_values_column_vector)`.
+
+            Looped per-instance because the CoolProp-backed `Symbolic_property`
+            functions are scalar (cannot be vectorised across instances).
+            """
+            vals_arr = np.asarray(args, dtype=float)
+            r = np.zeros((n_eq_local, 1))
+            per_inst_results = [None] * self._n_instances
+            inst_state_indices = self._inst_state_indices
+            inst_template = self._inst_template
+            inst_eq_idx = self._inst_eq_idx
+            templates = self._template_lambdas
+            for inst_idx in range(self._n_instances):
+                f = templates[inst_template[inst_idx]]
+                inst_args = vals_arr[inst_state_indices[inst_idx]]
+                result = np.asarray(f(*inst_args)).reshape(-1)
+                per_inst_results[inst_idx] = result
+                r[inst_eq_idx[inst_idx], 0] = result[0]
+            jvals = np.zeros((self._jac_nnz, 1))
+            jac_inst = self._jac_inst
+            jac_out = self._jac_out
+            for g in range(self._jac_nnz):
+                jvals[g, 0] = per_inst_results[jac_inst[g]][jac_out[g]]
+            return r, jvals
+
+        # Cache the last-computed (residual, jac_values) keyed by `vals_arr`'s
+        # bytes so a Newton iteration that asks for residual then Jacobian only
+        # pays the per-instance loop once.
+        self._eval_cache = {"key": None, "r": None, "j": None}
+
+        def _eval_with_cache(*args):
+            key = bytes(np.asarray(args, dtype=float).tobytes())
+            if self._eval_cache["key"] == key:
+                return self._eval_cache["r"], self._eval_cache["j"]
+            r, j = _eval_per_template(*args)
+            self._eval_cache.update(key=key, r=r, j=j)
+            return r, j
+
+        def _residual_callable(*args):
+            r, _ = _eval_with_cache(*args)
+            return r
+
+        def _jac_values_callable(*args):
+            _, j = _eval_with_cache(*args)
+            return j
+
+        self.lambdified_eqs = _residual_callable
+        self._lambdified_jac_values = _jac_values_callable
+
+        # Backward-compat dense Jacobian assembler (rarely used now that the
+        # sparse Newton path is the default).
         def _eval_jacobian_dense(*args):
-            J = np.zeros((n_eq, self.n_v))
-            if self._lambdified_jac_values is None:
+            J = np.zeros((n_eq_local, self.n_v))
+            if self._jac_nnz == 0:
                 return J
             vals = np.asarray(self._lambdified_jac_values(*args)).reshape(-1)
             J[self._jac_sparse_rows, self._jac_sparse_cols] = vals
             return J
 
         self.lambdified_jacobian = _eval_jacobian_dense
-        # Drop the dense symbolic Jacobian -- nothing reads it after this point
-        # and it's by far the largest sympy object we'd otherwise keep alive.
+        # Drop the now-unused symbolic Jacobian Matrix.
         self.jacobian = None
-        print(f"Jacobian lambdified in {time.time() - start_time} s")
 
         self.active_vars_references = [var for var in self.raw_vars_references if var.symbol in self.improved_vars]
 
