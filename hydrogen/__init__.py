@@ -27,7 +27,13 @@ from .components import (
     TwoPortSegment,
 )
 from .medium import CoolPropMedium, get_symbolic_property_function
-from .model import DifferentialVariable, Model, Parameter, Variable
+from .model import (
+    DifferentialVariable,
+    Model,
+    NewtonConvergenceFailure,
+    Parameter,
+    Variable,
+)
 from .plotting import plot_results
 from .test_models import (
     InnerODE_1,
@@ -42,6 +48,7 @@ __all__ = [
     "Parameter",
     "Variable",
     "DifferentialVariable",
+    "NewtonConvergenceFailure",
     # medium
     "CoolPropMedium",
     "get_symbolic_property_function",

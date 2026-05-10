@@ -11,6 +11,7 @@ def test_top_level_attributes():
         "Parameter",
         "Variable",
         "DifferentialVariable",
+        "NewtonConvergenceFailure",
         "CoolPropMedium",
         "AmbientInlet",
         "AmbientOutlet",

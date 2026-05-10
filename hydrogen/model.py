@@ -35,6 +35,27 @@ from .caching import (
 from .numerics import fast_error_norm, fast_linear_solve, fast_sparse_solve, lambdify_compat
 
 
+class NewtonConvergenceFailure(RuntimeError):
+    """Raised by `custom_solve(..., raise_on_no_convergence=True)` when Newton
+    hits `max_iter` without reducing the residual norm below `tol`.
+
+    `solve_adaptive_step` catches this to trigger a step rejection + dt cut,
+    so any of the three adaptive strategies can use Newton non-convergence
+    as one of their rejection signals (a too-large `dt` typically destabilises
+    the Newton solve before it shows up as a violated error metric).
+    """
+
+    def __init__(self, error_norm, n_iters, max_iter, tol):
+        super().__init__(
+            f"Newton failed to converge in {n_iters}/{max_iter} iterations "
+            f"(final error norm {error_norm:.3e}, target tol {tol:.3e})"
+        )
+        self.error_norm = error_norm
+        self.n_iters = n_iters
+        self.max_iter = max_iter
+        self.tol = tol
+
+
 # Module-globals seeded by `_init_lambdify_worker` (only used in worker
 # processes spawned by the `multiprocessing.Pool` in `instantiate`).  We pass
 # state via globals (fork-inherited from the parent) instead of pickled task
@@ -1713,7 +1734,8 @@ class Model:
         self.delta_values[:] = fast_linear_solve(j, r).T[0]
 
     @line_profiler.profile
-    def custom_solve(self, tol=1e-6, max_iter=100, relaxation=1.0):
+    def custom_solve(self, tol=1e-6, max_iter=100, relaxation=1.0,
+                     raise_on_no_convergence=False):
         guess = self.get_vars_values()
         error_norm = np.inf
         i = 0
@@ -1723,13 +1745,141 @@ class Model:
             error_norm = fast_error_norm(self.delta_values)
             guess -= self.delta_values
             i += 1
+        # Expose the last solve's outcome so `solve_adaptive_step` (and any
+        # diagnostic tooling) can inspect convergence without re-evaluating
+        # the residual.  Both attributes are always set, even on success.
+        self._last_solve_error_norm = float(error_norm)
+        self._last_solve_iters = i
+        if raise_on_no_convergence and error_norm > tol:
+            raise NewtonConvergenceFailure(error_norm, i, max_iter, tol)
         return guess
 
     @line_profiler.profile
-    def solve_dae_step(self, dt, relaxation=1.0, tol=1e-6, max_iter=100):
+    def solve_dae_step(self, dt, relaxation=1.0, tol=1e-6, max_iter=100,
+                       raise_on_no_convergence=False):
         self.set_dt(dt)
         self.set_t(self.get_t_value() + dt)
-        self.custom_solve(tol=tol, max_iter=max_iter, relaxation=relaxation)
+        self.custom_solve(tol=tol, max_iter=max_iter, relaxation=relaxation,
+                          raise_on_no_convergence=raise_on_no_convergence)
+
+    # --- adaptive time stepping -------------------------------------------------------
+    #
+    # `solve_adaptive_step(dt_target, strategy=...)` tries `dt_target`, asks the
+    # chosen strategy whether the result is acceptable, and either commits or
+    # restores + retries at smaller `dt`.  It NEVER calls `next_step()` -- the
+    # caller commits explicitly, mirroring the fixed-step pattern.  A rejected
+    # step never reaches `record`.
+    #
+    # Three strategies live in the `_ADAPTIVE_STRATEGIES` registry plus a "fixed"
+    # short-circuit that just calls `solve_dae_step` once.  Each strategy is
+    # responsible for its own internal solve loop because Richardson needs to
+    # take MULTIPLE solves per accepted step (one full + two halves) -- it's
+    # cleaner to push the loop into each strategy than to invent a multi-step
+    # protocol that all three share.
+
+    def _snapshot_state(self):
+        """Capture the minimum state needed to retry a step: current vars,
+        previous vars (used by CN), the time triplet, and the snapshotted
+        `der_x` value of every active `DifferentialVariable` (used by the
+        predictor-corrector strategy)."""
+        return {
+            "values": self.values[:self.n_v].copy(),
+            "prev_values": self.values[self.n_v:2 * self.n_v].copy(),
+            "t": self.get_t_value(),
+            "t_prev": self.get_t_prev_value(),
+            "dt": self.get_dt_value(),
+        }
+
+    def _restore_state(self, snap):
+        self.set_vars_values(snap["values"])
+        self.set_prev_vars_values(snap["prev_values"])
+        self.set_t(snap["t"])
+        self.set_t_prev(snap["t_prev"])
+        self.set_dt(snap["dt"])
+
+    def _get_diff_var_index_pairs(self):
+        """Returns `[(state_idx, der_idx), ...]` into `active_vars_references`,
+        one entry per `DifferentialVariable` whose state AND derivative both
+        survived trivial-equation reduction.  Cached after first call."""
+        if getattr(self, "_diff_var_index_pairs_cache", None) is not None:
+            return self._diff_var_index_pairs_cache
+        refs = self.active_vars_references
+        id_to_idx = {id(v): i for i, v in enumerate(refs)}
+        pairs = []
+        # Walk the component tree, picking up every DifferentialVariable.
+        def _walk(node):
+            if isinstance(node, DifferentialVariable):
+                state_idx = id_to_idx.get(id(node))
+                der_idx = id_to_idx.get(id(node.der_variable))
+                if state_idx is not None and der_idx is not None:
+                    pairs.append((state_idx, der_idx))
+            if isinstance(node, Model):
+                for child in node.components.values():
+                    _walk(child)
+        _walk(self)
+        self._diff_var_index_pairs_cache = pairs
+        return pairs
+
+    def _get_var_atols(self, fallback_atol):
+        """Per-variable absolute tolerance vector aligned with `active_vars_references`.
+        Falls back to `fallback_atol` (the strategy's global value) for any
+        variable that didn't override it via `Variable(..., atol=...)`."""
+        return np.array(
+            [v.atol if v.atol is not None else fallback_atol
+             for v in self.active_vars_references],
+            dtype=float,
+        )
+
+    def solve_adaptive_step(self, dt_target, strategy="predictor_corrector",
+                            dt_min=1e-9, dt_max=None,
+                            grow=1.5, shrink=0.5, max_retries=20,
+                            relaxation=1.0, tol=1e-6, max_iter=100):
+        """Take one accepted adaptive step toward `dt_target`.
+
+        Returns `(dt_used, info)` where `info` is a dict with at least
+        `{"strategy", "rejections", "metric", "n_iters"}` so the caller can
+        log/plot rejection rates and dt history.
+
+        The caller MUST call `next_step()` after a successful return to
+        commit the new state to `record` and advance `t_prev`.
+
+        Parameters
+        ----------
+        dt_target : float
+            Hint for the dt to try first.  The controller may grow beyond it
+            (up to `dt_max`) on a string of easy steps, so pass the LARGEST
+            dt you'd accept, not a conservative one.
+        strategy : str | dict | None
+            One of `"predictor_corrector"` (default), `"derivative_limit"`,
+            `"richardson"`, or `"fixed"`.  Pass a dict to also set tuning
+            params, e.g. `{"name": "richardson", "tol_local": 1e-5}`.
+        dt_min, dt_max : float
+            Hard floor / ceiling.  `dt_max` defaults to `4 * dt_target`.
+        grow, shrink : float
+            Multiplicative factors used by the simple controllers
+            (`derivative_limit`, `predictor_corrector`).  `richardson` uses
+            its own `(tol/err)^(1/3)` formula and ignores these.
+        max_retries : int
+            Hard cap on rejection-and-retry iterations within a single
+            adaptive step.  Raises `RuntimeError` if exceeded.
+        relaxation, tol, max_iter
+            Forwarded to every internal `solve_dae_step` / `custom_solve`.
+        """
+        if dt_max is None:
+            dt_max = 4.0 * dt_target
+
+        name, params = _normalise_adaptive_strategy(strategy)
+        if name == "fixed":
+            self.solve_dae_step(dt_target, relaxation=relaxation, tol=tol,
+                                max_iter=max_iter)
+            return dt_target, {"strategy": "fixed", "rejections": 0,
+                               "metric": 0.0,
+                               "n_iters": getattr(self, "_last_solve_iters", -1)}
+        impl = _ADAPTIVE_STRATEGIES[name]
+        return impl(self, dt_target=dt_target, dt_min=dt_min, dt_max=dt_max,
+                    grow=grow, shrink=shrink, max_retries=max_retries,
+                    relaxation=relaxation, tol=tol, max_iter=max_iter,
+                    params=params)
 
     def set_initial_time(self, t):
         for c in self.components.values():
@@ -1754,6 +1904,293 @@ class Model:
         for _, c in self.components.items():
             if not isinstance(c, (Parameter, Variable)):
                 c.print_info(indent=indent + 2)
+
+
+# --- Adaptive-step strategy registry --------------------------------------------------
+#
+# Each strategy is a callable with the signature
+#   strategy(model, dt_target, dt_min, dt_max, grow, shrink, max_retries,
+#            relaxation, tol, max_iter, params) -> (dt_used, info_dict)
+# and is responsible for its own rejection-and-retry loop.  The outer
+# `Model.solve_adaptive_step` just dispatches into here based on the strategy
+# name and forwards the controller knobs.  This split lets `richardson` do its
+# own multi-solve dance (full step + two half-steps) without contorting a
+# single-solve protocol that the simpler strategies would share.
+
+_DEFAULT_STRATEGY_PARAMS = {
+    # `derivative_limit`: 1% relative state change per step is a generous
+    # default appropriate for engineering transients; a tighter `rel_tol`
+    # is unstable on systems with variables that pass through zero
+    # (an oscillator's velocity at its peak amplitude has |x_new|/|x_old|
+    # arbitrarily large).  Use `predictor_corrector` or `richardson` if
+    # you need a tighter principled bound.
+    "derivative_limit":   {"rel_tol": 1e-2, "atol": 1e-6},
+    # `predictor_corrector`: the FE-CN mismatch is O(dt^2 * y'') -- which
+    # is `dt`-times LARGER than the actual CN local error of O(dt^3 * y''').
+    # So `tol_local=1e-2` here corresponds to a CN local error budget of
+    # ~`tol_local * dt` (i.e. 1e-4 at dt=0.01).  Tighten to 1e-3 if you want
+    # accuracy bounded a la fixed-dt 1e-3.
+    "predictor_corrector": {"tol_local": 1e-2, "atol": 1e-8},
+    # `richardson`: the half-vs-full mismatch IS the CN local error itself,
+    # so `tol_local=1e-4` directly bounds local truncation per step.
+    "richardson":         {"tol_local": 1e-4, "atol": 1e-8, "safety": 0.9, "order": 2},
+}
+
+
+def _normalise_adaptive_strategy(strategy):
+    """`strategy` is one of: None / "fixed" / "name" / {"name": "...", **params}."""
+    if strategy is None:
+        strategy = "predictor_corrector"
+    if isinstance(strategy, str):
+        name, user_params = strategy, {}
+    elif isinstance(strategy, dict):
+        s = dict(strategy)
+        name = s.pop("name", None)
+        if name is None:
+            raise ValueError("strategy dict must include a 'name' key")
+        user_params = s
+    else:
+        raise TypeError(
+            f"strategy must be None, str, or dict, got {type(strategy).__name__}")
+    if name == "fixed":
+        return name, {}
+    if name not in _ADAPTIVE_STRATEGIES:
+        raise ValueError(
+            f"unknown adaptive strategy {name!r}; choose from "
+            f"{sorted(['fixed', *_ADAPTIVE_STRATEGIES])}")
+    # Defaults < user overrides
+    merged = dict(_DEFAULT_STRATEGY_PARAMS[name])
+    merged.update(user_params)
+    return name, merged
+
+
+def _adaptive_scale(x_pre, x_new, atols):
+    """Symmetric scaling vector for the step-acceptance metric:
+    `scale_i = max(|x_pre_i|, |x_new_i|, atol_i)`.
+
+    Using BOTH endpoints (not just `|x_pre|`) makes the metric well-behaved
+    for variables that grow from zero: `z_osc(0) = 0 -> z_osc(dt) = -1.55`
+    on a harmonic oscillator otherwise produces an "infinite" relative
+    change.  With the symmetric scale the relative metric becomes the
+    standard Hairer-Wanner step-error norm.
+    """
+    return np.maximum(np.maximum(np.abs(x_pre), np.abs(x_new)), atols)
+
+
+def _try_step(model, dt, snap, relaxation, tol, max_iter):
+    """Restore `snap`, attempt a single solve at `dt`, return `(succeeded, dt)`.
+
+    Always restores BEFORE attempting so the caller can pass the same `snap`
+    to multiple `_try_step` calls in the same retry loop without explicit
+    bookkeeping.  Catches `NewtonConvergenceFailure` and returns False so the
+    strategy can treat non-convergence as a rejection signal.
+    """
+    model._restore_state(snap)
+    try:
+        model.solve_dae_step(dt, relaxation=relaxation, tol=tol,
+                             max_iter=max_iter, raise_on_no_convergence=True)
+        return True
+    except NewtonConvergenceFailure:
+        return False
+
+
+def _strategy_derivative_limit(model, *, dt_target, dt_min, dt_max, grow, shrink,
+                               max_retries, relaxation, tol, max_iter, params):
+    """(B) Reject when any active variable's per-step relative change exceeds
+    `rel_tol`.  Cheapest strategy: zero extra implicit solves per accepted step.
+    Best for problems where engineers can express physical limits naturally
+    (e.g. "no variable should move more than 1% per step")."""
+    rel_tol = params["rel_tol"]
+    atol_global = params["atol"]
+    atols = model._get_var_atols(atol_global)
+    snap = model._snapshot_state()
+    dt = max(dt_min, min(dt_target, dt_max))
+    rejections = 0
+    for _ in range(max_retries):
+        ok = _try_step(model, dt, snap, relaxation, tol, max_iter)
+        if not ok:
+            rejections += 1
+            dt = max(dt_min, dt * shrink)
+            if dt <= dt_min:
+                raise RuntimeError(
+                    f"derivative_limit: hit dt_min={dt_min} after Newton "
+                    f"non-convergence ({rejections} rejections)")
+            continue
+        x_new = model.get_vars_values()
+        x_pre = snap["values"]
+        scale = _adaptive_scale(x_pre, x_new, atols)
+        metric = float(np.max(np.abs(x_new - x_pre) / scale))
+        if metric <= rel_tol:
+            # Accept; suggest a slightly larger dt next time if we're well below
+            # the limit.  The hint lives on the model so the next call picks it up.
+            if metric < 0.25 * rel_tol:
+                dt_hint = min(dt * grow, dt_max)
+            else:
+                dt_hint = dt
+            model._dt_hint = dt_hint
+            return dt, {"strategy": "derivative_limit", "rejections": rejections,
+                        "metric": metric,
+                        "n_iters": model._last_solve_iters}
+        rejections += 1
+        dt = max(dt_min, dt * shrink)
+        if dt <= dt_min:
+            raise RuntimeError(
+                f"derivative_limit: hit dt_min={dt_min} with metric={metric:.3e} "
+                f"still above rel_tol={rel_tol}")
+    raise RuntimeError(
+        f"derivative_limit: exceeded {max_retries} retries (last metric={metric:.3e})")
+
+
+def _strategy_predictor_corrector(model, *, dt_target, dt_min, dt_max, grow, shrink,
+                                  max_retries, relaxation, tol, max_iter, params):
+    """(P) Compare the implicit Crank-Nicolson result to a cheap explicit-Euler
+    predictor `x_pred = x_pre + dt * der_pre` for every `DifferentialVariable`.
+    The mismatch IS a calibrated O(dt^2) local-error estimator -- principled
+    without paying for an extra implicit solve.
+
+    Auto-falls back to `derivative_limit` if there are no `DifferentialVariable`s
+    in the active set (the predictor would have nothing to compare to).
+    """
+    pairs = model._get_diff_var_index_pairs()
+    if not pairs:
+        return _strategy_derivative_limit(
+            model, dt_target=dt_target, dt_min=dt_min, dt_max=dt_max,
+            grow=grow, shrink=shrink, max_retries=max_retries,
+            relaxation=relaxation, tol=tol, max_iter=max_iter,
+            params={"rel_tol": params["tol_local"], "atol": params["atol"]})
+    state_idx = np.array([p[0] for p in pairs])
+    der_idx = np.array([p[1] for p in pairs])
+    tol_local = params["tol_local"]
+    atol_global = params["atol"]
+    atols = model._get_var_atols(atol_global)
+    snap = model._snapshot_state()
+    der_pre = snap["values"][der_idx].copy()    # slope at start of step
+    x_pre = snap["values"][state_idx].copy()
+    atols_diff = atols[state_idx]
+    dt = max(dt_min, min(dt_target, dt_max))
+    rejections = 0
+    for _ in range(max_retries):
+        ok = _try_step(model, dt, snap, relaxation, tol, max_iter)
+        if not ok:
+            rejections += 1
+            dt = max(dt_min, dt * shrink)
+            if dt <= dt_min:
+                raise RuntimeError(
+                    f"predictor_corrector: hit dt_min={dt_min} after Newton "
+                    f"non-convergence ({rejections} rejections)")
+            continue
+        x_new_full = model.get_vars_values()
+        x_new_diff = x_new_full[state_idx]
+        x_pred = x_pre + dt * der_pre
+        scale = _adaptive_scale(x_pre, x_new_diff, atols_diff)
+        metric = float(np.max(np.abs(x_new_diff - x_pred) / scale))
+        if metric <= tol_local:
+            dt_hint = min(dt * grow, dt_max) if metric < 0.25 * tol_local else dt
+            model._dt_hint = dt_hint
+            return dt, {"strategy": "predictor_corrector",
+                        "rejections": rejections, "metric": metric,
+                        "n_iters": model._last_solve_iters}
+        rejections += 1
+        dt = max(dt_min, dt * shrink)
+        if dt <= dt_min:
+            raise RuntimeError(
+                f"predictor_corrector: hit dt_min={dt_min} with "
+                f"metric={metric:.3e} still above tol_local={tol_local}")
+    raise RuntimeError(
+        f"predictor_corrector: exceeded {max_retries} retries "
+        f"(last metric={metric:.3e})")
+
+
+def _strategy_richardson(model, *, dt_target, dt_min, dt_max, grow, shrink,
+                         max_retries, relaxation, tol, max_iter, params):
+    """(R) Step-doubling: take one full step at `dt`, restore and take two
+    half-steps at `dt/2`, compare.  Costs 3 implicit solves per accepted step
+    (vs 1 for the simpler strategies) but gives a properly-calibrated
+    `O(dt^(p+1))` local-error estimate, so the controller uses the standard
+    `dt_new = dt * safety * (tol/err)^(1/(p+1))` formula instead of a fixed
+    grow/shrink ratio.
+
+    Commits the HALF-STEP result (more accurate of the two), so an accepted
+    Richardson step has the same accuracy as a fixed-`dt/2` run.
+    """
+    tol_local = params["tol_local"]
+    atol_global = params["atol"]
+    safety = params["safety"]
+    p = params["order"]                         # CN is order 2
+    atols = model._get_var_atols(atol_global)
+    snap = model._snapshot_state()
+    dt = max(dt_min, min(dt_target, dt_max))
+    rejections = 0
+    for _ in range(max_retries):
+        # Full step at dt
+        ok_full = _try_step(model, dt, snap, relaxation, tol, max_iter)
+        if not ok_full:
+            rejections += 1
+            dt = max(dt_min, dt * shrink)
+            if dt <= dt_min:
+                raise RuntimeError(
+                    f"richardson: hit dt_min={dt_min} (full-step Newton "
+                    f"non-convergence after {rejections} rejections)")
+            continue
+        x_full = model.get_vars_values().copy()
+        # Two half-steps at dt/2 from the same snapshot.  After the first
+        # half-step we DON'T call next_step() -- we just reuse the existing
+        # state as the prev_values for the second half.  This matches what
+        # an outer fixed-dt/2 loop would do across two `solve_dae_step` calls.
+        ok1 = _try_step(model, dt / 2, snap, relaxation, tol, max_iter)
+        if not ok1:
+            rejections += 1
+            dt = max(dt_min, dt * shrink)
+            continue
+        # Manually advance prev_values to current values for the second half.
+        mid_snap = model._snapshot_state()
+        model.set_prev_vars_values(mid_snap["values"])
+        model.set_t_prev(mid_snap["t"])
+        ok2 = False
+        try:
+            model.solve_dae_step(dt / 2, relaxation=relaxation, tol=tol,
+                                 max_iter=max_iter, raise_on_no_convergence=True)
+            ok2 = True
+        except NewtonConvergenceFailure:
+            pass
+        if not ok2:
+            rejections += 1
+            dt = max(dt_min, dt * shrink)
+            continue
+        x_half_half = model.get_vars_values().copy()
+        # Error estimate
+        scale = _adaptive_scale(x_full, x_half_half, atols)
+        err = float(np.max(np.abs(x_full - x_half_half) / scale))
+        # Standard Richardson controller for an order-p method
+        if err > 0:
+            ratio = (tol_local / err) ** (1.0 / (p + 1))
+        else:
+            ratio = grow
+        dt_next = max(dt_min, min(dt_max, dt * safety * ratio))
+        if err <= tol_local:
+            # Accept the half-step result (already in `model`).  Restore the
+            # CN bookkeeping: prev_values must be the ORIGINAL pre-step state
+            # (before we did any half-stepping), not the mid-step value.
+            model.set_prev_vars_values(snap["prev_values"])
+            model.set_t_prev(snap["t_prev"])
+            model._dt_hint = dt_next
+            return dt, {"strategy": "richardson", "rejections": rejections,
+                        "metric": err, "n_iters": model._last_solve_iters}
+        rejections += 1
+        dt = max(dt_min, dt_next)              # use the controller's hint
+        if dt <= dt_min:
+            raise RuntimeError(
+                f"richardson: hit dt_min={dt_min} with err={err:.3e} "
+                f"still above tol_local={tol_local}")
+    raise RuntimeError(
+        f"richardson: exceeded {max_retries} retries (last err={err:.3e})")
+
+
+_ADAPTIVE_STRATEGIES = {
+    "derivative_limit":    _strategy_derivative_limit,
+    "predictor_corrector": _strategy_predictor_corrector,
+    "richardson":          _strategy_richardson,
+}
 
 
 class Parameter(Model):
@@ -1793,9 +2230,18 @@ class Parameter(Model):
 
 
 class Variable(Model):
-    """Algebraic unknown; a Newton solve adjusts it to satisfy the system's residuals."""
+    """Algebraic unknown; a Newton solve adjusts it to satisfy the system's residuals.
 
-    def __init__(self, value, unit=None):
+    `atol` is an optional per-variable absolute tolerance consulted by
+    `Model.solve_adaptive_step` when computing the step-acceptance metric.
+    Leave as `None` to inherit the strategy's global `atol` (typical case);
+    set explicitly only when one variable's units make the global value
+    inappropriate -- e.g. mass flow `kg/s` (~1e-3) needs a much smaller
+    `atol` than pressure `Pa` (~1e5).  See "Performance & tuning" in the
+    README for guidance.
+    """
+
+    def __init__(self, value, unit=None, atol=None):
         self.components = {}
         self.value = value
         self._symbold_index = None
@@ -1803,6 +2249,7 @@ class Variable(Model):
         self.prev_value = value
         self.prev_symbol = None
         self.unit = unit
+        self.atol = atol
         self.can_evaluate = False
         self.is_connected = False
         self.connected_to = []
@@ -1869,8 +2316,8 @@ class DifferentialVariable(Variable):
     of the ODE).
     """
 
-    def __init__(self, value, unit=None):
-        super().__init__(value, unit)
+    def __init__(self, value, unit=None, atol=None):
+        super().__init__(value, unit, atol=atol)
         self.der_variable = Variable(0.0, None)
 
     def declare_equations(self):

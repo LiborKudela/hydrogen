@@ -254,6 +254,41 @@ Both share the same Newton-loop knobs:
 | `relaxation` | `1.0` | Newton damping factor (`0 < relaxation ≤ 1`). Drop to `0.5` when the `t=0` solve diverges or oscillates — typical for vessels suddenly exposed to a much higher upstream pressure (see `fill_vessel.py`). |
 | `tol` | `1e-6` | Convergence threshold on the residual norm. Loosen to `1e-4` for fast prototyping, tighten only when post-processing depends on conservation closures below 1e-6. |
 | `max_iter` | `100` | Newton iteration cap per timestep. Bump to `200-400` for stiff initialisations; if you regularly hit it during `solve_dae_step`, your `dt` is probably too large for the physics. |
+| `raise_on_no_convergence` *(`solve_dae_step` only)* | `False` | When `True`, raises `NewtonConvergenceFailure` if Newton hits `max_iter` without reducing the residual below `tol`. The adaptive controller (below) sets this internally so it can catch + retry at smaller `dt`. |
+
+### `Model.solve_adaptive_step(...)` — adaptive time-stepping
+
+For transients with very different timescales (steep initial ramp, slow tail) a single fixed `dt` either over-resolves the late phase or under-resolves the early phase. `solve_adaptive_step` proposes a `dt`, asks a strategy whether the step is acceptable, and either commits or restores + retries at smaller `dt`. The caller still drives `next_step()` explicitly (so a rejected step never reaches `record`).
+
+```python
+dt_used, info = system.solve_adaptive_step(
+    dt_target=0.025,                         # initial guess; gets scaled by the controller
+    strategy="predictor_corrector",          # default; see strategies below
+    dt_min=1e-5, dt_max=0.1,                 # hard floor / ceiling
+    relaxation=1.0, tol=1e-6, max_iter=100,  # forwarded to every internal solve
+)
+system.next_step()                           # caller commits the accepted step
+```
+
+Four strategies are bundled (pass `strategy="name"` for defaults, or `strategy={"name": "...", **overrides}` to tune):
+
+| `strategy` | What it measures | Extra solves / step | Best for |
+|---|---|--:|---|
+| `"fixed"` | nothing — short-circuit to `solve_dae_step(dt_target)` | 0 | reference / baseline |
+| `"derivative_limit"` | per-variable relative state change `|x_new − x_pre|/max(|x_pre|, |x_new|, atol)` | 0 | monotonic transients (vessel charge/discharge); not reliable for variables that pass through zero |
+| `"predictor_corrector"` *(default)* | mismatch between explicit-Euler predictor `x_pre + dt·der_pre` and the CN result, on differential variables only | 0 | most engineering transients; principled local-error estimate without paying for a second implicit solve |
+| `"richardson"` | one full step at `dt` vs two half-steps at `dt/2`; commits the more-accurate half-step result | 2 | when you need a calibrated `O(dt^(p+1))` local-error bound and can afford 3× the per-step cost |
+
+Per-strategy tuning lives in `_DEFAULT_STRATEGY_PARAMS` (`hydrogen/model.py`); the headline knob is `tol_local` (or `rel_tol` for `derivative_limit`). Variables with units that make the global `atol` inappropriate can override it per-variable: `Variable(value, unit, atol=tight_value)`.
+
+Benchmark on `examples/fill_vessel.py` (3 s vessel-charging transient, run from `examples/bench_adaptive.py`):
+
+| run | wall [s] | Newton iters | steps | dt range [s] | accuracy [Pa @ t=0.5s] |
+|---|--:|--:|--:|--:|--:|
+| `fixed dt=0.025`   | 0.79 |  423 | 120 | 0.025         |  4 |
+| `predictor_corrector tol=1e-2` | **0.29** | **152** | **35** | 0.006 → 0.10 | 52 |
+
+≈ **2.7× faster** in both wall time and Newton iters at ~0.03 % relative pressure error. The win comes entirely from `dt` growing 16× during the late equilibration phase.
 
 ### Recommended starter recipe for large pipe networks
 
@@ -273,6 +308,12 @@ system.initialise(relaxation=0.5, max_iter=400)
 for _ in range(N_STEPS):
     system.solve_dae_step(dt)
     system.next_step()
+
+# Or, for stiff transients, swap the inner loop for adaptive time-stepping
+# (typically 2-3x faster than the right fixed dt on uneven dynamics):
+# while system.get_t_value() < t_end:
+#     system.solve_adaptive_step(dt_target=dt, dt_max=10*dt)
+#     system.next_step()
 ```
 
 ## A few practical notes
@@ -285,8 +326,6 @@ for _ in range(N_STEPS):
 ## Future roadmap
 
 A non-binding wishlist of features that fit the framework's philosophy. Each bullet sketches the rough implementation path so a contributor can pick one up without a meeting.
-
-- **Adaptive time-stepping.** Wrap `solve_dae_step(dt)` in an outer controller that watches Newton convergence (iter count, residual reduction ratio) and a cheap embedded error estimator — e.g. a single explicit-Euler "predictor" step compared against the implicit Crank–Nicolson solution at `t+dt`. Shrink `dt` (`× 0.5`) when Newton needs more than `max_iter/2` iterations or the predictor-corrector mismatch exceeds `tol_local`, grow it (`× 1.2`) on easy steps. The existing `next_step()` snapshotting already supports rejecting + retrying a step at smaller `dt`.
 
 - **Reversible mixing junction.** Generalise `Splitter` (currently strictly 1-in / K-out) to a `MixingJunction` with M ports of unknown sign. For each port `i`, define an "upwind" weight `α_i = ½·(1 + tanh(w_i / w_smooth))` (smoothed Heaviside, keeps the Jacobian C¹ — see how `StraightPipe` already smooths Min/Max for friction), then write the mass + energy balances as `Σ ρ_i·A_i·w_i = 0` and `h_out = (Σ α_i·ṁ_i·h_i) / (Σ α_i·ṁ_i)`. The smoothing length `w_smooth` becomes a `Parameter` so users can trade Newton conditioning for sharper switching.
 

@@ -234,12 +234,39 @@ def run_tree(label: str, system: TreeSystem, *, warm_w: float | None = None,
     system.initialise(relaxation=0.5, max_iter=400)
     print(f"  initialise:  {time.time() - t0:.2f} s")
 
-    print("Time-stepping (5 steps of 0.05 s) to verify steady state...")
+    # Time-step with the default adaptive controller (`predictor_corrector`).
+    # The system is initialised AT steady state, so PC's predictor matches the
+    # CN result almost exactly -- the controller grows `dt` toward `DT_MAX`
+    # within the first couple of steps and then breezes through the rest of
+    # the window in a handful of cheap steps. A fixed `dt = 0.05 s` would
+    # always take 5 steps regardless of how easy the problem is.
+    #
+    # Note the loop caps `dt_try` at `DT_MAX` (not `DT_TARGET`) and feeds the
+    # controller's hint back in -- otherwise the hint could only ever shrink.
+    T_END = 0.25
+    DT_TARGET = 0.05
+    DT_MAX = 4 * DT_TARGET
+    print(f"Time-stepping adaptively until t = {T_END:g} s "
+          f"(initial dt_target = {DT_TARGET:g} s, can grow to {DT_MAX:g} s)...")
     t0 = time.time()
-    for _ in range(5):
-        system.solve_dae_step(0.05)
+    dt_history: list[float] = []
+    n_rejections = 0
+    while system.get_t_value() < T_END - 1e-12:
+        dt_try = min(DT_MAX, T_END - system.get_t_value())
+        if hasattr(system, "_dt_hint"):
+            dt_try = min(dt_try, system._dt_hint)
+        else:
+            dt_try = min(dt_try, DT_TARGET)              # first step
+        dt_used, info = system.solve_adaptive_step(
+            dt_try, dt_max=DT_MAX,
+            relaxation=0.5, max_iter=200,
+        )
+        dt_history.append(dt_used)
+        n_rejections += info["rejections"]
         system.next_step()
-    print(f"  solve loop:  {time.time() - t0:.2f} s")
+    print(f"  solve loop:  {time.time() - t0:.2f} s "
+          f"({len(dt_history)} accepted steps, {n_rejections} rejected, "
+          f"dt range {min(dt_history):.4f} .. {max(dt_history):.4f} s)")
 
     # --- post-process -----------------------------------------------------------------
     record = system.record
