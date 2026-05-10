@@ -150,9 +150,10 @@ def main():
     for i in range(0, len(t), max(1, N_STEPS // 10)):
         print(f"{t[i]:7.3f}  {p_v[i] / 1e5:10.4f}  {T_v[i]:8.2f}  {w_in[i]:11.4f}  {m_v[i] * 1000:7.3f}")
 
-    plot_results(system.record, "fill_vessel.html", show=False)
+    out_path = plot_results(system.record, "fill_vessel.html",
+                            show=False, subdir="examples")
     print()
-    print("Plot written to fill_vessel.html")
+    print(f"Plot written to {out_path}")
 
 
 if __name__ == "__main__":

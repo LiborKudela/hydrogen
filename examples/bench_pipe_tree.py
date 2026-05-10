@@ -150,7 +150,8 @@ def main():
             continue
         all_results.append(bench_one(label, size))
 
-    out_path = Path(__file__).with_name("bench_results.jsonl")
+    from hydrogen import local_results_path
+    out_path = Path(local_results_path("examples", "bench_pipe_tree.jsonl"))
     with out_path.open("a") as f:
         for r in all_results:
             f.write(json.dumps(r) + "\n")

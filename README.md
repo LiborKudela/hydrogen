@@ -61,7 +61,7 @@ print(f"max |y − cos(ωt)| = {np.max(np.abs(y - np.cos(2*np.pi*t))):.3e}")
 
 ## Examples
 
-Three ready-to-run demos in `examples/`. Each writes an interactive Plotly HTML next to the script.
+Three ready-to-run demos in `examples/`. Each writes an interactive Plotly HTML into the git-ignored sandbox `local_results/examples/` (override the location with the `HYDROGEN_LOCAL_RESULTS` env var). Tests that opt in via the `local_results_path` fixture drop their artifacts under `local_results/tests/`.
 
 ### `examples/run_system.py` — heated mass-flow loop
 

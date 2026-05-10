@@ -34,7 +34,7 @@ from .model import (
     Parameter,
     Variable,
 )
-from .plotting import plot_results
+from .plotting import local_results_path, plot_results
 from .test_models import (
     InnerODE_1,
     InnerODE_2,
@@ -69,6 +69,7 @@ __all__ = [
     "InnerODE_2",
     # plotting
     "plot_results",
+    "local_results_path",
 ]
 
 __version__ = "0.1.0"

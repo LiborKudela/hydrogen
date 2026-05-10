@@ -136,7 +136,9 @@ def main():
     print(f"  (CN preserves amplitude; residual is pure phase drift, bounded by")
     print(f"   ~ (omega*dt_max)^3 / 12 per step at dt_max = {dt_max_used:.4f} s.)")
 
-    plot_results(model_test.record, "model_test.html", show=False)
+    out_path = plot_results(model_test.record, "model_test.html",
+                            show=False, subdir="examples")
+    print(f"Plot written to {out_path}")
 
 
 if __name__ == "__main__":

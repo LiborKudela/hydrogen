@@ -27,6 +27,7 @@ def test_top_level_attributes():
         "InnerODE_1",
         "InnerODE_2",
         "plot_results",
+        "local_results_path",
     }
     missing = expected - set(hydrogen.__all__)
     assert not missing, f"missing public exports: {missing}"
