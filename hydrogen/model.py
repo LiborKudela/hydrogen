@@ -84,6 +84,12 @@ _eq_cache_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
 # heat-transfer correlation uses both, so any non-adiabatic pipe hits this.
 # Accept both arities: when sympy supplies its own `H(0)` value as the
 # second positional arg, defer to that; otherwise default to `0.5`.
+#
+# TODO: this shim may be removable once we drop sympy <1.11 support.
+# Sympy 1.11+'s NumPy printer inlines `Heaviside(x)` as
+# `numpy.select([less(x,0), equal(x,0), True], [0, 1/2, 1])` directly --
+# but ONLY when `Heaviside` is NOT in the modules dict (otherwise the
+# printer defers to the dict entry and emits the literal call).
 def _heaviside_compat(x, h0=0.5):
     return np.heaviside(x, h0)
 
