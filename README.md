@@ -61,7 +61,7 @@ print(f"max |y − cos(ωt)| = {np.max(np.abs(y - np.cos(2*np.pi*t))):.3e}")
 
 ## Examples
 
-Three ready-to-run demos in `examples/`. Each writes an interactive Plotly HTML into the git-ignored sandbox `local_results/examples/` (override the location with the `HYDROGEN_LOCAL_RESULTS` env var). Tests that opt in via the `local_results_path` fixture drop their artifacts under `local_results/tests/`.
+Four ready-to-run demos in `examples/`. Each writes an interactive Plotly HTML into the git-ignored sandbox `local_results/examples/` (override the location with the `HYDROGEN_LOCAL_RESULTS` env var). Tests that opt in via the `local_results_path` fixture drop their artifacts under `local_results/tests/`.
 
 ### `examples/run_system.py` — heated mass-flow loop
 
@@ -111,6 +111,27 @@ Velocity drops by ~`K` at each splitter (mass conservation with constant area), 
 python examples/pipe_tree.py
 ```
 
+### `examples/loop_pump_pipe.py` — true closed pump-and-pipe loop with a `LoopBuffer`
+
+`AdiabaticPump → StraightPipe → LoopBuffer → pump`, wired in a fully-closed loop via `add_connection`. A pure pump+pipe loop is **structurally rank-deficient by 2**: loop continuity (`ρ·w` is conserved through every segment, so the loop-closing continuity equation is implied by the others) and adiabatic loop energy (`h + w²/2` is conserved through every adiabatic segment) are each one-equation tautologies of the per-segment equations. The framework's Newton solve needs a square non-singular Jacobian, so a fully-wired loop won't instantiate without mass and energy storage to absorb those redundancies. `LoopBuffer` (a two-port well-mixed lumped-volume vessel; see the component catalogue below) provides exactly that — its `m` and `U` are differential states whose own residuals replace the redundant loop-closure equations, so even at steady state the global Jacobian stays full rank.
+
+The example also illustrates the three "anchors" you typically need to pin down a loop's operating point: pressure level (set by `LoopBuffer.p_init` via the EoS closure `m_init = ρ(p_init,h_init)·V`), enthalpy level (set by `T_init`, which determines `U_init = m_init·h_init - p_init·V`), and mass flow (one explicit equation `ρ·w·A == m_dot_target` returned from `declare_equations`, which fixes the pump's free `a_iz` strength). It then rides a sinusoidal `m_dot_target(t)` so the pump head continuously adjusts to track the prescribed flow.
+
+```
+=== Initial steady-state (t = 0, m_dot_target = m_dot_base) ===
+Buffer state    : p = 2.0000 bar, h = 426074.48 J/kg, m = 2.324 g, U = 790.16 J
+  (anchor target: p = 2.0000 bar, T = 300.00 K, V = 1.0 L)
+Pump inlet p    :    2.0000 bar      (== buffer.p via wiring, residual 0.00e+00 Pa)
+Pump rise       : dp =   4.677 kPa
+Pipe drop       : dp =   4.677 kPa (must equal pump rise; residual 0.00e+00 Pa)
+Pump strength   : a_iz = -1.4767e+02
+Mass flow       :  20.000 g/s     (target 20.000 g/s)
+```
+
+```bash
+python examples/loop_pump_pipe.py
+```
+
 ## Component catalogue (`hydrogen.components`)
 
 | Class | Boundary type | Use it when… |
@@ -120,6 +141,7 @@ python examples/pipe_tree.py
 | `PressureSource` | Stagnation reservoir at fixed `(p, T)` | You want flow driven by Δp; system finds `ṁ` |
 | `PressureOutlet` | Fixed-pressure outlet (forces `p_in = p_ambient`) | Pressure-imposed termination; system finds `ṁ` |
 | `PressureVessel` | Lumped rigid-volume vessel filling through one port | Charging / discharging dynamics |
+| `LoopBuffer` | Two-port well-mixed lumped-volume buffer (one inflow + one outflow) | Closed loops — provides the mass + energy storage that breaks loop continuity / loop energy rank-deficiency |
 | `Splitter` | Ideal `K`-way junction (no Δp, no Δh) | Building flow trees / manifolds |
 | `TwoPortSegment` | One discrete CV of a 1D duct (continuity + momentum + energy) | Building block; rarely used directly |
 | `StraightPipe` | Pipe split into N `TwoPortSegment`s with Churchill friction + smoothed Nusselt | Plumbing two boundaries together |

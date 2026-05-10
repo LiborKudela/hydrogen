@@ -420,6 +420,139 @@ class PressureVessel(Model):
         return [eq_mass, eq_energy, eq_density, eq_energy_state, eq_port_p]
 
 
+class LoopBuffer(Model):
+    """Two-port well-mixed lumped-volume buffer for closed-loop topologies.
+
+    Like `PressureVessel` but with both an inflow and an outflow port, so it
+    can sit *inline* in a flow path.  The point of having one of these in a
+    closed loop is to break the structural rank-deficiency that an
+    otherwise-pure pipe+pump loop carries:
+
+      * In a fully-wired closed loop, the steady-state continuity equations
+        are linearly dependent (`rho*w` is conserved through every segment,
+        so the loop-closing continuity equation is implied by the others).
+      * In an adiabatic closed loop, the steady-state energy equations are
+        likewise dependent (`h + w**2/2` is conserved through every
+        adiabatic segment).
+
+    The buffer breaks both: its `m` and `U` are *state* variables that
+    enter their own residuals (`dm/dt = m_in - m_out`,
+    `dU/dt = m_in*h_in - m_out*h_out`).  Even at steady state where
+    `dm/dt = dU/dt = 0`, those residuals constrain `(m, U)` (and via the
+    EoS closure `(p, h)`) to specific values rather than collapsing to
+    `0 = 0`, so the global Jacobian stays full rank.
+
+    Differential states:
+        m  - total mass in the buffer                            [kg]
+        U  - total internal energy in the buffer                 [J]
+
+    Algebraic states (well-mixed = single (p, h) inside the volume):
+        p  - pressure                                            [Pa]
+        h  - specific enthalpy                                   [J/kg]
+
+    Ports (matches the (p, h, w) convention used elsewhere):
+        p_in,  h_in,  w_in       (driven by the upstream component)
+        p_out, h_out, w_out      (drives the downstream component)
+
+    Equations (returned):
+        dm/dt = rho(p_in, h_in) * w_in  * A_in
+              - rho(p,    h   ) * w_out * A_out             (continuity)
+        dU/dt = rho(p_in, h_in) * w_in  * A_in  * h_in
+              - rho(p,    h   ) * w_out * A_out * h         (energy)
+        m  = rho(p, h) * V                                  (density closure)
+        U  = m*h - p*V                                      (internal-energy closure)
+
+    Port equalities, declared via `add_connection` (so they collapse out of
+    the symbolic Jacobian via union-find rather than living as residuals):
+        p_in  == p
+        p_out == p              (no inlet/outlet throttling)
+        h_out == h              (well-mixed: outflow carries the vessel's h)
+
+    `h_in` and the two velocities `w_in`, `w_out` stay as free port
+    variables, fixed by whatever the buffer is wired into.
+
+    Notes / simplifications:
+      * Rigid wall (V constant), no heat loss, no shaft work.
+      * Inflow / outflow kinetic energy is neglected (consistent with
+        `PressureVessel`).  For typical loop applications `h >> w**2/2`.
+      * Reverse flow is not modelled.  If `w_in` becomes negative the
+        energy balance still integrates, but the inlet would be carrying
+        downstream conditions, not the prescribed `h_in`.
+    """
+
+    def __init__(self, medium: CoolPropMedium, V, A_in, A_out=None,
+                 p_init=101325.0, T_init=293.15):
+        self.medium = medium
+        self.V = V
+        self.A_in = A_in
+        self.A_out = A_in if A_out is None else A_out
+        self.p_init = p_init
+        self.T_init = T_init
+        # Pre-compute thermodynamically consistent initial conditions so the
+        # t=0 Newton solve starts on (or very near) the algebraic manifold.
+        self.h_init = float(medium.eval_h_pT(p_init, T_init))
+        self.rho_init = float(medium.eval_rho_ph(p_init, self.h_init))
+        self.m_init = self.rho_init * V
+        self.U_init = self.m_init * self.h_init - p_init * V  # u = h - p/rho, m/rho = V
+        super().__init__()
+
+    def declare_components(self):
+        self.add_component('V', Parameter(self.V, "m^3"))
+        self.add_component('A_in', Parameter(self.A_in, "m^2"))
+        self.add_component('A_out', Parameter(self.A_out, "m^2"))
+
+        # Differential states (auto-attaches `der_m`, `der_U` companions).
+        self.add_component('m', DifferentialVariable(self.m_init, "kg"))
+        self.add_component('U', DifferentialVariable(self.U_init, "J"))
+
+        # Vessel-average algebraic states.
+        self.add_component('p', Variable(self.p_init, "Pa"))
+        self.add_component('h', Variable(self.h_init, "J/kg"))
+
+        # Inlet / outlet ports (driven by adjacent components).
+        self.add_component('p_in', Variable(self.p_init, "Pa"))
+        self.add_component('h_in', Variable(self.h_init, "J/kg"))
+        self.add_component('w_in', Variable(0.0, "m/s"))
+        self.add_component('p_out', Variable(self.p_init, "Pa"))
+        self.add_component('h_out', Variable(self.h_init, "J/kg"))
+        self.add_component('w_out', Variable(0.0, "m/s"))
+
+    def declare_equations(self):
+        # Port equalities via union-find: p_in == p_out == p and h_out == h.
+        # `h_in` stays free (it is whatever the upstream feeds into the buffer).
+        self.add_connection(self['p_in'], self['p'])
+        self.add_connection(self['p_out'], self['p'])
+        self.add_connection(self['h_out'], self['h'])
+
+        m = self['m'].symbol
+        U = self['U'].symbol
+        p = self['p'].symbol
+        h = self['h'].symbol
+        V = self['V'].symbol
+        A_in = self['A_in'].symbol
+        A_out = self['A_out'].symbol
+        p_in = self['p_in'].symbol
+        h_in = self['h_in'].symbol
+        w_in = self['w_in'].symbol
+        w_out = self['w_out'].symbol
+
+        rho_in = self.medium.rho_ph(p_in, h_in)
+        rho = self.medium.rho_ph(p, h)
+
+        m_in_dot = rho_in * w_in * A_in
+        m_out_dot = rho * w_out * A_out
+
+        # Continuity / energy: net imbalance feeds the differential states.
+        eq_mass = self['der_m'].symbol - (m_in_dot - m_out_dot)
+        eq_energy = self['der_U'].symbol - (m_in_dot * h_in - m_out_dot * h)
+
+        # Algebraic closure linking (m, U) to (p, h) via the equation of state.
+        eq_density = m - rho * V
+        eq_energy_state = U - m * h + p * V
+
+        return [eq_mass, eq_energy, eq_density, eq_energy_state]
+
+
 class StraightPipe(Model):
     """1D pipe split into `n_segments` equal-length `TwoPortSegment`s with optional heat transfer.
 
