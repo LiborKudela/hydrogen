@@ -12,13 +12,13 @@ The library is research-friendly: every stage (symbol assignment, equation colle
 - **Crank–Nicolson for free.** Declare a `DifferentialVariable` and the framework auto-creates a `der_x` companion variable plus the implicit time-step constraint that links them. You only declare the algebraic equation defining `der_x`.
 - **Symbolic reduction before lambdify.** Linear identities (`x − y = 0`, `x + y = 0`, `x − const = 0` …) are detected and substituted away in multiple passes, so the runtime Newton vector contains only the strictly-needed unknowns.
 - **Eliminated variables are still plotted.** Every original variable is reconstructed at record time from the substitution chain, surfaced under its full hierarchical name (`System.pipe.segment.p_in`).
-- **CoolProp-backed media.** `(p, h)`-based property functions (`ρ`, `T`, `s`, `μ`, `k`) and their partial derivatives are wrapped as differentiable SymPy callables, so they participate in the symbolic Jacobian.
+- **CoolProp-backed media.** `(p, h)`-based property functions (`ρ`, `T`, `s`, `μ`, `k`) and their partial derivatives are wrapped as differentiable SymPy callables, so they participate in the symbolic Jacobian. Pass `backend="BICUBIC&HEOS"` for a ~3× faster solve on large systems with engineering-grade accuracy (see [Performance & tuning](#performance--tuning)).
 - **Numba-JITed kernels.** The Newton inner loop's linear solve and error-norm primitives are `@njit`-compiled.
 
 ## Install
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/LiborKudela/hydrogen.git
 cd hydrogen
 pip install -e .
 # or, with the test dependencies:
@@ -197,9 +197,99 @@ pytest -v tests/test_pressure_vessel.py # just the vessel mass/energy closures
 
 The suite covers the cache primitives, `lambdify_compat` + numba kernels, hierarchical naming, the trivial-removal substitution chain (including a regression for non-`Symbol` RHSs), the CN integrator vs. analytical solutions for a decay + harmonic oscillator, and the `PressureVessel` mass / energy / closure laws driven by a constant-`ṁ` source.
 
+## Performance & tuning
+
+The default settings are tuned for accuracy and clean cold-cache numbers. The knobs below are documented in measured-impact order so you know which dial moves the needle on your problem.
+
+### `CoolPropMedium(backend=...)` — biggest practical lever
+
+`CoolPropMedium` always builds a `CoolProp.AbstractState` per medium; `backend` chooses which equation-of-state implementation backs it.
+
+| `backend=` | What it does | Solve speedup | Init speedup | Accuracy vs HEOS |
+|---|---|--:|--:|---|
+| `"HEOS"` *(default)* | Full Helmholtz EOS Newton solver. Bit-exact reference quality. | 1.0× | 1.0× | reference |
+| `"BICUBIC&HEOS"` | Bicubic spline interpolation table built lazily on first `update()`; falls back to HEOS outside the table. | **2.7×** | **3.6×** | max ~1e-4 on `ρ`, ~1e-5 on `T`, ~5e-4 on partial derivatives |
+
+```python
+air = CoolPropMedium("Air", disable_warnings=True, backend="BICUBIC&HEOS")
+```
+
+Numbers are from `examples/pipe_tree.py` (`N=4, K=2, M=3`, ~389 active variables) on `sympy 1.14` / `numpy 2.2`. The Newton iteration converges to the same fixed point (max relative diff ~1e-10 across 189 active variables) regardless of backend, because table-interpolation errors don't accumulate across iterations. Use BICUBIC for any workflow that doesn't demand reference-grade thermodynamic precision.
+
+### `Model.instantiate(...)` — symbolic build phase
+
+```python
+def instantiate(self,
+                cse=True,                       # SymPy common-subexpression elimination
+                aditional_modules=None,         # extra namespaces for sympy.lambdify
+                max_remove_trival_passes=1,     # iterations of trivial-equation reduction
+                lambda_cache_dir=None):         # disk cache directory (None = $HOME/.cache/hydrogen)
+```
+
+- **`cse=True`** *(default)* runs SymPy's common-subexpression elimination on the residual + Jacobian before code generation. Cuts the generated lambda body 2-5× on systems with shared `(p,h)` boundary terms; turn off only when debugging.
+- **`aditional_modules=medium.modules`** is the **scalar** evaluator namespace (default, recommended). Each `eval_*_ph` carries `lru_cache(maxsize=100)` that catches cross-template `(p,h)` reuse — splitter junctions whose state is shared across every connected pipe — and that sharing is the dominant CoolProp speedup in tree/network systems.
+- **`aditional_modules=medium.batch_modules`** is the opt-in numpy-array-aware variant. It's **3× slower** than `modules` on tree systems (each template's batch of `(p,h)` pairs is opaque to neighbours, so shared boundary nodes get re-evaluated once per template) but useful for one-of-a-kind models with many instances of a single template and zero cross-template aliasing.
+- **`max_remove_trival_passes=N`** controls how many sweeps of `x − y = 0` substitution run before lambdification. `N=1` (default) catches >95% of the wins on most systems; `N=4–5` shrinks the Newton vector a few % more on deeply nested compositions like `pipe_tree(N≥3)` at the cost of a longer instantiate phase. Pass `max_remove_trival_passes=4` for the largest pipe trees.
+- **`lambda_cache_dir=Path(...)`** persists the lambdified source code (per-template) to disk so subsequent runs of the same model skip code generation entirely. Default location is `$HOME/.cache/hydrogen`; the cache key is content-addressed (`sha256` of args + expression + modules signature + `cse`), so identical templates across different scripts share cache entries.
+
+### Environment variables
+
+- **`HYDROGEN_LAMBDA_CACHE`** — path to the on-disk lambda cache directory. Set to `""` or `"0"` to disable caching entirely (useful for benchmarking a true cold build); set to a custom path to override the default `$HOME/.cache/hydrogen` location.
+- **`HYDROGEN_PARALLEL_LAMBDIFY`** — number of worker processes used to lambdify cache-miss templates in parallel. Defaults to `min(n_cache_misses, n_cpus)`. Set `=0` or `=1` to disable parallel lambdification (helpful inside debuggers, or when CoolProp's static initialisers fight `fork()`).
+- **`HYDROGEN_VECTORISE_MIN`** — minimum number of instances per template for the vectorised evaluator path to kick in. Default `8`. Below this cutoff the framework uses a per-instance Python loop, which is faster for small templates because the vectorised path's array-packing + medium-callback wrapping pay off only when amortised over many elements. Set `999` to disable vectorisation entirely (escape hatch for custom media that don't tolerate broadcasting).
+
+### `CoolPropMedium` class-level knobs
+
+- **`scalar_cache_maxsize = 100`** *(class attribute)* — `lru_cache` size on each `eval_X_ph`. Bigger = more cross-iteration caching when Newton settles into a tight neighbourhood, marginal RAM cost. Drop to `0` to disable per-property caching for diagnostic comparisons.
+- **`batch_state_pool_size = 8`** *(class attribute)* — LRU pool size for the batch state cache used by `eval_*_batch`. Only matters if you opted into `batch_modules`. Default of 8 covers most pipe-tree templates (each typically references 2-4 distinct `(p,h)` boundary states).
+- **`disable_warnings=True`** — silences "partial derivative … failed, using finite difference" warnings emitted when CoolProp can't evaluate `∂μ/∂p` analytically for some media. The finite-difference fallback is correct, just chatty.
+
+### `Model.initialise(...)` and `Model.solve_dae_step(...)` — Newton tuning
+
+Both share the same Newton-loop knobs:
+
+| arg | default | meaning |
+|---|---|---|
+| `n` *(`initialise` only)* | `1` | Number of warm-start "iterations" of `solve_dae_step(dt=0)`-equivalents to run before integrating; bump to `3-5` if your initial state is far from the steady manifold. |
+| `relaxation` | `1.0` | Newton damping factor (`0 < relaxation ≤ 1`). Drop to `0.5` when the `t=0` solve diverges or oscillates — typical for vessels suddenly exposed to a much higher upstream pressure (see `fill_vessel.py`). |
+| `tol` | `1e-6` | Convergence threshold on the residual norm. Loosen to `1e-4` for fast prototyping, tighten only when post-processing depends on conservation closures below 1e-6. |
+| `max_iter` | `100` | Newton iteration cap per timestep. Bump to `200-400` for stiff initialisations; if you regularly hit it during `solve_dae_step`, your `dt` is probably too large for the physics. |
+
+### Recommended starter recipe for large pipe networks
+
+```python
+import os
+os.environ.setdefault("HYDROGEN_PARALLEL_LAMBDIFY", str(os.cpu_count() or 4))
+
+from hydrogen import CoolPropMedium
+
+air = CoolPropMedium("Air", disable_warnings=True, backend="BICUBIC&HEOS")
+system = MyTreeSystem(air, ...)
+system.instantiate(
+    aditional_modules=air.modules,    # keep the scalar lru_cache benefit
+    max_remove_trival_passes=4,       # pays off on pipe trees with N >= 3
+)
+system.initialise(relaxation=0.5, max_iter=400)
+for _ in range(N_STEPS):
+    system.solve_dae_step(dt)
+    system.next_step()
+```
+
 ## A few practical notes
 
 - **Initial guesses matter.** Newton uses a full step by default. Systems with strong startup transients (e.g. a vessel suddenly exposed to a much higher upstream pressure — see `fill_vessel.py`) can need (a) warm-started velocities to keep the energy-equation row non-singular w.r.t. `w`, and (b) `initialise(relaxation=0.5)` to damp the `t=0` solve.
 - **Trivial reduction protects parameters.** The reducer never eliminates a `Parameter` (or `t`/`dt`); only free `Variable`s can be substituted away. This avoids a class of bugs where a parameter would silently disappear from the lambdified signature.
 - **Ill-conditioned Jacobians** (mixing Pa, J/kg, m/s, kg in one residual vector) can show `cond ≈ 10¹⁴` on small systems. Newton still converges in practice; row/column scaling is a worthwhile future improvement.
 - **Single-phase only.** All built-in components assume a single fluid phase (whatever CoolProp returns from `(p, h)`). Two-phase support would need a different residual formulation.
+
+## Future roadmap
+
+A non-binding wishlist of features that fit the framework's philosophy. Each bullet sketches the rough implementation path so a contributor can pick one up without a meeting.
+
+- **Adaptive time-stepping.** Wrap `solve_dae_step(dt)` in an outer controller that watches Newton convergence (iter count, residual reduction ratio) and a cheap embedded error estimator — e.g. a single explicit-Euler "predictor" step compared against the implicit Crank–Nicolson solution at `t+dt`. Shrink `dt` (`× 0.5`) when Newton needs more than `max_iter/2` iterations or the predictor-corrector mismatch exceeds `tol_local`, grow it (`× 1.2`) on easy steps. The existing `next_step()` snapshotting already supports rejecting + retrying a step at smaller `dt`.
+
+- **Reversible mixing junction.** Generalise `Splitter` (currently strictly 1-in / K-out) to a `MixingJunction` with M ports of unknown sign. For each port `i`, define an "upwind" weight `α_i = ½·(1 + tanh(w_i / w_smooth))` (smoothed Heaviside, keeps the Jacobian C¹ — see how `StraightPipe` already smooths Min/Max for friction), then write the mass + energy balances as `Σ ρ_i·A_i·w_i = 0` and `h_out = (Σ α_i·ṁ_i·h_i) / (Σ α_i·ṁ_i)`. The smoothing length `w_smooth` becomes a `Parameter` so users can trade Newton conditioning for sharper switching.
+
+- **JSON system parser.** Add a `hydrogen.json_loader` module that takes a JSON document `{components: [{type, name, args}…], connections: [{from, to}…]}`, looks each `type` up in a `COMPONENT_REGISTRY` dict (populated by a `@register_component` decorator on each class in `hydrogen.components`), and emits a `Model` subclass on the fly via `type(name, (Model,), {…})`. Pair it with a `Model.to_json()` round-tripper and a tiny WebSocket/REST shim that pushes `record['state']` to a UI in real time and lets the UI mutate `Parameter.value`s mid-run — turns hydrogen into a backend for visual flow-sheet editors.
+
+- **Conditional equations.** Support equations that switch form based on the current state (e.g. choked vs. subsonic flow, valve open/closed) using `sympy.Piecewise` for cases where the discontinuity is genuinely smooth (lambdify already handles `Piecewise` via `numpy.select`), and a sigmoid-blended `α(state)·eq_A + (1 − α(state))·eq_B` form for cases where the discontinuity must stay C¹ for Newton. For hard switches (compressible/incompressible regime change), a third route is to detect the active branch *between* timesteps in `next_step()`, swap the equation set, and rebuild the lambdified residual from cache — the existing per-template lambda cache (keyed by content hash) means each branch only pays its first-time lambdify cost once.
