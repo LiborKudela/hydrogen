@@ -30,9 +30,14 @@ from hydrogen import (  # noqa: E402
 )
 
 
-N = 50
+N = 100
 L = 10
-air = CoolPropMedium('air', disable_warnings=True)
+air = CoolPropMedium(
+    'air',
+    disable_warnings=True,
+    backend="BICUBIC&HEOS",
+    scalar_cache_maxsize=1000,
+)
 
 
 class System(Model):

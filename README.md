@@ -238,9 +238,24 @@ def instantiate(self,
 - **`HYDROGEN_PARALLEL_LAMBDIFY`** — number of worker processes used to lambdify cache-miss templates in parallel. Defaults to `min(n_cache_misses, n_cpus)`. Set `=0` or `=1` to disable parallel lambdification (helpful inside debuggers, or when CoolProp's static initialisers fight `fork()`).
 - **`HYDROGEN_VECTORISE_MIN`** — minimum number of instances per template for the vectorised evaluator path to kick in. Default `8`. Below this cutoff the framework uses a per-instance Python loop, which is faster for small templates because the vectorised path's array-packing + medium-callback wrapping pay off only when amortised over many elements. Set `999` to disable vectorisation entirely (escape hatch for custom media that don't tolerate broadcasting).
 
-### `CoolPropMedium` class-level knobs
+### `CoolPropMedium` cache + warning knobs
 
-- **`scalar_cache_maxsize = 100`** *(class attribute)* — `lru_cache` size on each `eval_X_ph`. Bigger = more cross-iteration caching when Newton settles into a tight neighbourhood, marginal RAM cost. Drop to `0` to disable per-property caching for diagnostic comparisons.
+- **`scalar_cache_maxsize = 100`** *(constructor kwarg, also a class attribute used as default)* — `lru_cache` size on each scalar `eval_X_ph`. **Critical for HEOS performance on systems with many segments.** When the working set of unique `(p, h)` states exceeds the cache size, the cache thrashes and HEOS scales super-linearly because every Newton iteration re-computes the same property at the same `(p, h)` it just evicted. Working set ≈ number of active variables for media with analytical `μ`/`k` partials, ≈ **5× that** for media that fall back to finite differences (Air, Hydrogen — each FD `dμ/d{p,h}` lookup adds 4 extra `(p±ε, h)` and `(p, h±ε)` keys). Measured impact on `run_system.py` with 2 pipes × N segments + IntegrationTest:
+
+  | backend | N | active vars | `scalar_cache_maxsize` | ms/step | cache hit% |
+  |---|--:|--:|--:|--:|--:|
+  | HEOS | 50 | 408 | 100 *(default)* | 274 | 68% |
+  | HEOS | 50 | 408 | **1000** | **96** | **89%** |
+  | HEOS | 100 | 808 | 100 *(default)* | 2305 | 0.7% (catastrophic thrash) |
+  | HEOS | 100 | 808 | **1000** | **211** | 88% |
+  | BICUBIC&HEOS | 100 | 808 | 100 *(default)* | 116 | 0.6% |
+
+  Rule of thumb: if your HEOS solve loop is 5× slower than expected at large N, set `scalar_cache_maxsize ≈ 5 × n_active_vars`. RAM cost is negligible (~1 KB per cache entry × number of properties × 1000 ≈ 16 MB max). For BICUBIC&HEOS the cache matters less (table lookup is ~5 µs, so a miss is cheap).
+
+  ```python
+  air = CoolPropMedium("Air", disable_warnings=True, scalar_cache_maxsize=1000)
+  ```
+
 - **`batch_state_pool_size = 8`** *(class attribute)* — LRU pool size for the batch state cache used by `eval_*_batch`. Only matters if you opted into `batch_modules`. Default of 8 covers most pipe-tree templates (each typically references 2-4 distinct `(p,h)` boundary states).
 - **`disable_warnings=True`** — silences "partial derivative … failed, using finite difference" warnings emitted when CoolProp can't evaluate `∂μ/∂p` analytically for some media. The finite-difference fallback is correct, just chatty.
 
@@ -298,7 +313,11 @@ os.environ.setdefault("HYDROGEN_PARALLEL_LAMBDIFY", str(os.cpu_count() or 4))
 
 from hydrogen import CoolPropMedium
 
-air = CoolPropMedium("Air", disable_warnings=True, backend="BICUBIC&HEOS")
+air = CoolPropMedium(
+    "Air", disable_warnings=True,
+    backend="BICUBIC&HEOS",          # ~10x faster than HEOS at large N, scales linearly
+    scalar_cache_maxsize=1000,       # bump for systems with > ~50 active vars
+)
 system = MyTreeSystem(air, ...)
 system.instantiate(
     aditional_modules=air.modules,    # keep the scalar lru_cache benefit

@@ -117,6 +117,51 @@ def test_batch_state_pool_reuses_states(heos_air):
     np.testing.assert_array_equal(mu, expected_mu)
 
 
+def test_scalar_cache_maxsize_kwarg_overrides_default():
+    """Per-instance `scalar_cache_maxsize` kwarg sets the `lru_cache` size on
+    every scalar evaluator -- bumping this is the main fix for the HEOS
+    super-linear scaling at N>~50 segments where the default 100 thrashes."""
+    big = CoolPropMedium("Air", disable_warnings=True, scalar_cache_maxsize=2048)
+    small = CoolPropMedium("Air", disable_warnings=True, scalar_cache_maxsize=4)
+    default = CoolPropMedium("Air", disable_warnings=True)
+    assert big.eval_rho_ph.cache_info().maxsize == 2048
+    assert small.eval_rho_ph.cache_info().maxsize == 4
+    assert default.eval_rho_ph.cache_info().maxsize == 100
+    # Same kwarg propagates to ALL scalar evaluators (not just rho).
+    for name in CoolPropMedium._SCALAR_EVAL_NAMES:
+        assert getattr(big, name).cache_info().maxsize == 2048, (
+            f"{name} cache should respect scalar_cache_maxsize kwarg")
+
+
+def test_scalar_cache_isolation_per_instance():
+    """Two instances with different cache sizes must not share cache entries
+    (a shared class-level lru_cache would conflate `(self, p, h)` keys; the
+    per-instance wrapping in `__init__` avoids this)."""
+    a = CoolPropMedium("Air", disable_warnings=True)
+    b = CoolPropMedium("Air", disable_warnings=True)
+    a.clear_cache()
+    b.clear_cache()
+    a.eval_rho_ph(1e5, 4e5)
+    a.eval_rho_ph(1.5e5, 4e5)
+    a.eval_rho_ph(2e5, 4e5)
+    # `a`'s cache now has 3 entries; `b`'s should still be empty.
+    assert a.eval_rho_ph.cache_info().misses == 3
+    assert b.eval_rho_ph.cache_info().misses == 0
+
+
+def test_clear_cache_clears_per_property_caches():
+    """`clear_cache()` must drop the per-property entries, not just the
+    size-1 `set_state_*` caches."""
+    m = CoolPropMedium("Air", disable_warnings=True)
+    m.eval_rho_ph(1e5, 4e5)
+    m.eval_T_ph(1e5, 4e5)
+    assert m.eval_rho_ph.cache_info().currsize == 1
+    assert m.eval_T_ph.cache_info().currsize == 1
+    m.clear_cache()
+    assert m.eval_rho_ph.cache_info().currsize == 0
+    assert m.eval_T_ph.cache_info().currsize == 0
+
+
 def test_batch_modules_have_same_keys_as_scalar(heos_air):
     """`batch_modules` is a drop-in replacement for `modules` (same dict keys)
     so callers can opt in by switching the `aditional_modules=` argument."""
