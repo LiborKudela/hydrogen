@@ -49,15 +49,13 @@ class System(Model):
         self.add_component('integration_test', IntegrationTest(omega=2 * np.pi))
 
     def declare_equations(self):
-        res_1 = self['ambient_inlet']['p_out'].symbol - self['straight_pipe_1']['p_in'].symbol
-        res_2 = self['ambient_inlet']['h_out'].symbol - self['straight_pipe_1']['h_in'].symbol
-        res_3 = self['ambient_inlet']['w_out'].symbol - self['straight_pipe_1']['w_in'].symbol
-
-        res_4 = self['straight_pipe_1']['p_out'].symbol - self['straight_pipe_2']['p_in'].symbol
-        res_5 = self['straight_pipe_1']['h_out'].symbol - self['straight_pipe_2']['h_in'].symbol
-        res_6 = self['straight_pipe_1']['w_out'].symbol - self['straight_pipe_2']['w_in'].symbol
-
-        return [res_1, res_2, res_3, res_4, res_5, res_6]
+        # Series wiring on the `(p, h, m_dot)` port triple via union-find.
+        for io in ('p', 'h', 'm_dot'):
+            self.add_connection(self['ambient_inlet'][f'{io}_out'],
+                                self['straight_pipe_1'][f'{io}_in'])
+            self.add_connection(self['straight_pipe_1'][f'{io}_out'],
+                                self['straight_pipe_2'][f'{io}_in'])
+        return []
 
 
 def main():

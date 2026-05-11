@@ -17,15 +17,19 @@ The library is research-friendly: every stage (symbol assignment, equation colle
 
 ## Install
 
+Always install into a fresh virtual environment — the framework lambdifies `sp.Min` / `sp.Max` (used by the smoothed-Nusselt blending in `StraightPipe`) and that path only generates correct numpy code starting with **sympy ≥ 1.12**. Distro-managed Pythons (e.g. Ubuntu 22.04's `python3` ships sympy 1.5.1 from 2019) silently emit broken `np.amin` / `np.amax` calls that crash with `ValueError: setting an array element with a sequence ... inhomogeneous shape` at solve time.
+
 ```bash
 git clone https://github.com/LiborKudela/hydrogen.git
 cd hydrogen
-pip install -e .
-# or, with the test dependencies:
-pip install -e ".[dev]"
+
+python3 -m venv .venv               # create a venv (skip if you have your own)
+source .venv/bin/activate           # activate it
+
+pip install -e .                    # or pip install -e ".[dev]" for the test deps
 ```
 
-Requires Python ≥ 3.10. Runtime deps: `numpy`, `sympy`, `numba`, `CoolProp`, `plotly`, `line_profiler`.
+Requires Python ≥ 3.10. Runtime deps (with the pinned minimums in `pyproject.toml`): `numpy ≥ 1.24`, `sympy ≥ 1.12`, `numba ≥ 0.58`, `CoolProp ≥ 6.5`, `plotly`, `line_profiler`.
 
 ## Quickstart
 
@@ -80,7 +84,7 @@ python examples/run_system.py
 Source:        p = 2.000 bar,  T = 293.15 K
 Vessel start:  p = 1.013 bar,  T = 293.15 K,  m = 1.204 g
 Vessel end:    p = 2.000 bar,  T = 339.44 K,  m = 2.053 g
-Inlet w_in:    start = 142.670 m/s,  end = -0.000 m/s   (100.0% decay)
+Inlet m_dot:   start = 1.292 g/s,  end = 0.000 g/s   (100.0% decay)
 Vessel pressure has closed 100.0% of the gap to source pressure.
 ```
 
@@ -99,13 +103,19 @@ PressureSource  →  root pipe  →  Splitter  →  K * (pipe → Splitter → .
 so the whole system has `(K^(N+1) - 1) / (K - 1)` pipes, `(K^N - 1) / (K - 1)` splitters and `K^N` leaves. Defaults `N=2, K=2, M=2`, giving 7 pipes / 3 splitters / 4 leaves. Output prints the steady-state outlet conditions at every depth and confirms the symmetry of the solution:
 
 ```
-=== Steady-state pipe-outlet conditions, by tree depth ===
-  depth 0 ( 1 pipe ):  w_out min= 81.59 max= 81.59 m/s,  p_out min=1.0525 max=1.0525 bar,  spread(w)=0.00e+00
-  depth 1 ( 2 pipes):  w_out min= 41.40 max= 41.40 m/s,  p_out min=1.0221 max=1.0221 bar,  spread(w)=0.00e+00
-  depth 2 ( 4 pipes):  w_out min= 20.79 max= 20.79 m/s,  p_out min=1.0130 max=1.0130 bar,  spread(w)=0.00e+00
+=== Steady-state pipe-outlet conditions (Air) ===
+  depth 0 ( 1 pipe):  m_dot min=   2.0449 max=   2.0449 g/s,  w min=  81.586 max=  81.586 m/s,  p_out min=1.0525 max=1.0525 bar
+  depth 1 ( 2 pipes): m_dot min=   1.0224 max=   1.0224 g/s,  w min=  41.402 max=  41.402 m/s,  p_out min=1.0221 max=1.0221 bar
+  depth 2 ( 4 pipes): m_dot min=   0.5112 max=   0.5112 g/s,  w min=  20.793 max=  20.793 m/s,  p_out min=1.0130 max=1.0130 bar
+
+Mass conservation (Air):
+  source m_dot                        =    2.0449 g/s
+  depth 0 ( 1 pipes) m_dot   =    2.0449 g/s  (rel err vs source: 0.00e+00)
+  depth 1 ( 2 pipes) m_dot   =    2.0449 g/s  (rel err vs source: 0.00e+00)
+  depth 2 ( 4 pipes) m_dot   =    2.0449 g/s  (rel err vs source: 0.00e+00)
 ```
 
-Velocity drops by ~`K` at each splitter (mass conservation with constant area), and `spread(w) = 0` confirms every pipe at the same depth carries the same flow.
+Mass flow is exactly conserved at every depth (rel err `0.00e+00`) because the `(p, h, m_dot)` port convention unifies `m_dot` across every joint — there is no `ρ·w·A` translation step that could introduce numerical drift. The per-leaf velocity drops by `~K` at each splitter (constant-area mass conservation), confirming the tree's symmetry.
 
 ```bash
 python examples/pipe_tree.py
@@ -113,9 +123,9 @@ python examples/pipe_tree.py
 
 ### `examples/loop_pump_pipe.py` — true closed pump-and-pipe loop with a `LoopBuffer`
 
-`AdiabaticPump → StraightPipe → LoopBuffer → pump`, wired in a fully-closed loop via `add_connection`. A pure pump+pipe loop is **structurally rank-deficient by 2**: loop continuity (`ρ·w` is conserved through every segment, so the loop-closing continuity equation is implied by the others) and adiabatic loop energy (`h + w²/2` is conserved through every adiabatic segment) are each one-equation tautologies of the per-segment equations. The framework's Newton solve needs a square non-singular Jacobian, so a fully-wired loop won't instantiate without mass and energy storage to absorb those redundancies. `LoopBuffer` (a two-port well-mixed lumped-volume vessel; see the component catalogue below) provides exactly that — its `m` and `U` are differential states whose own residuals replace the redundant loop-closure equations, so even at steady state the global Jacobian stays full rank.
+`AdiabaticPump → StraightPipe → LoopBuffer → pump`, wired in a fully-closed loop via `add_connection`. A pure pump+pipe loop is **structurally rank-deficient by 2**: loop continuity (`m_dot` is conserved through every segment, so the loop-closing continuity equation is implied by the others) and adiabatic loop energy (`h + w²/2` is conserved through every adiabatic segment) are each one-equation tautologies of the per-segment equations. The framework's Newton solve needs a square non-singular Jacobian, so a fully-wired loop won't instantiate without mass and energy storage to absorb those redundancies. `LoopBuffer` (a two-port well-mixed lumped-volume vessel; see the component catalogue below) provides exactly that — its `m` and `U` are differential states whose own residuals replace the redundant loop-closure equations, so even at steady state the global Jacobian stays full rank.
 
-The example also illustrates the three "anchors" you typically need to pin down a loop's operating point: pressure level (set by `LoopBuffer.p_init` via the EoS closure `m_init = ρ(p_init,h_init)·V`), enthalpy level (set by `T_init`, which determines `U_init = m_init·h_init - p_init·V`), and mass flow (one explicit equation `ρ·w·A == m_dot_target` returned from `declare_equations`, which fixes the pump's free `a_iz` strength). It then rides a sinusoidal `m_dot_target(t)` so the pump head continuously adjusts to track the prescribed flow.
+The example also illustrates the three "anchors" you typically need to pin down a loop's operating point: pressure level (set by `LoopBuffer.p_init` via the EoS closure `m_init = ρ(p_init,h_init)·V`), enthalpy level (set by `T_init`, which determines `U_init = m_init·h_init - p_init·V`), and mass flow (one explicit equation `pump.m_dot_in == m_dot_target` returned from `declare_equations`, which fixes the pump's free `a_iz` strength). It then rides a sinusoidal `m_dot_target(t)` so the pump head continuously adjusts to track the prescribed flow.
 
 ```
 === Initial steady-state (t = 0, m_dot_target = m_dot_base) ===
@@ -163,29 +173,27 @@ python examples/loop_pump_pipe.py
 
 ## Wiring components together
 
-Every component exposes ports as named `Variable`s (typically `p_in/h_in/w_in` and `p_out/h_out/w_out`). Connections are just port-equality equations in the parent's `declare_equations`:
+Every component exposes ports as named `Variable`s following the **`(p, h, m_dot)`** convention: `p_in/h_in/m_dot_in` and `p_out/h_out/m_dot_out`. Pressure and specific enthalpy are the standard `(p, h)` thermodynamic state, and **mass flow rate `m_dot` [kg/s]** is the conserved flow variable across every joint — using `m_dot` (rather than velocity `w`) means port connections are mass-conserving regardless of any cross-sectional-area mismatch on either side. Velocity is reconstructed internally where each component needs it (`w = m_dot / (ρ·A)`); to inspect it post-simulation, divide the recorded `m_dot` by `ρ(p, h)·A`.
+
+Connections are just port-equality equations in the parent's `declare_equations`. Use `add_connection` (union-find) for pure variable equalities — it short-circuits these out of the symbolic Jacobian entirely instead of leaving them for the trivial-equation reducer:
 
 ```python
 class System(Model):
     def declare_components(self):
         self.medium = CoolPropMedium("Air", disable_warnings=True)
-        self.add_component('source', PressureSource(self.medium, 2e5, 293.15))
+        self.add_component('source', PressureSource(self.medium, 2e5, 293.15, A=A_port))
         self.add_component('pipe',   StraightPipe(self.medium, 0.003, 1.0, 1e-6,
                                                   z_in=0, z_out=0, n_segments=2, adiabatic=True))
         self.add_component('vessel', PressureVessel(self.medium, 1e-3, A_port, 1.013e5, 293.15))
 
     def declare_equations(self):
-        return [
-            self['source']['p_out'].symbol - self['pipe']['p_in'].symbol,
-            self['source']['h_out'].symbol - self['pipe']['h_in'].symbol,
-            self['source']['w_out'].symbol - self['pipe']['w_in'].symbol,
-            self['pipe']['p_out'].symbol   - self['vessel']['p_in'].symbol,
-            self['pipe']['h_out'].symbol   - self['vessel']['h_in'].symbol,
-            self['pipe']['w_out'].symbol   - self['vessel']['w_in'].symbol,
-        ]
+        for io in ('p', 'h', 'm_dot'):
+            self.add_connection(self['source'][f'{io}_out'], self['pipe'][f'{io}_in'])
+            self.add_connection(self['pipe'][f'{io}_out'],   self['vessel'][f'{io}_in'])
+        return []
 ```
 
-The trivial-equation pass collapses each `a − b = 0` connection into a single shared symbol before lambdification, so these "wires" are free at runtime.
+The union-find pass collapses each `add_connection(a, b)` into a single shared symbol before lambdification, so these "wires" are completely free at runtime — the unified `m_dot` symbol is exactly what flows through the whole chain.
 
 ## Project layout
 

@@ -6,8 +6,8 @@ Measures, for several (N, K, M) sizes:
   * 5-step solve-loop wall time
   * peak RSS (via `resource.getrusage`) and tracemalloc peak Python heap
   * a stable correctness fingerprint (steady-state mass-flow at the source +
-    every leaf-pipe `w_out`, hashed) so we can verify each refactor preserves
-    the numerical answer.
+    every leaf-pipe `m_dot_out`, hashed) so we can verify each refactor
+    preserves the numerical answer.
 
 Run as:  python3 examples/bench_pipe_tree.py
 """
@@ -47,7 +47,7 @@ def _peak_rss_mb() -> float:
 
 
 def _state_fingerprint(system) -> dict:
-    """A small set of robust steady-state numbers + a hash of every leaf w_out."""
+    """A small set of robust steady-state numbers + a hash of every leaf m_dot_out."""
     record = system.record
     state = np.asarray(record["state"])
     names = list(record["vars_names"])
@@ -56,24 +56,20 @@ def _state_fingerprint(system) -> dict:
         idx = next(i for i, n in enumerate(names) if n.endswith(suffix))
         return float(state[-1, idx])
 
-    leaf_w = sorted(
+    leaf_m_dot = sorted(
         float(state[-1, i])
         for i, n in enumerate(names)
-        if n.endswith(".pipe.w_out") and ".child_" in n and (n.count(".child_") == system.N)
+        if n.endswith(".pipe.m_dot_out") and ".child_" in n and (n.count(".child_") == system.N)
     )
-    rho_src = float(system.medium.eval_rho_ph(
-        trace_last(".source.p_out"),
-        trace_last(".source.h_out"),
-    ))
-    m_dot_src = trace_last(".source.w_out") * system.A_pipe * rho_src
-    h = hashlib.md5(json.dumps([round(w, 6) for w in leaf_w]).encode()).hexdigest()[:12]
+    m_dot_src = trace_last(".source.m_dot_out")
+    h = hashlib.md5(json.dumps([round(m, 9) for m in leaf_m_dot]).encode()).hexdigest()[:12]
     return {
         "n_vars_active": int(system.n_v),
         "m_dot_source_g_s": round(m_dot_src * 1000, 6),
-        "leaf_w_min": round(min(leaf_w), 6),
-        "leaf_w_max": round(max(leaf_w), 6),
-        "leaf_w_hash": h,
-        "n_leaves": len(leaf_w),
+        "leaf_m_dot_min_g_s": round(min(leaf_m_dot) * 1000, 6),
+        "leaf_m_dot_max_g_s": round(max(leaf_m_dot) * 1000, 6),
+        "leaf_m_dot_hash": h,
+        "n_leaves": len(leaf_m_dot),
     }
 
 
@@ -99,11 +95,13 @@ def bench_one(label: str, size: dict) -> dict:
     cur_py_after_inst, peak_py_after_inst = tracemalloc.get_traced_memory()
     rss_after_inst = _peak_rss_mb()
 
-    warm = _bernoulli_warm_start(system)
+    warm_m_dot = _bernoulli_warm_start(system)
     for var in system.active_vars_references:
         full = getattr(var, "full_name", "")
-        if full.endswith(".w_in") or full.endswith(".w_out") or ".w_out_" in full:
-            var.value = warm
+        if (full.endswith(".m_dot_in") or full.endswith(".m_dot_out")
+                or ".m_dot_out_" in full):
+            depth = full.count(".child_")
+            var.value = warm_m_dot / (system.K ** depth)
 
     t0 = time.perf_counter()
     system.initialise(relaxation=0.5, max_iter=400)

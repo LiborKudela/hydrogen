@@ -55,7 +55,7 @@ class FillSystem(Model):
 
     def declare_components(self):
         self.medium = CoolPropMedium("Air", disable_warnings=True)
-        self.add_component('source', PressureSource(self.medium, P_SOURCE, T_SOURCE))
+        self.add_component('source', PressureSource(self.medium, P_SOURCE, T_SOURCE, A=A_PORT))
         self.add_component(
             'pipe',
             StraightPipe(
@@ -69,14 +69,12 @@ class FillSystem(Model):
         )
 
     def declare_equations(self):
-        return [
-            self['source']['p_out'].symbol - self['pipe']['p_in'].symbol,
-            self['source']['h_out'].symbol - self['pipe']['h_in'].symbol,
-            self['source']['w_out'].symbol - self['pipe']['w_in'].symbol,
-            self['pipe']['p_out'].symbol - self['vessel']['p_in'].symbol,
-            self['pipe']['h_out'].symbol - self['vessel']['h_in'].symbol,
-            self['pipe']['w_out'].symbol - self['vessel']['w_in'].symbol,
-        ]
+        # Wire `(p, h, m_dot)` through every joint via union-find (cheaper than
+        # leaving these as residuals for the trivial-equation reducer).
+        for io in ('p', 'h', 'm_dot'):
+            self.add_connection(self['source'][f'{io}_out'], self['pipe'][f'{io}_in'])
+            self.add_connection(self['pipe'][f'{io}_out'], self['vessel'][f'{io}_in'])
+        return []
 
 
 def main():
@@ -91,17 +89,20 @@ def main():
     )
     print(f"  instantiate: {time.time() - t0:.2f} s")
 
-    # Warm-start the velocity unknowns. The default initial guess is `w ≈ 0.1` m/s
-    # everywhere, but at the boundaries we have a 1 bar pressure mismatch with no
-    # friction loss to support it (since friction scales as `ρ*w²`). The Newton solve
-    # then tries to push `w` to supersonic values just to balance the boundary pressure
-    # eq, which sends `h_out = h_total - w²/2` negative and crashes CoolProp. Putting
-    # all velocities near a physically plausible steady-state value side-steps this.
-    WARM_W = 30.0  # m/s, rough order-of-magnitude steady-state velocity
+    # Warm-start every `m_dot` unknown.  Default initial guess of `m_dot = 0`
+    # places the boundary at the source's stagnation enthalpy with no flow,
+    # but the 1 bar pressure mismatch at the vessel end has no friction loss
+    # to absorb it (friction scales as `m_dot**2`), so Newton tries to push
+    # m_dot to extreme values to satisfy the boundary pressure equation,
+    # sometimes overshooting into a negative-density regime.  Pinning m_dot to
+    # a physically plausible steady-state value side-steps this.
+    h_src = float(system.medium.eval_h_pT(P_SOURCE, T_SOURCE))
+    rho_src = float(system.medium.eval_rho_ph(P_SOURCE, h_src))
+    WARM_M_DOT = 30.0 * rho_src * A_PORT  # ~30 m/s order-of-magnitude steady-state
     for var in system.active_vars_references:
         full = getattr(var, 'full_name', '')
-        if full.endswith('.w_in') or full.endswith('.w_out'):
-            var.value = WARM_W
+        if full.endswith('.m_dot_in') or full.endswith('.m_dot_out'):
+            var.value = WARM_M_DOT
 
     print("Initialising (damped Newton at t = 0)...")
     t0 = time.time()
@@ -128,12 +129,12 @@ def main():
     p_v = trace('.vessel.p')
     h_v = trace('.vessel.h')
     m_v = trace('.vessel.m')
-    w_in = trace('.vessel.w_in')
+    m_dot_in = trace('.vessel.m_dot_in')
 
     # Reconstruct vessel temperature from (p, h) via the medium.
     T_v = np.array([system.medium.eval_T_ph(float(pi), float(hi)) for pi, hi in zip(p_v, h_v)])
 
-    decay_pct = (1.0 - w_in[-1] / w_in[0]) * 100.0 if w_in[0] != 0.0 else 0.0
+    decay_pct = (1.0 - m_dot_in[-1] / m_dot_in[0]) * 100.0 if m_dot_in[0] != 0.0 else 0.0
     pressure_progress = (p_v[-1] - p_v[0]) / (P_SOURCE - p_v[0]) * 100.0
 
     print()
@@ -141,14 +142,14 @@ def main():
     print(f"Source:        p = {P_SOURCE / 1e5:.3f} bar,  T = {T_SOURCE:.2f} K")
     print(f"Vessel start:  p = {p_v[0] / 1e5:.3f} bar,  T = {T_v[0]:.2f} K,  m = {m_v[0] * 1000:.3f} g")
     print(f"Vessel end:    p = {p_v[-1] / 1e5:.3f} bar,  T = {T_v[-1]:.2f} K,  m = {m_v[-1] * 1000:.3f} g")
-    print(f"Inlet w_in:    start = {w_in[0]:.3f} m/s,  end = {w_in[-1]:.3f} m/s   ({decay_pct:.1f}% decay)")
+    print(f"Inlet m_dot:   start = {m_dot_in[0] * 1000:.3f} g/s,  end = {m_dot_in[-1] * 1000:.3f} g/s   ({decay_pct:.1f}% decay)")
     print(f"Vessel pressure has closed {pressure_progress:.1f}% of the gap to source pressure.")
 
     print()
     print(f"Sample trajectory (every {max(1, N_STEPS // 10)} steps):")
-    print(f"{'t [s]':>7}  {'p_v [bar]':>10}  {'T_v [K]':>8}  {'w_in [m/s]':>11}  {'m [g]':>7}")
+    print(f"{'t [s]':>7}  {'p_v [bar]':>10}  {'T_v [K]':>8}  {'m_dot [g/s]':>11}  {'m [g]':>7}")
     for i in range(0, len(t), max(1, N_STEPS // 10)):
-        print(f"{t[i]:7.3f}  {p_v[i] / 1e5:10.4f}  {T_v[i]:8.2f}  {w_in[i]:11.4f}  {m_v[i] * 1000:7.3f}")
+        print(f"{t[i]:7.3f}  {p_v[i] / 1e5:10.4f}  {T_v[i]:8.2f}  {m_dot_in[i] * 1000:11.4f}  {m_v[i] * 1000:7.3f}")
 
     out_path = plot_results(system.record, "fill_vessel.html",
                             show=False, subdir="examples")

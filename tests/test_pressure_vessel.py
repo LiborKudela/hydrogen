@@ -26,31 +26,28 @@ N_STEPS = 8
 
 
 class _ForcedInflow(Model):
-    """Imposes a constant `(m_dot, h_set)` boundary at its `(p_out, h_out, w_out)` port.
+    """Imposes a constant `(m_dot, h_set)` boundary at its `(p_out, h_out, m_dot_out)` port.
 
-    `p_out` is set by the downstream connection (vessel back-pressure); the source
-    solves for the velocity that sustains the requested mass flow at the current
-    `p_out`.
+    `p_out` is set by the downstream connection (vessel back-pressure); the
+    source's `m_dot_out` is pinned to the requested mass flow via a trivial
+    equation that the reducer collapses at instantiate time.
     """
 
-    def __init__(self, medium, m_dot, h_set, A):
+    def __init__(self, medium, m_dot, h_set):
         self.medium = medium
         self.m_dot_value = m_dot
         self.h_set_value = h_set
-        self.A_value = A
         super().__init__()
 
     def declare_components(self):
-        self.add_component('A', Parameter(self.A_value, "m^2"))
         self.add_component('m_dot', Parameter(self.m_dot_value, "kg/s"))
         self.add_component('h_set', Parameter(self.h_set_value, "J/kg"))
         self.add_component('p_out', Variable(P_INIT, "Pa"))
         self.add_component('h_out', Variable(self.h_set_value, "J/kg"))
-        self.add_component('w_out', Variable(1.0, "m/s"))
+        self.add_component('m_dot_out', Variable(self.m_dot_value, "kg/s"))
 
     def declare_equations(self):
-        rho = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
-        eq_m = self['m_dot'].symbol - rho * self['w_out'].symbol * self['A'].symbol
+        eq_m = self['m_dot'].symbol - self['m_dot_out'].symbol
         eq_h = self['h_out'].symbol - self['h_set'].symbol
         return [eq_m, eq_h]
 
@@ -62,14 +59,14 @@ class _VesselSystem(Model):
         self.medium = CoolPropMedium("Air", disable_warnings=True)
         # Inlet enthalpy at the inlet pressure: h(p, T_INLET). Held fixed by the source.
         self._h_inlet = float(self.medium.eval_h_pT(P_INIT, T_INLET))
-        self.add_component('source', _ForcedInflow(self.medium, M_DOT, self._h_inlet, A_PORT))
+        self.add_component('source', _ForcedInflow(self.medium, M_DOT, self._h_inlet))
         self.add_component('vessel', PressureVessel(self.medium, V_VESSEL, A_PORT, P_INIT, T_INIT))
 
     def declare_equations(self):
         return [
             self['source']['p_out'].symbol - self['vessel']['p_in'].symbol,
             self['source']['h_out'].symbol - self['vessel']['h_in'].symbol,
-            self['source']['w_out'].symbol - self['vessel']['w_in'].symbol,
+            self['source']['m_dot_out'].symbol - self['vessel']['m_dot_in'].symbol,
         ]
 
 

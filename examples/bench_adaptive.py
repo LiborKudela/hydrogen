@@ -52,10 +52,18 @@ def _build_and_warm():
         aditional_modules=system.medium.modules,
         max_remove_trival_passes=3,
     )
+    # Warm-start m_dot unknowns to a physically plausible value (~30 m/s of
+    # air through the 3 mm bore -> a few g/s).
+    h_src = float(system.medium.eval_h_pT(P_SOURCE, 293.15))
+    rho_src = float(system.medium.eval_rho_ph(P_SOURCE, h_src))
+    import numpy as _np
+    PIPE_D_local = 0.003
+    A_port = _np.pi * PIPE_D_local ** 2 / 4
+    warm_m_dot = 30.0 * rho_src * A_port
     for var in system.active_vars_references:
         full = getattr(var, "full_name", "")
-        if full.endswith(".w_in") or full.endswith(".w_out"):
-            var.value = 30.0
+        if full.endswith(".m_dot_in") or full.endswith(".m_dot_out"):
+            var.value = warm_m_dot
     system.initialise(relaxation=0.5, max_iter=400)
     return system
 

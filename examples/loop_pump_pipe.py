@@ -34,7 +34,7 @@ one explicit equation:
                           closure `m_init = rho(p_init, h_init) * V`.
   2. Enthalpy level   ->  buffer's initial state (`T_init` -> `h_init`),
                           again via `U_init = m_init*h_init - p_init*V`.
-  3. Mass flow        ->  one explicit equation `rho*w_in*A == m_dot_target`
+  3. Mass flow        ->  one explicit equation `pump.m_dot_in == m_dot_target`
                           returned from `declare_equations`, which fixes
                           the pump's free `a_iz` strength.
 
@@ -136,14 +136,16 @@ class PumpedLoop(Model):
         ))
         self.add_component('buffer', LoopBuffer(
             self.medium,
-            V=BUFFER_V, A_in=A_PORT, A_out=A_PORT,
+            V=BUFFER_V,
             p_init=P_LOOP, T_init=T_LOOP,
         ))
 
     def declare_equations(self):
         # Closed-loop wiring (union-find short-circuits these out of the
-        # symbolic Jacobian -- they never become equations).
-        for io in ('p', 'h', 'w'):
+        # symbolic Jacobian -- they never become equations).  Ports carry the
+        # `(p, h, m_dot)` triple; `m_dot` propagates mass-flow conservation
+        # across joints regardless of port-area mismatch.
+        for io in ('p', 'h', 'm_dot'):
             # pump  -> pipe
             self.add_connection(self['pump'][f'{io}_out'], self['pipe'][f'{io}_in'])
             # pipe  -> buffer
@@ -158,14 +160,12 @@ class PumpedLoop(Model):
         # to do during the transient.
         #
         # `self.t_symbols[0]` is the framework's `t` symbol; the time stepper
-        # injects the current `t` value before each Newton solve.
+        # injects the current `t` value before each Newton solve.  With m_dot
+        # on the port the anchor is just `m_dot_in == m_dot_target`.
         t_sym = self.t_symbols[0]
         m_dot_target = (self['m_dot_base'].symbol
                         + self['m_dot_amp'].symbol * sp.sin(self['omega'].symbol * t_sym))
-        rho_in = self.medium.rho_ph(self['pump']['p_in'].symbol,
-                                    self['pump']['h_in'].symbol)
-        m_dot_actual = rho_in * self['pump']['w_in'].symbol * self['pump']['A_in'].symbol
-        eq_m_dot = m_dot_actual - m_dot_target
+        eq_m_dot = self['pump']['m_dot_in'].symbol - m_dot_target
 
         return [eq_m_dot]
 
@@ -189,20 +189,19 @@ def main():
     )
     print(f"  instantiate: {time.time() - t0:.2f} s")
 
-    # Warm-start the velocity unknowns near a physically plausible value.
-    # The default w=0.1 m/s is far from a self-consistent operating point and
-    # Newton can wander into negative-density territory; pinning w to the
-    # ballpark consistent with `m_dot_base` keeps the first solve well-behaved.
+    # Warm-start every `m_dot` unknown at the requested design flow rate.
+    # The default `m_dot = 0` initialisation is far from a self-consistent
+    # operating point and Newton can wander into negative-density territory;
+    # pinning m_dot to the operating value keeps the first solve well-behaved.
     h_loop = float(system.medium.eval_h_pT(P_LOOP, T_LOOP))
     rho_loop = float(system.medium.eval_rho_ph(P_LOOP, h_loop))
-    w0 = M_DOT_BASE / (rho_loop * A_PORT)
-    print(f"Warm-starting velocities at w0 = {w0:.3f} m/s "
-          f"(consistent with m_dot_base = {M_DOT_BASE * 1000:.1f} g/s, "
-          f"rho_loop = {rho_loop:.3f} kg/m^3).")
+    print(f"Warm-starting m_dot unknowns at design value "
+          f"m_dot_base = {M_DOT_BASE * 1000:.1f} g/s "
+          f"(rho_loop = {rho_loop:.3f} kg/m^3, expected w ~ {M_DOT_BASE / (rho_loop * A_PORT):.2f} m/s).")
     for var in system.active_vars_references:
         full = getattr(var, 'full_name', '')
-        if full.endswith('.w_in') or full.endswith('.w_out'):
-            var.value = w0
+        if full.endswith('.m_dot_in') or full.endswith('.m_dot_out'):
+            var.value = M_DOT_BASE
 
     print("Initialising (damped Newton at t = 0)...")
     t0 = time.time()
@@ -221,7 +220,7 @@ def main():
     p_pin = get0('.pump.p_in')
     p_pout = get0('.pump.p_out')
     h_pin = get0('.pump.h_in')
-    w_pin = get0('.pump.w_in')
+    m_dot0 = get0('.pump.m_dot_in')
     a_iz0 = get0('.pump.a_iz')
     p_pipe_out = get0('.pipe.p_out')
     p_buffer = get0('.buffer.p')
@@ -231,7 +230,7 @@ def main():
 
     T_pin = float(system.medium.eval_T_ph(p_pin, h_pin))
     rho_pin = float(system.medium.eval_rho_ph(p_pin, h_pin))
-    m_dot0 = rho_pin * w_pin * A_PORT
+    w_pin = m_dot0 / (rho_pin * A_PORT)
 
     # Loop pressure closure: pump head must exactly balance pipe friction loss
     # (the buffer is well-mixed with no throttling, so it neither adds nor
@@ -274,17 +273,13 @@ def main():
     # --- Post-process: show the loop tracking the drive ----------------------------
     rec = system.record
     t = np.asarray(rec['time'])
-    w_pin_t = _trace(rec, '.pump.w_in')
+    m_dot_t = _trace(rec, '.pump.m_dot_in')
     a_iz_t = _trace(rec, '.pump.a_iz')
     p_pin_t = _trace(rec, '.pump.p_in')
     p_pout_t = _trace(rec, '.pump.p_out')
-    h_pin_t = _trace(rec, '.pump.h_in')
     m_buffer_t = _trace(rec, '.buffer.m')
     U_buffer_t = _trace(rec, '.buffer.U')
 
-    rho_t = np.array([float(system.medium.eval_rho_ph(p, h))
-                      for p, h in zip(p_pin_t, h_pin_t)])
-    m_dot_t = rho_t * w_pin_t * A_PORT
     m_dot_target_t = M_DOT_BASE + M_DOT_AMP * np.sin(2 * np.pi * F_HZ * t)
     dp_pump_t = p_pout_t - p_pin_t
 
