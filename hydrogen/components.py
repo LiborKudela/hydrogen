@@ -43,6 +43,10 @@ class AmbientInlet(Model):
         self.add_component('p_out', Variable(self.p_ambient * 0.99, "Pa"))
         self.add_component('h_out', Variable(self.medium.h_pT(self.p_ambient, self.T_ambient) * 0.99, "J/kg"))
         self.add_component('m_dot_out', Variable(self.m_flow, "kg/s"))
+        # Internal velocity Variable; kept as a leaf symbol so the isentropic
+        # energy balance below sees `w_out**2 / 2` as a 1-leaf expression
+        # rather than a nested `m_dot/(rho*A)` chain that bloats the Jacobian.
+        self.add_component('w_out', Variable(0.2, "m/s"))
 
     def declare_equations(self):
         A = np.pi * self['D'].symbol ** 2 / 4
@@ -51,19 +55,19 @@ class AmbientInlet(Model):
         # collapses to a Parameter substitution at instantiate time.
         eq1 = self['m_flow'].symbol - self['m_dot_out'].symbol
 
-        # Internal velocity (derived from m_dot + density + area) for the KE term
-        # in the isentropic energy balance.  Not exposed as a port variable.
+        # m_dot <-> w closure (nonlinear in rho, so the trivial reducer
+        # leaves it alone -- keeps `w_out` as a leaf symbol in eq3 below).
         rho_out = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
-        w_out = self['m_dot_out'].symbol / (rho_out * A)
+        eq_w = self['m_dot_out'].symbol - rho_out * self['w_out'].symbol * A
 
         h_in = self['h_ambient'].symbol
         s_in = self['s_ambient'].symbol
         s_out = self.medium.s_ph(self['p_out'].symbol, self['h_out'].symbol)
         eq2 = s_in - s_out
-        eq3 = h_in - (self['h_out'].symbol + w_out ** 2 / 2)
+        eq3 = h_in - (self['h_out'].symbol + self['w_out'].symbol ** 2 / 2)
         eq4 = self['T_ambient'].symbol - self.T_ambient
 
-        return [eq1, eq2, eq3, eq4]
+        return [eq1, eq_w, eq2, eq3, eq4]
 
 
 class AmbientOutlet(Model):
@@ -90,21 +94,22 @@ class AmbientOutlet(Model):
         self.add_component('p_out', Variable(self.p_ambient * 0.99, "Pa"))
         self.add_component('h_out', Variable(self.medium.h_pT(self.p_ambient, self.T_ambient) * 0.99, "J/kg"))
         self.add_component('m_dot_out', Variable(self.m_flow, "kg/s"))
+        self.add_component('w_out', Variable(0.2, "m/s"))
 
     def declare_equations(self):
         A = np.pi * self['D'].symbol ** 2 / 4
         eq1 = self['m_flow'].symbol - self['m_dot_out'].symbol
 
         rho_out = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
-        w_out = self['m_dot_out'].symbol / (rho_out * A)
+        eq_w = self['m_dot_out'].symbol - rho_out * self['w_out'].symbol * A
 
         h_in = self['h_ambient'].symbol
         s_in = self['s_ambient'].symbol
         s_out = self.medium.s_ph(self['p_out'].symbol, self['h_out'].symbol)
         eq2 = s_in - s_out
-        eq3 = h_in - (self['h_out'].symbol + w_out ** 2 / 2)
+        eq3 = h_in - (self['h_out'].symbol + self['w_out'].symbol ** 2 / 2)
 
-        return [eq1, eq2, eq3]
+        return [eq1, eq_w, eq2, eq3]
 
 
 class TwoPortSegment(Model):
@@ -115,10 +120,23 @@ class TwoPortSegment(Model):
         p_out, h_out, m_dot_out    - downstream face
 
     `m_dot` is the mass flow rate [kg/s] (signed by physical flow direction).
-    Velocity `w = m_dot / (rho * A)` is derived internally as needed for the
-    friction, kinetic-energy, and heat-transfer correlations -- it is not a
-    port variable, because using `w` on ports silently violates mass
-    conservation whenever connected components have different cross-sections.
+    Two **internal** algebraic Variables `w_in` / `w_out` carry the face
+    velocities so the friction, momentum, kinetic-energy, and heat-transfer
+    expressions can reference them as leaf SymPy symbols (lean lambdified
+    code).  The link between them is a pair of closures
+    `m_dot = rho * w * A` per face, which the trivial-equation reducer
+    can NOT collapse (rho is a nonlinear function of `(p, h)`), so the
+    `w_in` / `w_out` symbols stay leaf-shaped through code generation.
+
+    Why both?  Putting `m_dot` on the port unifies mass-flow across joints
+    regardless of cross-sectional-area mismatch (`add_connection` of
+    velocities silently breaks mass conservation when areas differ).
+    Keeping `w` as a Variable (instead of a derived expression
+    `m_dot / (rho * A)` substituted everywhere) keeps the per-equation
+    expression tree shallow -- otherwise every `w` reference inflates to a
+    nested `m_dot / (rho_ph(p, h) * A)` chain, which both slows the trivial
+    reducer (chained substitutions through hundreds of equations) and
+    bloats the lambdified Jacobian (more CoolProp evaluations per non-zero).
 
     `f_factor_func(Re, epsilon, Dh)` returns the friction factor symbolically.
     `q_inflow_func(w, p, h, rho, T, mu, k, fr, T_wall)` returns the heat input rate.
@@ -142,9 +160,11 @@ class TwoPortSegment(Model):
         self.add_component('p_in', Variable(101325, "Pa"))
         self.add_component('h_in', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
+        self.add_component('w_in', Variable(0.1, "m/s"))
         self.add_component('p_out', Variable(101325, "Pa"))
         self.add_component('h_out', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
+        self.add_component('w_out', Variable(0.1, "m/s"))
         self.add_component('A_in', Parameter(self.A_in, "m^2"))
         self.add_component('A_out', Parameter(self.A_out, "m^2"))
         self.add_component('P_in', Parameter(self.P_in, "m"))
@@ -167,12 +187,12 @@ class TwoPortSegment(Model):
         mu_out = self.medium.mu_ph(self['p_out'].symbol, self['h_out'].symbol)
         k_out = self.medium.k_ph(self['p_out'].symbol, self['h_out'].symbol)
 
-        # Internal velocities derived from m_dot + density + area.  `w` is not
-        # a port variable in this codebase; whenever the friction / KE /
-        # heat-transfer correlations need it, we reconstruct it locally so
-        # each face uses its own area.
-        w_in = self['m_dot_in'].symbol / (rho_in * self['A_in'].symbol)
-        w_out = self['m_dot_out'].symbol / (rho_out * self['A_out'].symbol)
+        # Local aliases -- leaf symbols only, so every reference below stays
+        # cheap to evaluate and cheap to differentiate.
+        w_in = self['w_in'].symbol
+        w_out = self['w_out'].symbol
+        m_dot_in = self['m_dot_in'].symbol
+        m_dot_out = self['m_dot_out'].symbol
 
         p_avg = (self['p_in'].symbol + self['p_out'].symbol) / 2
         h_avg = (self['h_in'].symbol + self['h_out'].symbol) / 2
@@ -182,7 +202,7 @@ class TwoPortSegment(Model):
         k_avg = (k_in + k_out) / 2
         w_avg = (w_in + w_out) / 2
         A_avg = (self['A_in'].symbol + self['A_out'].symbol) / 2
-        m_dot_avg = (self['m_dot_in'].symbol + self['m_dot_out'].symbol) / 2
+        m_dot_avg = (m_dot_in + m_dot_out) / 2
 
         Dh_in = 4 * self['A_in'].symbol / self['P_in'].symbol
         Dh_out = 4 * self['A_out'].symbol / self['P_out'].symbol
@@ -190,16 +210,24 @@ class TwoPortSegment(Model):
 
         Re_avg = rho_avg * abs(w_avg) * Dh_avg / mu_avg
 
-        # Continuity: m_dot is conserved end-to-end -- a single linear
-        # equation that the trivial-equation reducer eliminates entirely.
-        eq1 = self['m_dot_in'].symbol - self['m_dot_out'].symbol
+        # Mass-flow continuity end-to-end (trivially `m_dot_in == m_dot_out`;
+        # collapsed by the trivial-equation reducer at instantiate time so it
+        # contributes nothing at runtime).
+        eq_continuity = m_dot_in - m_dot_out
+
+        # m_dot <-> w closures, one per face.  Nonlinear in (rho, w) so the
+        # trivial reducer leaves them alone -- which is exactly what we want
+        # so that `w_in` / `w_out` keep being leaf symbols in the heavy
+        # friction / momentum / energy expressions below.
+        eq_w_in = m_dot_in - rho_in * self['A_in'].symbol * w_in
+        eq_w_out = m_dot_out - rho_out * self['A_out'].symbol * w_out
 
         # Momentum
         f_avg = self.f_factor_func(Re_avg, self.epsilon, Dh_avg)
         delta_P_friction = f_avg * (self['L'].symbol / Dh_avg) * (rho_avg * abs(w_avg) * w_avg / 2)
         momentum_flux = m_dot_avg * (w_out - w_in)
         buoyancy_force = -G_const * (self['z_out'].symbol - self['z_in'].symbol) * A_avg * rho_avg
-        eq2 = self['p_in'].symbol * self['A_in'].symbol - self['p_out'].symbol * self['A_out'].symbol - delta_P_friction * A_avg - momentum_flux + buoyancy_force
+        eq_momentum = self['p_in'].symbol * self['A_in'].symbol - self['p_out'].symbol * self['A_out'].symbol - delta_P_friction * A_avg - momentum_flux + buoyancy_force
 
         # Energy
         q = self.q_inflow_func(w_avg, p_avg, h_avg, rho_avg, T_avg, mu_avg, k_avg, f_avg, self['T_wall'].symbol)
@@ -217,14 +245,14 @@ class TwoPortSegment(Model):
         # enough to keep d sign_w / d w_avg well-conditioned.
         w_eps = 1e-4
         sign_w = w_avg / sp.sqrt(w_avg ** 2 + w_eps ** 2)
-        eq3 = self['h_in'].symbol + w_in ** 2 / 2 + sign_w * q - (self['h_out'].symbol + w_out ** 2 / 2)
+        eq_energy = self['h_in'].symbol + w_in ** 2 / 2 + sign_w * q - (self['h_out'].symbol + w_out ** 2 / 2)
 
         # `q_inflow` stays the raw magnitude of heat transfer (direction-
         # independent) so users get a meaningful "wall heat input" diagnostic
         # regardless of which way the fluid happens to be flowing.
-        eq4 = self['q_inflow'].symbol - q
+        eq_q_diag = self['q_inflow'].symbol - q
 
-        return [eq1, eq2, eq3, eq4]
+        return [eq_continuity, eq_w_in, eq_w_out, eq_momentum, eq_energy, eq_q_diag]
 
 
 class AdiabaticPump(TwoPortSegment):
@@ -370,16 +398,21 @@ class PressureSource(Model):
         self.add_component('p_out', Variable(self.p_source, "Pa"))
         self.add_component('h_out', Variable(self._h_total, "J/kg"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
+        # Internal velocity Variable; leaf symbol in the isentropic energy
+        # balance so `w_out**2 / 2` lambdifies to a flat expression rather
+        # than the deep `m_dot / (rho_ph(p, h) * A)` chain.
+        self.add_component('w_out', Variable(1.0, "m/s"))
 
     def declare_equations(self):
         h_total = self['h_total'].symbol
         s_total = self['s_total'].symbol
         s_out = self.medium.s_ph(self['p_out'].symbol, self['h_out'].symbol)
         rho_out = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
-        w_out = self['m_dot_out'].symbol / (rho_out * self['A'].symbol)
+        # m_dot <-> w closure (nonlinear in rho; trivial reducer leaves it alone).
+        eq_w = self['m_dot_out'].symbol - rho_out * self['w_out'].symbol * self['A'].symbol
         eq_isentropic = s_total - s_out
-        eq_energy = h_total - (self['h_out'].symbol + w_out ** 2 / 2)
-        return [eq_isentropic, eq_energy]
+        eq_energy = h_total - (self['h_out'].symbol + self['w_out'].symbol ** 2 / 2)
+        return [eq_w, eq_isentropic, eq_energy]
 
 
 class PressureVessel(Model):
@@ -694,6 +727,16 @@ class StraightPipe(Model):
         # building a sympy `Add` per pair and letting the trivial reducer eat them.
         for port in ('p_in', 'h_in', 'm_dot_in'):
             self.add_connection(self[port], self['pipe_segment_0'][port])
+        # Inter-segment wiring.  We deliberately do NOT union `w` between
+        # adjacent segments: each segment owns a pair of closure equations
+        # `m_dot = rho * A * w` (one per face), and at an internal interface
+        # both equations would reduce to the same statement after `(p, h,
+        # m_dot)` are unioned -- collapsing the two `w` symbols into one
+        # would leave the system over-determined by one equation per shared
+        # face.  Letting `w_out(seg_k)` and `w_in(seg_{k+1})` stay distinct
+        # algebraic Variables that independently converge to the same value
+        # costs `N - 1` extra unknowns per pipe but keeps the equation count
+        # square.
         for i in range(self.n_segments - 1):
             for io in ('p', 'h', 'm_dot'):
                 self.add_connection(
