@@ -8,10 +8,10 @@ version = "0.1.0"
 description = "Symbolic DAE/ODE solver for fluid-system dynamics."
 requires-python = ">=3.10"
 dependencies = [
-    "numpy",
-    "CoolProp",
-    "numba",
-    "sympy",
+ "numpy>=1.24",
+    "CoolProp>=6.5",
+    "numba>=0.58",
+"sympy>=1.12",
     "line_profiler",
     "plotly",
 ]
