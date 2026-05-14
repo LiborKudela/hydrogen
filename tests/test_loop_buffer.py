@@ -43,7 +43,14 @@ def _push_params(model: Model) -> None:
 
 class _InletPin(Model):
     """Inlet that pins both `m_dot_out` and the enthalpy it pushes into
-    the buffer (`h_out`, unioned to `buffer.h_in`)."""
+    the buffer (`h_out`, unioned to `buffer.h_in`).
+
+    Sign convention: `m_dot_target` is the user-facing "physical outflow
+    rate" (positive forward, i.e. flow leaving this pin into the
+    downstream buffer).  Under "flow into me", the boundary's own
+    `m_dot_out` measures fluid *entering* through its out-face, so we
+    pin `m_dot_out = -m_dot_target`.
+    """
 
     def __init__(self, medium: CoolPropMedium, m_dot: float, h_set: float):
         self.medium = medium
@@ -56,11 +63,11 @@ class _InletPin(Model):
         self.add_component('h_target',     Parameter(self._h_set, "J/kg"))
         self.add_component('p_out',        Variable(P_INIT, "Pa"))
         self.add_component('h_out',        Variable(self._h_set, "J/kg"))
-        self.add_component('m_dot_out',    Variable(self._m_dot, "kg/s"))
+        self.add_component('m_dot_out',    Variable(-self._m_dot, "kg/s"))
 
     def declare_equations(self):
         return [
-            self['m_dot_target'].symbol - self['m_dot_out'].symbol,
+            self['m_dot_target'].symbol + self['m_dot_out'].symbol,
             self['h_target'].symbol     - self['h_out'].symbol,
         ]
 
@@ -105,14 +112,23 @@ class _BufferTestSystem(Model):
 
     def declare_equations(self):
         # Standard (p, h, m_dot) wiring -- exactly the same shape as
-        # `examples/loop_pump_pipe.py`, so any code that wired into the
-        # legacy LoopBuffer keeps working unchanged.
-        for var in ('p', 'h', 'm_dot'):
+        # `examples/loop_pump_pipe.py`.  Under "flow into me", both faces
+        # of every m_dot wire describe fluid entering their own component
+        # at the shared interface, so the two values are equal in
+        # magnitude with opposite sign -> sum-to-zero connection on the
+        # flow channel.  `p` and `h` are across variables (single-valued
+        # at the interface) and stay direct equalities.
+        for var in ('p', 'h'):
             self.add_connection(self['inlet'][f'{var}_out'],
                                 self['buffer'][f'{var}_in'])
-        for var in ('p', 'm_dot'):
-            self.add_connection(self['buffer'][f'{var}_out'],
-                                self['outlet'][f'{var}_in'])
+        self.add_connection(self['inlet']['m_dot_out'],
+                            self['buffer']['m_dot_in'],
+                            sign=-1)
+        self.add_connection(self['buffer']['p_out'],
+                            self['outlet']['p_in'])
+        self.add_connection(self['buffer']['m_dot_out'],
+                            self['outlet']['m_dot_in'],
+                            sign=-1)
         return []
 
 
@@ -234,16 +250,23 @@ def test_reverse_flow_newton_converges(reverse_run):
     primary regression target: the legacy LoopBuffer would have happily
     integrated a wrong `m_dot_in * h_in` term with a negative m_dot_in
     and pushed the buffer into nonphysical territory before crashing
-    in CoolProp."""
+    in CoolProp.
+
+    Under the "flow into me" convention, forward axial flow through the
+    buffer reports m_dot_in > 0 (fluid entering at the inlet face) and
+    m_dot_out < 0 (fluid leaving at the outlet face = negative "into
+    me" rate); reverse flow flips both signs.
+    """
     m_dot_in = _trace(reverse_run["record"], ".buffer.m_dot_in")
     m_dot_out = _trace(reverse_run["record"], ".buffer.m_dot_out")
     n1 = reverse_run["n_phase1"]
-    # Forward phase: positive flow.
+    # Forward phase: m_dot_in > 0 (inflow at inlet), m_dot_out < 0
+    # (outflow at outlet under "into me" reporting).
     assert np.all(m_dot_in[:n1 + 1] > 0)
-    assert np.all(m_dot_out[:n1 + 1] > 0)
-    # Reverse phase: negative flow.
+    assert np.all(m_dot_out[:n1 + 1] < 0)
+    # Reverse phase: both signs flipped.
     assert np.all(m_dot_in[n1 + 1:] < 0)
-    assert np.all(m_dot_out[n1 + 1:] < 0)
+    assert np.all(m_dot_out[n1 + 1:] > 0)
 
 
 def test_reverse_flow_h_stays_constant(reverse_run):

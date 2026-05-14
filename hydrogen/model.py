@@ -994,7 +994,23 @@ class Model:
 
         def _decompose(eq):
             """Enumerate (var, coeff, rest) splits of `eq` where `var` is a
-            current-step Variable leaf appearing strictly linearly."""
+            current-step Variable leaf appearing strictly linearly.
+
+            Sign-canonicalization: `a*x + R == 0` and `-a*x - R == 0` encode
+            the same constraint, so we normalise the signature by flipping
+            BOTH `coeff` and `rest` whenever `coeff` carries a top-level
+            minus sign (`could_extract_minus_sign()`).  Without this,
+            adjacent pipe-segment face closures under the "flow into me"
+            convention end up in opposite-sign sympy forms after the signed
+            UF substitution (`m_dot_out - rho*A*w_out = 0` on the in-face
+            of seg_{k+1} vs the out-face's `-m_dot_in_{k+1} + rho*A*w_out =
+            0`); their `(coeff, rest)` would otherwise hash to different
+            buckets and the dedup pass would silently miss the match.
+
+            The keeper-var bookkeeping is unaffected: dedup still records
+            `dup_var -> keeper_var` (and the prev-step mirror), only the
+            hash key is canonicalised.
+            """
             out = []
             for s in eq.free_symbols:
                 if s not in raw_var_set or s not in var_set or s in removed_vars:
@@ -1007,6 +1023,20 @@ class Model:
                 rest = eq - coeff * s
                 if s in rest.free_symbols:
                     continue
+                # Canonicalise (coeff, rest) by sign so `(a, R)` and `(-a, -R)`
+                # land in the same bucket.  Use sympy's built-in heuristic
+                # `could_extract_minus_sign` -- it's the same predicate sympy
+                # itself uses for `Add` canonicalisation.
+                try:
+                    if coeff.could_extract_minus_sign():
+                        coeff = -coeff
+                        rest = -rest
+                except AttributeError:
+                    # `coeff` may be a plain Python number (e.g. `-1`); fall
+                    # back to a numeric sign check.
+                    if coeff < 0:
+                        coeff = -coeff
+                        rest = -rest
                 out.append((s, coeff, rest))
             return out
 

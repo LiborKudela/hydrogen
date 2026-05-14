@@ -117,20 +117,24 @@ class _SinusoidalFlowBoundary(Model):
         self.add_component('phase',     Parameter(self._phase, "rad"))
         self.add_component('h_set',     Parameter(self._h_set, "J/kg"))
         # Initial-guess values are reasonable for t = 0 (sin(phase) ~ 0 if
-        # phase = 0, else amplitude * sin(phase)).
+        # phase = 0, else -amplitude * sin(phase) under "flow into me").
         self.add_component('p_out',     Variable(P_INIT, "Pa"))
         self.add_component('h_set_out', Variable(self._h_set, "J/kg"))
         self.add_component('m_dot_out',
-                           Variable(self._amplitude * np.sin(self._phase),
+                           Variable(-self._amplitude * np.sin(self._phase),
                                     "kg/s", atol=ATOL["m_dot"]))
 
     def declare_equations(self):
+        # Under "flow into me", `m_dot_out` is positive when fluid enters
+        # the boundary through its out-face.  The user-facing `amplitude`
+        # is the boundary's physical *outflow* rate, so the residual reads
+        # `m_dot_out = -amp*sin(omega*t + phase)`.
         t = self.t_symbols[0]
         amp = self['amplitude'].symbol
         omega = self['omega'].symbol
         phase = self['phase'].symbol
         return [
-            self['m_dot_out'].symbol - amp * sp.sin(omega * t + phase),
+            self['m_dot_out'].symbol + amp * sp.sin(omega * t + phase),
             self['h_set_out'].symbol - self['h_set'].symbol,
         ]
 
@@ -171,16 +175,25 @@ class TwoPortMixingSystem(Model):
         )
 
     def declare_equations(self):
+        # m_dot is a flow variable -- under "flow into me", boundary's
+        # `m_dot_out` and junction's `m_dot_k` both measure fluid entering
+        # their own component at the shared interface, so they sum to zero
+        # (sign=-1 connection).  `p` and `h_set` are across variables and
+        # stay direct equalities.
         for k in range(2):
-            for io_var in ('p_out', 'h_set_out', 'm_dot_out'):
-                bnd_var = self[f'bnd_{k}'][io_var]
-                # Map boundary port names -> junction port names
-                junc_var = self['junction'][{
-                    'p_out':     f'p_{k}',
-                    'h_set_out': f'h_set_{k}',
-                    'm_dot_out': f'm_dot_{k}',
-                }[io_var]]
-                self.add_connection(bnd_var, junc_var)
+            self.add_connection(
+                self[f'bnd_{k}']['p_out'],
+                self['junction'][f'p_{k}'],
+            )
+            self.add_connection(
+                self[f'bnd_{k}']['h_set_out'],
+                self['junction'][f'h_set_{k}'],
+            )
+            self.add_connection(
+                self[f'bnd_{k}']['m_dot_out'],
+                self['junction'][f'm_dot_{k}'],
+                sign=-1,
+            )
         return []
 
     def apply_atols(self):

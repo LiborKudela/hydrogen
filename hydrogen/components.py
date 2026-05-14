@@ -51,21 +51,26 @@ class AmbientInlet(Model):
         self.add_port('outlet', FluidPort_phm(
             self,
             channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
-            flow_orientation='out',
+            flow_orientation='in',
             medium=self.medium,
         ))
 
     def declare_equations(self):
         A = np.pi * self['D'].symbol ** 2 / 4
-        # Continuity (mass-flow imposed): the port carries m_dot_out, the
-        # constitutive parameter `m_flow` sets its value.  This is trivial and
-        # collapses to a Parameter substitution at instantiate time.
-        eq1 = self['m_flow'].symbol - self['m_dot_out'].symbol
+        # Continuity (mass-flow imposed): under "flow into me", positive
+        # `m_dot_out` means fluid entering the inlet through its out-face
+        # (reverse flow).  The user-facing `m_flow` parameter still means
+        # "physical outflow rate" (positive forward), so we pin
+        # `m_dot_out = -m_flow`, i.e. `m_flow + m_dot_out == 0`.  Trivial
+        # and collapses to a Parameter substitution at instantiate time.
+        eq1 = self['m_flow'].symbol + self['m_dot_out'].symbol
 
         # m_dot <-> w closure (nonlinear in rho, so the trivial reducer
         # leaves it alone -- keeps `w_out` as a leaf symbol in eq3 below).
+        # Sign: `w_out` is axial forward, `m_dot_out` is "into me at the
+        # out-face" (axial backward), so they sum to zero.
         rho_out = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
-        eq_w = self['m_dot_out'].symbol - rho_out * self['w_out'].symbol * A
+        eq_w = self['m_dot_out'].symbol + rho_out * self['w_out'].symbol * A
 
         h_in = self['h_ambient'].symbol
         s_in = self['s_ambient'].symbol
@@ -105,16 +110,20 @@ class AmbientOutlet(Model):
         self.add_port('outlet', FluidPort_phm(
             self,
             channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
-            flow_orientation='out',
+            flow_orientation='in',
             medium=self.medium,
         ))
 
     def declare_equations(self):
+        # "Flow into me" sign convention: `m_dot_out` is positive when fluid
+        # enters through the boundary's out-face.  The user-facing `m_flow`
+        # remains "physical outflow rate" (positive forward), hence the `+`
+        # in both continuity and the m_dot<->w closure (see `AmbientInlet`).
         A = np.pi * self['D'].symbol ** 2 / 4
-        eq1 = self['m_flow'].symbol - self['m_dot_out'].symbol
+        eq1 = self['m_flow'].symbol + self['m_dot_out'].symbol
 
         rho_out = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
-        eq_w = self['m_dot_out'].symbol - rho_out * self['w_out'].symbol * A
+        eq_w = self['m_dot_out'].symbol + rho_out * self['w_out'].symbol * A
 
         h_in = self['h_ambient'].symbol
         s_in = self['s_ambient'].symbol
@@ -132,7 +141,14 @@ class TwoPortSegment(Model):
         p_in,  h_in,  m_dot_in     - upstream face
         p_out, h_out, m_dot_out    - downstream face
 
-    `m_dot` is the mass flow rate [kg/s] (signed by physical flow direction).
+    Sign convention -- Modelica "flow into me":
+        Every face's `m_dot` is positive when fluid ENTERS the component
+        through that face.  Forward axial flow (in-face -> out-face) is
+        therefore reported as `m_dot_in > 0`, `m_dot_out < 0`, and the
+        continuity equation `m_dot_in + m_dot_out == 0` holds (Kirchhoff
+        on the control volume).  The unsigned "axial flow rate" used
+        internally by momentum / energy terms is recovered as
+        `m_dot_axial = m_dot_in = -m_dot_out`.
     Two **internal** algebraic Variables `w_in` / `w_out` carry the face
     velocities so the friction, momentum, kinetic-energy, and heat-transfer
     expressions can reference them as leaf SymPy symbols (lean lambdified
@@ -237,10 +253,12 @@ class TwoPortSegment(Model):
         self.add_component('L', Parameter(self.L, "m"))
         self.add_component('T_wall', Parameter(293.15, "K"))
         self.add_component('q_inflow', Variable(0.0, "W"))
-        # Directional fluid ports.  m_dot_in is "into me at the in-face" and
-        # m_dot_out is "out of me at the out-face"; the segment's continuity
-        # equation `m_dot_in - m_dot_out == 0` makes the two numerically equal
-        # under forward flow.  See class docstring.
+        # Directional fluid ports.  BOTH faces use the Modelica "flow into
+        # me" convention -- positive m_dot means fluid entering the segment
+        # through that face -- so `flow_orientation='in'` on both, and the
+        # continuity equation `m_dot_in + m_dot_out == 0` (Kirchhoff on the
+        # CV) replaces the old axial-positive `m_dot_in - m_dot_out == 0`.
+        # See class docstring.
         self.add_port('inlet', FluidPort_phm(
             self,
             channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
@@ -250,7 +268,7 @@ class TwoPortSegment(Model):
         self.add_port('outlet', FluidPort_phm(
             self,
             channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
-            flow_orientation='out',
+            flow_orientation='in',
             medium=self.medium,
         ))
 
@@ -283,7 +301,15 @@ class TwoPortSegment(Model):
         k_avg = (k_in + k_out) / 2
         w_avg = (w_in + w_out) / 2
         A_avg = (self['A_in'].symbol + self['A_out'].symbol) / 2
-        m_dot_avg = (m_dot_in + m_dot_out) / 2
+        # Axial-positive mass-flow average: under the "flow into me"
+        # convention `m_dot_out` measures fluid *entering* through the out-
+        # face (i.e. axially backward), so the forward-flow rate is
+        # `m_dot_in == -m_dot_out`.  After continuity collapses one of
+        # `{m_dot_in, m_dot_out}` via the trivial reducer (or via signed UF
+        # if the residual is routed through `add_connection`), this
+        # difference evaluates to the surviving leaf with axial orientation
+        # -- which is what every downstream momentum / energy term wants.
+        m_dot_avg = (m_dot_in - m_dot_out) / 2
 
         Dh_in = 4 * self['A_in'].symbol / self['P_in'].symbol
         Dh_out = 4 * self['A_out'].symbol / self['P_out'].symbol
@@ -291,10 +317,12 @@ class TwoPortSegment(Model):
 
         Re_avg = rho_avg * abs(w_avg) * Dh_avg / mu_avg
 
-        # Mass-flow continuity end-to-end (trivially `m_dot_in == m_dot_out`;
-        # collapsed by the trivial-equation reducer at instantiate time so it
-        # contributes nothing at runtime).
-        eq_continuity = m_dot_in - m_dot_out
+        # Mass-flow continuity (Kirchhoff on the CV under "flow into me":
+        # net inflow sums to zero).  Linear in `m_dot_in, m_dot_out` with
+        # unit coefficients, so the trivial-equation reducer eliminates one
+        # leaf at instantiate time and the residual contributes nothing at
+        # runtime.
+        eq_continuity = m_dot_in + m_dot_out
 
         # m_dot <-> w closures, one per face.  Nonlinear in (rho, w) so the
         # trivial reducer leaves them alone -- which is exactly what we want
@@ -306,8 +334,14 @@ class TwoPortSegment(Model):
         # `instantiate()` collapses `w_out(seg_k)` and `w_in(seg_{k+1})` to
         # a single variable at every internal interface, dropping one
         # equation per face.
+        #
+        # Sign of `w_out` term: `w_out` is the axial velocity (positive
+        # forward), but `m_dot_out` is "into me at out-face" (positive
+        # backward) -- opposite orientations.  So the closure carries a
+        # `+ rho*A*w_out` term (sum-to-zero), unlike the `- rho*A*w_in` on
+        # the inlet face where both quantities point inward.
         eq_w_in = m_dot_in - rho_in * self['A_in'].symbol * w_in
-        eq_w_out = m_dot_out - rho_out * self['A_out'].symbol * w_out
+        eq_w_out = m_dot_out + rho_out * self['A_out'].symbol * w_out
 
         # Momentum
         f_avg = self.f_factor_func(Re_avg, self.epsilon, Dh_avg)
@@ -467,7 +501,7 @@ class Splitter(Model):
                 self,
                 channels={'p': self[f'p_out_{k}'], 'h': self[f'h_out_{k}'],
                           'm_dot': self[f'm_dot_out_{k}']},
-                flow_orientation='out',
+                flow_orientation='in',
                 medium=self.medium,
             ))
 
@@ -479,10 +513,13 @@ class Splitter(Model):
             self.add_connection(self[f'p_out_{k}'], self['p_in'])
             self.add_connection(self[f'h_out_{k}'], self['h_in'])
 
-        m_out = 0
+        # Mass balance under "flow into me": every port's m_dot measures
+        # fluid entering the splitter, so net inflow sums to zero.  Forward
+        # operation produces m_dot_in > 0 and each m_dot_out_k < 0.
+        m_sum = self['m_dot_in'].symbol
         for k in range(self.K):
-            m_out = m_out + self[f'm_dot_out_{k}'].symbol
-        return [self['m_dot_in'].symbol - m_out]
+            m_sum = m_sum + self[f'm_dot_out_{k}'].symbol
+        return [m_sum]
 
 
 class PressureSource(Model):
@@ -537,7 +574,7 @@ class PressureSource(Model):
         self.add_port('outlet', FluidPort_phm(
             self,
             channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
-            flow_orientation='out',
+            flow_orientation='in',
             medium=self.medium,
         ))
 
@@ -546,8 +583,12 @@ class PressureSource(Model):
         s_total = self['s_total'].symbol
         s_out = self.medium.s_ph(self['p_out'].symbol, self['h_out'].symbol)
         rho_out = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
-        # m_dot <-> w closure (nonlinear in rho; trivial reducer leaves it alone).
-        eq_w = self['m_dot_out'].symbol - rho_out * self['w_out'].symbol * self['A'].symbol
+        # m_dot <-> w closure (nonlinear in rho; trivial reducer leaves it
+        # alone).  Sign: under "flow into me", `m_dot_out` is positive when
+        # fluid enters through the out-face (axial backward) while `w_out`
+        # stays axial forward, so the two have opposite physical signs and
+        # sum to zero.
+        eq_w = self['m_dot_out'].symbol + rho_out * self['w_out'].symbol * self['A'].symbol
         eq_isentropic = s_total - s_out
         eq_energy = h_total - (self['h_out'].symbol + self['w_out'].symbol ** 2 / 2)
         return [eq_w, eq_isentropic, eq_energy]
@@ -955,17 +996,21 @@ class LoopBuffer(MixingJunction):
 
     Port API
     --------
-    Unchanged from the pre-subclass version:
+    Modelica "flow into me" convention -- both ports' `m_dot_*` are positive
+    when fluid enters the buffer through that face:
 
         p_in,  h_in,  m_dot_in       (driven by upstream;
-                                      m_dot_in  > 0 = flow INTO buffer)
+                                      m_dot_in  > 0 = flow INTO buffer at inlet)
         p_out, h_out, m_dot_out      (drives downstream;
-                                      m_dot_out > 0 = flow OUT OF buffer)
+                                      m_dot_out > 0 = flow INTO buffer at outlet
+                                                      = reverse axial flow)
 
-    Mapping onto the inherited `MixingJunction` ports:
+    Mapping onto the inherited `MixingJunction` ports (the junction already
+    uses "into me" semantics on every indexed port, so the two-port aliases
+    collapse to direct unions with no sign flips):
 
         p_in       <-> p_0          (unioned)
-        m_dot_in   <-> m_dot_0      (unioned, no sign flip)
+        m_dot_in   <-> m_dot_0      (unioned, both "into buffer at port 0")
         h_in       <-> h_set_0      (h_in plays the role of the inlet's
                                      stream-in enthalpy -- this is what
                                      forward flow physically carries into
@@ -973,8 +1018,7 @@ class LoopBuffer(MixingJunction):
         p_out      <-> p_1          (unioned)
         h_out      <-> h_1          (carrier; collapses to bulk h via the
                                      pin on h_set_1 below)
-        m_dot_out  <-> -m_dot_1     (explicit linear equation:
-                                     `m_dot_out + m_dot_1 == 0`)
+        m_dot_out  <-> m_dot_1      (unioned, both "into buffer at port 1")
         h_set_1     pinned to h     (the buffer's port API does NOT expose
                                      a separate downstream stream-in; this
                                      pin collapses the port-1 blend to
@@ -1019,7 +1063,7 @@ class LoopBuffer(MixingJunction):
         self.add_port('outlet', FluidPort_phm(
             self,
             channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
-            flow_orientation='out',
+            flow_orientation='in',
             medium=self.medium,
         ))
 
@@ -1043,12 +1087,14 @@ class LoopBuffer(MixingJunction):
         self.add_connection(self['p_out'],    self['p_1'])
         self.add_connection(self['h_out'],    self['h_1'])
 
-        # Sign-flip for m_dot_out: the parent's m_dot_1 is "into me",
-        # the buffer's m_dot_out is "out of me".  Trivially linear, the
-        # reducer eliminates one of {m_dot_out, m_dot_1} entirely.
-        eqs.append(self['m_dot_out'].symbol + self['m_dot_1'].symbol)
+        # Under "flow into me" the buffer's `m_dot_out` and the parent's
+        # `m_dot_1` are measuring the same physical quantity (both positive
+        # when fluid enters the buffer at port 1), so they're unioned with
+        # no sign flip -- UF eliminates one of {m_dot_out, m_dot_1} cleanly
+        # at instantiate time.
+        self.add_connection(self['m_dot_out'], self['m_dot_1'])
         # Pin downstream stream-in to bulk h (no separate API for it).
-        # Also trivially linear -- the reducer eliminates h_set_1 = h.
+        # Trivially linear -- the reducer eliminates h_set_1 = h.
         eqs.append(self['h_set_1'].symbol - self['h'].symbol)
 
         return eqs
@@ -1157,7 +1203,7 @@ class StraightPipe(Model):
         self.add_port('outlet', FluidPort_phm(
             self,
             channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
-            flow_orientation='out',
+            flow_orientation='in',
             medium=self.medium,
         ))
 
@@ -1223,12 +1269,27 @@ class StraightPipe(Model):
         # reference the SAME SymPy symbols for area / perimeter /
         # segment-length, which is exactly what `declare_components` above
         # wires up via shared `A` / `P` / `L_segment` Parameters.
+        # Under "flow into me", the m_dot at seg_i's out-face and seg_{i+1}'s
+        # in-face describe the same physical interface but from opposite
+        # control volumes (each measures fluid flowing INTO its own
+        # component) -- they're equal in magnitude with opposite sign, so
+        # we route the m_dot wire through signed UF (`sign=-1`) while p
+        # and h stay direct (across variables -- the face's pressure and
+        # enthalpy are single-valued regardless of which side looks at it).
         for i in range(self.n_segments - 1):
-            for io in ('p', 'h', 'm_dot'):
-                self.add_connection(
-                    self[f'pipe_segment_{i}'][f'{io}_out'],
-                    self[f'pipe_segment_{i + 1}'][f'{io}_in'],
-                )
+            self.add_connection(
+                self[f'pipe_segment_{i}']['p_out'],
+                self[f'pipe_segment_{i + 1}']['p_in'],
+            )
+            self.add_connection(
+                self[f'pipe_segment_{i}']['h_out'],
+                self[f'pipe_segment_{i + 1}']['h_in'],
+            )
+            self.add_connection(
+                self[f'pipe_segment_{i}']['m_dot_out'],
+                self[f'pipe_segment_{i + 1}']['m_dot_in'],
+                sign=-1,
+            )
         last = f'pipe_segment_{self.n_segments - 1}'
         for port in ('p_out', 'h_out', 'm_dot_out'):
             self.add_connection(self[port], self[last][port])

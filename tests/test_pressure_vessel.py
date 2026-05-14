@@ -31,6 +31,11 @@ class _ForcedInflow(Model):
     `p_out` is set by the downstream connection (vessel back-pressure); the
     source's `m_dot_out` is pinned to the requested mass flow via a trivial
     equation that the reducer collapses at instantiate time.
+
+    Sign convention: `m_dot` is the user-facing "physical outflow rate"
+    (positive forward, leaving this boundary into the downstream).  Under
+    "flow into me", the boundary's own `m_dot_out` measures fluid
+    *entering* through its out-face, so the pin reads `m_dot_out = -m_dot`.
     """
 
     def __init__(self, medium, m_dot, h_set):
@@ -44,10 +49,10 @@ class _ForcedInflow(Model):
         self.add_component('h_set', Parameter(self.h_set_value, "J/kg"))
         self.add_component('p_out', Variable(P_INIT, "Pa"))
         self.add_component('h_out', Variable(self.h_set_value, "J/kg"))
-        self.add_component('m_dot_out', Variable(self.m_dot_value, "kg/s"))
+        self.add_component('m_dot_out', Variable(-self.m_dot_value, "kg/s"))
 
     def declare_equations(self):
-        eq_m = self['m_dot'].symbol - self['m_dot_out'].symbol
+        eq_m = self['m_dot'].symbol + self['m_dot_out'].symbol
         eq_h = self['h_out'].symbol - self['h_set'].symbol
         return [eq_m, eq_h]
 
@@ -63,10 +68,13 @@ class _VesselSystem(Model):
         self.add_component('vessel', PressureVessel(self.medium, V_VESSEL, A_PORT, P_INIT, T_INIT))
 
     def declare_equations(self):
+        # m_dot is a flow variable: both ends measure "into me" at the
+        # shared interface so they sum to zero (sign=-1 connection).
+        # p and h are across variables and stay direct equalities.
         return [
             self['source']['p_out'].symbol - self['vessel']['p_in'].symbol,
             self['source']['h_out'].symbol - self['vessel']['h_in'].symbol,
-            self['source']['m_dot_out'].symbol - self['vessel']['m_dot_in'].symbol,
+            self['source']['m_dot_out'].symbol + self['vessel']['m_dot_in'].symbol,
         ]
 
 

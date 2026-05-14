@@ -64,6 +64,12 @@ class _PrescribedStreamBoundary(Model):
 
     The junction's per-port smooth-blend closure consumes `h_set_out` (wired
     to `junction.h_set_k`) and dictates the carrier `h_k`.
+
+    Sign convention: `m_dot_target` is the user-facing "physical outflow
+    rate" (positive forward, leaving this boundary into the junction).
+    Under "flow into me", the boundary's own `m_dot_out` measures fluid
+    *entering* through its out-face, so the pin reads
+    `m_dot_out = -m_dot_target`.
     """
 
     def __init__(self, medium: CoolPropMedium, m_dot_init: float, h_set: float):
@@ -77,11 +83,11 @@ class _PrescribedStreamBoundary(Model):
         self.add_component('h_set',        Parameter(self._h_set, "J/kg"))
         self.add_component('p_out',        Variable(P_INIT, "Pa"))
         self.add_component('h_set_out',    Variable(self._h_set, "J/kg"))
-        self.add_component('m_dot_out',    Variable(self._m_dot_init, "kg/s"))
+        self.add_component('m_dot_out',    Variable(-self._m_dot_init, "kg/s"))
 
     def declare_equations(self):
         return [
-            self['m_dot_target'].symbol - self['m_dot_out'].symbol,
+            self['m_dot_target'].symbol + self['m_dot_out'].symbol,
             self['h_set'].symbol        - self['h_set_out'].symbol,
         ]
 
@@ -116,10 +122,19 @@ class _PressurePinBoundary(Model):
 
 
 def _wire_port(parent: Model, bnd_path: str, junc_path: str, k: int) -> None:
-    """Connect a boundary's `_out` triple (+ stream-in) to junction port k."""
+    """Connect a boundary's `_out` triple (+ stream-in) to junction port k.
+
+    Under "flow into me", both `bnd.m_dot_out` and `junction.m_dot_k`
+    measure fluid entering their respective component at the shared
+    interface -- equal in magnitude with opposite sign, so the flow
+    channel uses a `sign=-1` (sum-to-zero) connection.  Pressure and
+    stream-in enthalpy are across variables (single-valued at the
+    interface) and stay direct equalities.
+    """
     parent.add_connection(parent[bnd_path]['p_out'],     parent[junc_path][f'p_{k}'])
     parent.add_connection(parent[bnd_path]['h_set_out'], parent[junc_path][f'h_set_{k}'])
-    parent.add_connection(parent[bnd_path]['m_dot_out'], parent[junc_path][f'm_dot_{k}'])
+    parent.add_connection(parent[bnd_path]['m_dot_out'], parent[junc_path][f'm_dot_{k}'],
+                          sign=-1)
 
 
 # =============================================================================
