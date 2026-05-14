@@ -854,7 +854,7 @@ class Model:
             the physical domain (positive density, positive area); users
             with constructions where the candidate coefficient can pass
             through zero should disable this pass via
-            `instantiate(remove_duplicate_equations=False)`.
+            `instantiate(max_remove_duplicate_passes=0)`.
         """
         raw_var_set = set(self.raw_var_symbols)
         var_set = set(var_symbols)
@@ -955,7 +955,7 @@ class Model:
 
     @line_profiler.profile
     def instantiate(self, cse=True, aditional_modules=None, max_remove_trival_passes=1,
-                    lambda_cache_dir=None, remove_duplicate_equations=True):
+                    lambda_cache_dir=None, max_remove_duplicate_passes=5):
         # Step B's `declare_equations()` template cache is scoped to this single
         # `instantiate()` call to avoid cross-call contamination (e.g. Air's
         # `Air_rho_ph` Function nodes leaking into a subsequent Hydrogen
@@ -968,7 +968,7 @@ class Model:
                 aditional_modules=aditional_modules,
                 max_remove_trival_passes=max_remove_trival_passes,
                 lambda_cache_dir=lambda_cache_dir,
-                remove_duplicate_equations=remove_duplicate_equations,
+                max_remove_duplicate_passes=max_remove_duplicate_passes,
             )
         finally:
             _eq_cache_var.reset(_eq_cache_token)
@@ -976,7 +976,7 @@ class Model:
     @line_profiler.profile
     def _instantiate_impl(self, cse=True, aditional_modules=None,
                           max_remove_trival_passes=1, lambda_cache_dir=None,
-                          remove_duplicate_equations=True):
+                          max_remove_duplicate_passes=5):
         if aditional_modules is None:
             aditional_modules = []
         # `_NUMPY_LAMBDIFY_COMPAT` patches sympy callables that `lambdify`
@@ -1175,26 +1175,43 @@ class Model:
         # signatures; for the headline use case -- StraightPipe face
         # closures -- the relevant equations are nonlinear and survive
         # trivial reduction unchanged).
-        if remove_duplicate_equations:
+        #
+        # Iterated up to `max_remove_duplicate_passes` times: pass N's
+        # substitutions can EXPOSE new duplicates for pass N+1.  Concretely,
+        # `TwoPortSegment`'s face-medium closures (rho, T, mu, k) get
+        # collapsed in pass 1 -- which in turn rewrites the rho leaves
+        # inside neighbouring `m_dot = rho * A * w` closures so that the
+        # face-velocity duplicates become visible in pass 2.  Passes are
+        # idempotent once no further substitutions fire, so the loop
+        # always terminates well below the cap for sane inputs.
+        if max_remove_duplicate_passes > 0:
             print("Removing duplicate equations")
             dup_start = time.time()
             before_n = len(self.improved_equations)
-            self.improved_equations, self.all_improved_symbols, dup_subs = (
-                self.remove_duplicate_equations(
-                    self.improved_equations, self.all_improved_symbols)
-            )
-            if dup_subs:
+            total_subs = 0
+            for pass_idx in range(max_remove_duplicate_passes):
+                print(f"Duplicate-equation pass {pass_idx + 1}")
+                pass_before_n = len(self.improved_equations)
+                self.improved_equations, self.all_improved_symbols, dup_subs = (
+                    self.remove_duplicate_equations(
+                        self.improved_equations, self.all_improved_symbols)
+                )
+                if not dup_subs:
+                    break
                 # Stitch the new substitutions into the running improve_subs
                 # map exactly the same way the trivial-pass loop does.
                 for prev_key in list(self.improve_subs.keys()):
                     self.improve_subs[prev_key] = self.improve_subs[prev_key].xreplace(dup_subs)
                 self.improve_subs.update(dup_subs)
-                improved_symbols_set = set(self.all_improved_symbols)
-                self.improved_vars = [s for s in self.raw_var_symbols if s in improved_symbols_set]
+                total_subs += len(dup_subs)
+                if len(self.improved_equations) == pass_before_n:
+                    break
+            improved_symbols_set = set(self.all_improved_symbols)
+            self.improved_vars = [s for s in self.raw_var_symbols if s in improved_symbols_set]
             after_n = len(self.improved_equations)
             print(
-                f"Duplicate-equation pass: {before_n - after_n} equation(s) / "
-                f"{len(dup_subs)} variable(s) eliminated in "
+                f"Duplicate-equation reduction: {before_n - after_n} equation(s) / "
+                f"{total_subs} substitution(s) over {pass_idx + 1} pass(es) in "
                 f"{time.time() - dup_start:.2f} s"
             )
 

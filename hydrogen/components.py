@@ -151,6 +151,21 @@ class TwoPortSegment(Model):
     This is what lets `Model.remove_duplicate_equations` collapse the per-
     face `m_dot = rho*A*w` closures across internal interfaces of a uniform
     `StraightPipe`.
+
+    Face thermodynamic properties (`T`, `rho`, `mu`, `k` at the in/out faces)
+    are exposed as explicit algebraic Variables with closure equations
+    `rho_in - rho_ph(p_in, h_in) == 0` (etc.).  Materialising them as leaf
+    symbols serves two purposes:
+      1. The downstream momentum / energy / friction expressions reference
+         the leaves directly, so CoolProp calls appear in the residual
+         exactly four times per face (rho, T, mu, k) -- not once per use.
+      2. After `add_connection` unifies the upstream-face `(p, h)` of segment
+         k+1 with the downstream-face of segment k, the two segments' face
+         closures become structurally identical.  The iterated
+         `Model.remove_duplicate_equations` pass collapses them, leaving
+         one closure per *physical* interface rather than per *segment side*,
+         and likewise unifies the face Variables.  For a uniform N-segment
+         pipe that removes ~4*(N-1) CoolProp evaluations per Newton iteration.
     """
 
     def __init__(self, medium: CoolPropMedium, A_in, A_out, P_in, P_out, z_in, z_out, L, epsilon, f_factor_func, q_inflow_func):
@@ -165,17 +180,41 @@ class TwoPortSegment(Model):
         self.epsilon = epsilon
         self.f_factor_func = f_factor_func
         self.q_inflow_func = q_inflow_func
+        # Cache the standard-state property values used as initial guesses
+        # for the face-property Variables.  Computed once per segment via
+        # the medium's scalar `eval_*_ph` callbacks so each Variable starts
+        # the Newton solve at a physically reasonable order of magnitude
+        # (otherwise the very first `eval_residual` would see e.g. mu=1
+        # while the actual value is ~1e-5 -- enough to push the line-
+        # search step into ridiculous regions).
+        h_std = float(medium.eval_h_pT(101325.0, 293.15))
+        self._h_std = h_std
+        self._rho_std = float(medium.eval_rho_ph(101325.0, h_std))
+        self._mu_std = float(medium.eval_mu_ph(101325.0, h_std))
+        self._k_std = float(medium.eval_k_ph(101325.0, h_std))
         super().__init__()
 
     def declare_components(self):
         self.add_component('p_in', Variable(101325, "Pa"))
-        self.add_component('h_in', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
+        self.add_component('h_in', Variable(self._h_std, "J/kg"))
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
         self.add_component('w_in', Variable(0.1, "m/s"))
         self.add_component('p_out', Variable(101325, "Pa"))
-        self.add_component('h_out', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
+        self.add_component('h_out', Variable(self._h_std, "J/kg"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
         self.add_component('w_out', Variable(0.1, "m/s"))
+        # Face thermodynamic properties as leaf Variables.  See class
+        # docstring for the rationale; closure equations are declared in
+        # `declare_equations` and the iterated duplicate-equation pass
+        # collapses them across shared interfaces of adjacent segments.
+        self.add_component('T_in',   Variable(293.15,         "K"))
+        self.add_component('T_out',  Variable(293.15,         "K"))
+        self.add_component('rho_in', Variable(self._rho_std,  "kg/m^3"))
+        self.add_component('rho_out',Variable(self._rho_std,  "kg/m^3"))
+        self.add_component('mu_in',  Variable(self._mu_std,   "Pa*s"))
+        self.add_component('mu_out', Variable(self._mu_std,   "Pa*s"))
+        self.add_component('k_in',   Variable(self._k_std,    "W/m/K"))
+        self.add_component('k_out',  Variable(self._k_std,    "W/m/K"))
         self.add_component('A_in', Parameter(self.A_in, "m^2"))
         self.add_component('A_out', Parameter(self.A_out, "m^2"))
         self.add_component('P_in', Parameter(self.P_in, "m"))
@@ -187,16 +226,18 @@ class TwoPortSegment(Model):
         self.add_component('q_inflow', Variable(0.0, "W"))
 
     def declare_equations(self):
-        # volume averages
-        T_in = self.medium.T_ph(self['p_in'].symbol, self['h_in'].symbol)
-        rho_in = self.medium.rho_ph(self['p_in'].symbol, self['h_in'].symbol)
-        mu_in = self.medium.mu_ph(self['p_in'].symbol, self['h_in'].symbol)
-        k_in = self.medium.k_ph(self['p_in'].symbol, self['h_in'].symbol)
-
-        T_out = self.medium.T_ph(self['p_out'].symbol, self['h_out'].symbol)
-        rho_out = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
-        mu_out = self.medium.mu_ph(self['p_out'].symbol, self['h_out'].symbol)
-        k_out = self.medium.k_ph(self['p_out'].symbol, self['h_out'].symbol)
+        # Face properties as LEAF symbols.  Closure equations below bind
+        # each Variable to its CoolProp evaluation; everything downstream
+        # references the leaf so the residual / Jacobian see no CoolProp
+        # calls anywhere except in those 8 closures.
+        T_in    = self['T_in'].symbol
+        T_out   = self['T_out'].symbol
+        rho_in  = self['rho_in'].symbol
+        rho_out = self['rho_out'].symbol
+        mu_in   = self['mu_in'].symbol
+        mu_out  = self['mu_out'].symbol
+        k_in    = self['k_in'].symbol
+        k_out   = self['k_out'].symbol
 
         # Local aliases -- leaf symbols only, so every reference below stays
         # cheap to evaluate and cheap to differentiate.
@@ -269,7 +310,32 @@ class TwoPortSegment(Model):
         # regardless of which way the fluid happens to be flowing.
         eq_q_diag = self['q_inflow'].symbol - q
 
-        return [eq_continuity, eq_w_in, eq_w_out, eq_momentum, eq_energy, eq_q_diag]
+        # Face-property closures.  Each is `leaf - X_ph(p, h) == 0`, i.e.
+        # linear in its dedicated leaf with a constant (= 1) coefficient
+        # and a (p, h)-only "rest" term.  Two adjacent segments meeting at
+        # an internal interface end up with structurally identical closures
+        # (after `add_connection` unifies (p, h) across the face and
+        # `_decompose` in the dedup pass picks the leaf as `var`); the
+        # iterated `Model.remove_duplicate_equations` then collapses the
+        # closure pair and unifies the two leaves.
+        p_in_sym = self['p_in'].symbol
+        p_out_sym = self['p_out'].symbol
+        h_in_sym = self['h_in'].symbol
+        h_out_sym = self['h_out'].symbol
+        eq_T_in    = T_in    - self.medium.T_ph(p_in_sym, h_in_sym)
+        eq_rho_in  = rho_in  - self.medium.rho_ph(p_in_sym, h_in_sym)
+        eq_mu_in   = mu_in   - self.medium.mu_ph(p_in_sym, h_in_sym)
+        eq_k_in    = k_in    - self.medium.k_ph(p_in_sym, h_in_sym)
+        eq_T_out   = T_out   - self.medium.T_ph(p_out_sym, h_out_sym)
+        eq_rho_out = rho_out - self.medium.rho_ph(p_out_sym, h_out_sym)
+        eq_mu_out  = mu_out  - self.medium.mu_ph(p_out_sym, h_out_sym)
+        eq_k_out   = k_out   - self.medium.k_ph(p_out_sym, h_out_sym)
+
+        return [
+            eq_continuity, eq_w_in, eq_w_out, eq_momentum, eq_energy, eq_q_diag,
+            eq_T_in,  eq_rho_in,  eq_mu_in,  eq_k_in,
+            eq_T_out, eq_rho_out, eq_mu_out, eq_k_out,
+        ]
 
 
 class AdiabaticPump(TwoPortSegment):
