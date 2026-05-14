@@ -69,11 +69,13 @@ class FillSystem(Model):
         )
 
     def declare_equations(self):
-        # Wire `(p, h, m_dot)` through every joint via union-find (cheaper than
-        # leaving these as residuals for the trivial-equation reducer).
-        for io in ('p', 'h', 'm_dot'):
-            self.add_connection(self['source'][f'{io}_out'], self['pipe'][f'{io}_in'])
-            self.add_connection(self['pipe'][f'{io}_out'], self['vessel'][f'{io}_in'])
+        # Wire `(p, h, m_dot)` through every joint via the typed-port
+        # `connect()` API.  Each call expands to one signed `add_connection`
+        # per channel, all of which collapse via the union-find pass at
+        # instantiate time (cheaper than leaving residuals for the trivial
+        # reducer).
+        self.connect(self['source'].ports['outlet'], self['pipe'].ports['inlet'])
+        self.connect(self['pipe'].ports['outlet'],   self['vessel'].ports['inlet'])
         return []
 
 

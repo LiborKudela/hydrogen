@@ -141,17 +141,14 @@ class PumpedLoop(Model):
         ))
 
     def declare_equations(self):
-        # Closed-loop wiring (union-find short-circuits these out of the
-        # symbolic Jacobian -- they never become equations).  Ports carry the
-        # `(p, h, m_dot)` triple; `m_dot` propagates mass-flow conservation
-        # across joints regardless of port-area mismatch.
-        for io in ('p', 'h', 'm_dot'):
-            # pump  -> pipe
-            self.add_connection(self['pump'][f'{io}_out'], self['pipe'][f'{io}_in'])
-            # pipe  -> buffer
-            self.add_connection(self['pipe'][f'{io}_out'], self['buffer'][f'{io}_in'])
-            # buffer -> pump   (this is the wire that closes the loop)
-            self.add_connection(self['buffer'][f'{io}_out'], self['pump'][f'{io}_in'])
+        # Closed-loop wiring through typed `FluidPort_phm` connectors.  Each
+        # `connect()` emits one signed `add_connection` per channel and rides
+        # the union-find short-circuit pass -- so these wires never become
+        # residuals in the symbolic Jacobian, just like before.
+        self.connect(self['pump'].ports['outlet'],   self['pipe'].ports['inlet'])
+        self.connect(self['pipe'].ports['outlet'],   self['buffer'].ports['inlet'])
+        self.connect(self['buffer'].ports['outlet'], self['pump'].ports['inlet'])
+        # (the last connect closes the loop)
 
         # Mass-flow operating point: prescribe m_dot, let the pump's free
         # `a_iz` (inside `f_pump = a_iz / (Re*Dh)`) adjust so that pump head

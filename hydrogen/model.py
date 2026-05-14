@@ -251,6 +251,10 @@ class Model:
         # trivial-equation reducer, which is much faster for large systems
         # where the bulk of the trivial equations are connection equalities.
         self.connections = []
+        # Typed `Port` registry.  Optional layer on top of `components`;
+        # ports merely group existing Variable references and add type/
+        # multiplicity checks at `connect()` time.  See `hydrogen/ports.py`.
+        self.ports = {}
         self.t_values = [0.0, 0.0, 0.0]
         self.declare_components()
         # Lazy: only `instantiate()` actually needs the flattened
@@ -304,34 +308,155 @@ class Model:
         """Override to return a list of sympy expressions, each implicitly == 0."""
         return []
 
-    def add_connection(self, var_a, var_b):
-        """Declare that two `Variable`s must always hold the same value.
+    def add_port(self, name, port):
+        """Register a `hydrogen.ports.Port` on this Model under `name`.
 
-        This is a hint to `instantiate()` that lets the framework collapse the
-        two variables into one via union-find, BEFORE the symbolic-equation
-        machinery runs.  Functionally equivalent to returning `var_a.symbol -
-        var_b.symbol` from `declare_equations()`, but much cheaper at scale:
+        Returns the port so users can chain in-place:
+
+            inlet = self.add_port('inlet', FluidPort_phm(self, channels={...}, ...))
+
+        Aliasing a port under a second name (e.g. to expose an inherited
+        port via a different label) is not supported; declare a fresh port
+        bound to the same channels instead.
+        """
+        from .ports import Port  # local import to avoid a circular module-load
+        if not isinstance(port, Port):
+            raise TypeError(
+                f"add_port expects a hydrogen.ports.Port instance, got "
+                f"{type(port).__name__}"
+            )
+        if name in self.ports:
+            raise ValueError(
+                f"Port {name!r} already declared on {getattr(self, 'name', type(self).__name__)}"
+            )
+        port.name = name
+        self.ports[name] = port
+        return port
+
+    def connect(self, port_a, port_b):
+        """Wire two ports together; emits one `add_connection` per channel.
+
+        See `hydrogen/ports.py` for the channel/orientation semantics.  The
+        sign on each `add_connection` is picked automatically:
+
+          * ACROSS channels      ->  sign = +1 (direct equality always)
+          * FLOW channels        ->  sign = +1 if orientations differ
+                                       (`out` -> `in`, the typical case)
+                                     sign = -1 if orientations match
+                                       (two `in` or two `out` ports;
+                                       sum-to-zero on the flow variable,
+                                       which is the Kirchhoff / Modelica
+                                       connector convention)
+
+        Two extra checks fire before any connection is recorded so wiring
+        mistakes raise at parent-time rather than producing a confusing
+        Newton failure:
+
+          * `kind` mismatch                            -> PortKindMismatchError
+          * a `medium` mismatch on either side (when   -> PortMediumMismatchError
+            both ports declare a non-None medium)
+          * either port already wired                  -> PortAlreadyConnectedError
+          * required channel missing on the other side -> PortChannelMissingError
+        """
+        from .ports import (
+            PortChannelMissingError,
+            PortKindMismatchError,
+            PortMediumMismatchError,
+        )
+
+        if port_a.kind != port_b.kind:
+            raise PortKindMismatchError(
+                f"Cannot connect ports of different kinds: "
+                f"{port_a._path()} ({port_a.kind!r}) <-> "
+                f"{port_b._path()} ({port_b.kind!r})"
+            )
+        if (port_a.medium is not None and port_b.medium is not None
+                and port_a.medium is not port_b.medium):
+            raise PortMediumMismatchError(
+                f"Cannot connect fluid ports with different media: "
+                f"{port_a._path()} (medium={port_a.medium}) <-> "
+                f"{port_b._path()} (medium={port_b.medium})"
+            )
+
+        flow_set = set(port_a.flow_channels)
+        if flow_set != set(port_b.flow_channels):
+            raise PortChannelMissingError(
+                f"Flow-channel sets disagree on matching-kind ports: "
+                f"{port_a._path()} {port_a.flow_channels} vs "
+                f"{port_b._path()} {port_b.flow_channels}"
+            )
+
+        port_a._mark_connected(port_b)
+        port_b._mark_connected(port_a)
+
+        same_orientation = (port_a.flow_orientation == port_b.flow_orientation)
+        # Iterate `port_a.channels` in insertion order so adjacent runs of
+        # `connect()` produce the same connection list (the UF pass is
+        # order-independent in result but the pretty-printed counters
+        # depend on it).
+        for ch_name in port_a.channels:
+            if ch_name not in port_b.channels:
+                raise PortChannelMissingError(
+                    f"Channel {ch_name!r} present on {port_a._path()} but missing "
+                    f"on {port_b._path()}"
+                )
+            va = port_a.channels[ch_name]
+            vb = port_b.channels[ch_name]
+            sign = -1 if (ch_name in flow_set and same_orientation) else +1
+            self.add_connection(va, vb, sign=sign)
+
+    def add_connection(self, var_a, var_b, sign=+1):
+        """Declare a linear constraint between two `Variable`s, resolved via
+        signed union-find BEFORE the symbolic-equation machinery runs.
+
+        With the default `sign=+1` this is the classical "same value" wire:
+        the constraint is `var_a - var_b == 0` and the two symbols collapse
+        into one shared representative.  With `sign=-1` the constraint is
+        `var_a + var_b == 0` (the value of one is the *negation* of the
+        other); the two symbols collapse to a single representative plus a
+        recorded sign, and every downstream `xreplace` emits `s -> rep`
+        for one and `s -> -rep` for the other.
+
+        Either form is functionally equivalent to returning the same sympy
+        expression from `declare_equations()`, but much cheaper at scale:
           * no sympy `Add` is built per connection,
           * the connection never enters the equation list,
           * the trivial-equation reducer doesn't have to discover it.
 
-        Use it for any "same physical port wired together" relationships
-        (pipe-to-pipe segment continuity, splitter outlet -> child inlet,
-        etc.).  Use the regular `declare_equations` return value for any
-        constraint that is genuinely non-trivial.
+        Use `sign=+1` for "same physical port wired together" (pipe-to-pipe
+        segment continuity, splitter outlet -> child inlet, ...).  Use
+        `sign=-1` when two ports of the same flow orientation are wired
+        (e.g. a junction port whose `m_dot` is "into me" connected to a
+        pipe inlet whose `m_dot` is also "into me") -- the resulting
+        constraint encodes "what enters one face must enter the other from
+        the opposite side".  The high-level `Model.connect()` /
+        `hydrogen.ports.Port` layer picks the sign automatically.
         """
-        self.connections.append((var_a, var_b))
+        if sign not in (+1, -1):
+            raise ValueError(f"connection sign must be +1 or -1, got {sign!r}")
+        self.connections.append((var_a, var_b, sign))
 
     def collect_connections(self):
-        """Recursively gather every `(var_a, var_b)` connection registered in
-        the tree.  Mirror of `collect_equations` but for connections only.
+        """Recursively gather every `(var_a, var_b, sign)` connection registered
+        in the tree.  Mirror of `collect_equations` but for connections only.
+
+        Legacy 2-tuple entries (from code that pre-dates signed union-find)
+        are widened to 3-tuples with `sign=+1` on the fly so external
+        callers and any in-tree composite that bypasses `add_connection`
+        keep working without modification.
 
         IMPORTANT: connections are declared *inside* `declare_equations`
         (because that's where the user has access to sub-components), so
         callers MUST call `collect_equations` first to flush them onto each
         component's `connections` list.
         """
-        conns = list(self.connections)
+        def _norm(c):
+            # Accept either (a, b) or (a, b, sign); always emit (a, b, sign).
+            if len(c) == 2:
+                return (c[0], c[1], +1)
+            return c
+
+        conns = [_norm(c) for c in self.connections]
         for c in self.components.values():
             if isinstance(c, Model) and c.is_composite():
                 conns.extend(c.collect_connections())
@@ -1053,52 +1178,103 @@ class Model:
         # nodes: BranchNode, TreeSystem) thereby skip building the Add(symA,
         # -symB) sympy expression entirely, and the reducer doesn't have to
         # rediscover them.
+        #
+        # The unionfind is SIGNED: each non-root carries a sign (+/-1)
+        # relative to its parent so we can collapse both `a == b` wires
+        # (`sign=+1`, the legacy form) AND `a + b == 0` wires (`sign=-1`,
+        # emitted by `Model.connect()` whenever two ports of the same flow
+        # orientation are wired -- e.g. junction-`in` to pipe-`in`).  The
+        # all-`+1` workload reduces structurally to plain UF (one extra
+        # integer multiply per `find()`), so this is a strict generalisation
+        # of the old code.
         connections = self.collect_connections()
         if connections:
             uf_start = time.time()
             uf_parent = {}
+            uf_sign = {}    # sign of this node relative to its parent (+/-1)
+            inconsistent_loops = []
 
             def find(s):
+                """Return (root, sign_of_s_relative_to_root).  Path-compress."""
                 parent = uf_parent.get(s, s)
                 if parent is s:
-                    return s
-                root = find(parent)
+                    return s, +1
+                root, sign_parent = find(parent)
+                sign_self = sign_parent * uf_sign.get(s, +1)
+                # Path-compression: rewire `s` directly under the root and
+                # collapse the accumulated sign onto `uf_sign[s]`.
                 uf_parent[s] = root
-                return root
+                uf_sign[s] = sign_self
+                return root, sign_self
 
-            def union(a, b):
-                ra, rb = find(a), find(b)
+            def union(a, b, sign):
+                """Add the constraint `a == sign * b`."""
+                ra, sa = find(a)
+                rb, sb = find(b)
                 if ra is rb:
+                    # Cycle: must be consistent.  `sa*ra == sign * sb*rb`
+                    # plus `ra is rb` requires `sa == sign * sb`.  An
+                    # inconsistent cycle forces `ra == -ra`, i.e. the whole
+                    # equivalence class collapses to zero -- almost certainly
+                    # a wiring mistake, so we surface it as a diagnostic.
+                    if sa != sign * sb:
+                        inconsistent_loops.append((a, b))
                     return
-                # deterministic: smaller symbol-name wins as representative
+                # Want:  sa * ra == sign * sb * rb
+                #   ->   ra == (sign * sb / sa) * rb   (sa, sb in {+1, -1})
+                rel_ab = sign * sb * sa  # +/-1
+                # Deterministic: smaller symbol-name wins as representative.
                 if rb.name < ra.name:
-                    ra, rb = rb, ra
-                uf_parent[rb] = ra
+                    # Flip so the smaller-named root absorbs the other.
+                    uf_parent[ra] = rb
+                    uf_sign[ra] = rel_ab
+                else:
+                    uf_parent[rb] = ra
+                    uf_sign[rb] = rel_ab
 
             raw_var_set = set(self.raw_var_symbols)
             deferred_eqs = []
-            for var_a, var_b in connections:
+            for var_a, var_b, sign in connections:
                 sa, sb = var_a.symbol, var_b.symbol
                 if sa is None or sb is None:
                     continue
                 if sa not in raw_var_set or sb not in raw_var_set:
                     # One side is a Parameter / t -- can't union with a non-Variable;
                     # defer to the symbolic trivial reducer.
-                    deferred_eqs.append(sa - sb)
+                    deferred_eqs.append(sa - sign * sb)
                     continue
-                union(sa, sb)
+                union(sa, sb, sign)
+
+            if inconsistent_loops:
+                preview = ", ".join(
+                    f"{a.name}<->{b.name}" for a, b in inconsistent_loops[:5]
+                )
+                raise ValueError(
+                    f"Inconsistent signed-connection cycle(s) detected "
+                    f"({len(inconsistent_loops)} pair(s), e.g. {preview}). "
+                    f"This usually means two ports of the same flow orientation "
+                    f"were wired in a loop that forces a variable to zero -- "
+                    f"check the topology before instantiate()."
+                )
 
             current_to_prev = {var.symbol: var.prev_symbol for var in self.raw_vars_references}
             connection_subs = {}
             for s in list(uf_parent.keys()):
-                rep = find(s)
+                rep, sign_to_rep = find(s)
                 if rep is s:
                     continue
-                connection_subs[s] = rep
+                # `s -> sign_to_rep * rep`.  sympy's xreplace handles the
+                # `-rep` case via a `Mul(-1, rep)` rewrite, so downstream
+                # consumers (trivial reducer, dedup pass, lambdify) need no
+                # changes -- they just see a regular sympy expression.
+                if sign_to_rep == +1:
+                    connection_subs[s] = rep
+                else:
+                    connection_subs[s] = -rep
                 ps = current_to_prev.get(s)
                 pr = current_to_prev.get(rep)
                 if ps is not None and pr is not None:
-                    connection_subs[ps] = pr
+                    connection_subs[ps] = pr if sign_to_rep == +1 else -pr
 
             if connection_subs:
                 self.improved_equations = [
@@ -1111,8 +1287,10 @@ class Model:
                 ]
             if deferred_eqs:
                 self.improved_equations = list(self.improved_equations) + deferred_eqs
+            n_signed = sum(1 for _, _, s in connections if s == -1)
             print(f"add_connection short-circuited {len(connection_subs)} symbols "
-                  f"from {len(connections)} pairs ({len(deferred_eqs)} deferred) "
+                  f"from {len(connections)} pairs "
+                  f"({n_signed} sign-flipped, {len(deferred_eqs)} deferred) "
                   f"in {time.time() - uf_start:.2f} s")
 
         if max_remove_trival_passes > 0:

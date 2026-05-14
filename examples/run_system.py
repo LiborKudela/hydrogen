@@ -49,12 +49,13 @@ class System(Model):
         self.add_component('integration_test', IntegrationTest(omega=2 * np.pi))
 
     def declare_equations(self):
-        # Series wiring on the `(p, h, m_dot)` port triple via union-find.
-        for io in ('p', 'h', 'm_dot'):
-            self.add_connection(self['ambient_inlet'][f'{io}_out'],
-                                self['straight_pipe_1'][f'{io}_in'])
-            self.add_connection(self['straight_pipe_1'][f'{io}_out'],
-                                self['straight_pipe_2'][f'{io}_in'])
+        # Series wiring through the typed `FluidPort_phm` connectors -- each
+        # `connect()` call emits one signed `add_connection` per channel and
+        # rides the same union-find fast path as before.
+        self.connect(self['ambient_inlet'].ports['outlet'],
+                     self['straight_pipe_1'].ports['inlet'])
+        self.connect(self['straight_pipe_1'].ports['outlet'],
+                     self['straight_pipe_2'].ports['inlet'])
         return []
 
 

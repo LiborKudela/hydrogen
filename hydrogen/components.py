@@ -8,6 +8,7 @@ import sympy as sp
 from .medium import CoolPropMedium
 from .model import DifferentialVariable, Model, Parameter, Variable
 from .numerics import G_const
+from .ports import FluidPort_phm
 
 
 class AmbientInlet(Model):
@@ -47,6 +48,12 @@ class AmbientInlet(Model):
         # energy balance below sees `w_out**2 / 2` as a 1-leaf expression
         # rather than a nested `m_dot/(rho*A)` chain that bloats the Jacobian.
         self.add_component('w_out', Variable(0.2, "m/s"))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='out',
+            medium=self.medium,
+        ))
 
     def declare_equations(self):
         A = np.pi * self['D'].symbol ** 2 / 4
@@ -95,6 +102,12 @@ class AmbientOutlet(Model):
         self.add_component('h_out', Variable(self.medium.h_pT(self.p_ambient, self.T_ambient) * 0.99, "J/kg"))
         self.add_component('m_dot_out', Variable(self.m_flow, "kg/s"))
         self.add_component('w_out', Variable(0.2, "m/s"))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='out',
+            medium=self.medium,
+        ))
 
     def declare_equations(self):
         A = np.pi * self['D'].symbol ** 2 / 4
@@ -224,6 +237,22 @@ class TwoPortSegment(Model):
         self.add_component('L', Parameter(self.L, "m"))
         self.add_component('T_wall', Parameter(293.15, "K"))
         self.add_component('q_inflow', Variable(0.0, "W"))
+        # Directional fluid ports.  m_dot_in is "into me at the in-face" and
+        # m_dot_out is "out of me at the out-face"; the segment's continuity
+        # equation `m_dot_in - m_dot_out == 0` makes the two numerically equal
+        # under forward flow.  See class docstring.
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='out',
+            medium=self.medium,
+        ))
 
     def declare_equations(self):
         # Face properties as LEAF symbols.  Closure equations below bind
@@ -380,6 +409,12 @@ class PressureOutlet(Model):
         self.add_component('p_in', Variable(self.p_ambient, "Pa"))
         self.add_component('h_in', Variable(self._h_ambient, "J/kg"))
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
 
     def declare_equations(self):
         return [self['p_in'].symbol - self['p_ambient'].symbol]
@@ -421,6 +456,20 @@ class Splitter(Model):
             self.add_component(f'p_out_{k}', Variable(101325.0, "Pa"))
             self.add_component(f'h_out_{k}', Variable(self._h_init, "J/kg"))
             self.add_component(f'm_dot_out_{k}', Variable(0.0, "kg/s"))
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+        for k in range(self.K):
+            self.add_port(f'outlet_{k}', FluidPort_phm(
+                self,
+                channels={'p': self[f'p_out_{k}'], 'h': self[f'h_out_{k}'],
+                          'm_dot': self[f'm_dot_out_{k}']},
+                flow_orientation='out',
+                medium=self.medium,
+            ))
 
     def declare_equations(self):
         # The K pressure and K enthalpy equalities are pure variable-equality
@@ -485,6 +534,12 @@ class PressureSource(Model):
         # balance so `w_out**2 / 2` lambdifies to a flat expression rather
         # than the deep `m_dot / (rho_ph(p, h) * A)` chain.
         self.add_component('w_out', Variable(1.0, "m/s"))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='out',
+            medium=self.medium,
+        ))
 
     def declare_equations(self):
         h_total = self['h_total'].symbol
@@ -562,6 +617,12 @@ class PressureVessel(Model):
         self.add_component('p_in', Variable(self.p_init, "Pa"))
         self.add_component('h_in', Variable(self.h_init, "J/kg"))
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
 
     def declare_equations(self):
         m = self['m'].symbol
@@ -949,6 +1010,18 @@ class LoopBuffer(MixingJunction):
         self.add_component('p_out',     Variable(self.p_init, "Pa"))
         self.add_component('h_out',     Variable(self.h_init, "J/kg"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='out',
+            medium=self.medium,
+        ))
 
     def declare_equations(self):
         # Pull in the parent's storage residuals + port blends.
@@ -1075,6 +1148,18 @@ class StraightPipe(Model):
         self.add_component('p_out', Variable(101325, "Pa"))
         self.add_component('h_out', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='out',
+            medium=self.medium,
+        ))
 
         # `N+1` axial stations shared between adjacent segments: segment `k`'s
         # `z_out` and segment `k+1`'s `z_in` reference the same `Parameter`.

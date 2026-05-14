@@ -37,6 +37,17 @@ from .model import (
     Variable,
 )
 from .plotting import local_results_path, plot_results
+from .ports import (
+    ElectricalPort_VI,
+    FluidPort_phm,
+    Port,
+    PortAlreadyConnectedError,
+    PortChannelMissingError,
+    PortError,
+    PortKindMismatchError,
+    PortMediumMismatchError,
+    ThermalPort_TQ,
+)
 from .test_models import (
     InnerODE_1,
     InnerODE_2,
@@ -54,6 +65,16 @@ __all__ = [
     # medium
     "CoolPropMedium",
     "get_symbolic_property_function",
+    # ports
+    "Port",
+    "FluidPort_phm",
+    "ThermalPort_TQ",
+    "ElectricalPort_VI",
+    "PortError",
+    "PortAlreadyConnectedError",
+    "PortKindMismatchError",
+    "PortChannelMissingError",
+    "PortMediumMismatchError",
     # components
     "AmbientInlet",
     "AmbientOutlet",

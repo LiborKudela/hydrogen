@@ -105,23 +105,23 @@ class BranchNode(Model):
             self.add_component('outlet', PressureOutlet(self.medium, self.p_outlet, self.T_outlet))
 
     def declare_equations(self):
-        # All inter-component wiring here is variable-equality -- route via the
-        # union-find `add_connection` API so the trivial-equation reducer never
-        # sees these as sympy expressions.  Ports carry `(p, h, m_dot)`; the
-        # m_dot union enforces mass conservation regardless of any port-area
-        # mismatch across the joint.
+        # All inter-component wiring goes through the typed-port `connect()`
+        # API.  Each call emits one signed `add_connection` per port channel
+        # and rides the same union-find short-circuit as before, so the
+        # trivial-equation reducer never sees these wires as sympy
+        # residuals.  The m_dot union still enforces mass conservation
+        # regardless of any port-area mismatch across the joint.
         if self.depth_remaining > 0:
-            for io in ('p', 'h', 'm_dot'):
-                self.add_connection(self['pipe'][f'{io}_out'], self['splitter'][f'{io}_in'])
+            self.connect(self['pipe'].ports['outlet'],
+                         self['splitter'].ports['inlet'])
             for k in range(self.K):
-                for io in ('p', 'h', 'm_dot'):
-                    self.add_connection(
-                        self['splitter'][f'{io}_out_{k}'],
-                        self[f'child_{k}']['pipe'][f'{io}_in'],
-                    )
+                self.connect(
+                    self['splitter'].ports[f'outlet_{k}'],
+                    self[f'child_{k}']['pipe'].ports['inlet'],
+                )
         else:
-            for io in ('p', 'h', 'm_dot'):
-                self.add_connection(self['pipe'][f'{io}_out'], self['outlet'][f'{io}_in'])
+            self.connect(self['pipe'].ports['outlet'],
+                         self['outlet'].ports['inlet'])
         return []
 
 
@@ -188,8 +188,8 @@ class TreeSystem(Model):
         ))
 
     def declare_equations(self):
-        for io in ('p', 'h', 'm_dot'):
-            self.add_connection(self['source'][f'{io}_out'], self['tree']['pipe'][f'{io}_in'])
+        self.connect(self['source'].ports['outlet'],
+                     self['tree']['pipe'].ports['inlet'])
         return []
 
 
