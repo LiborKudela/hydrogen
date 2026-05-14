@@ -140,6 +140,17 @@ class TwoPortSegment(Model):
 
     `f_factor_func(Re, epsilon, Dh)` returns the friction factor symbolically.
     `q_inflow_func(w, p, h, rho, T, mu, k, fr, T_wall)` returns the heat input rate.
+
+    Each of the seven geometry slots (`A_in`, `A_out`, `P_in`, `P_out`, `z_in`,
+    `z_out`, `L`) may be passed either as a plain Python scalar OR as an
+    existing `Parameter` instance owned by a parent `Model`.  The
+    `Parameter(...)` constructor itself handles the dispatch (see
+    `Parameter.__new__`): a scalar produces a fresh local Parameter, an
+    existing Parameter produces a transparent `ParameterAlias` so two
+    sibling segments end up with the SAME SymPy symbol in their equations.
+    This is what lets `Model.remove_duplicate_equations` collapse the per-
+    face `m_dot = rho*A*w` closures across internal interfaces of a uniform
+    `StraightPipe`.
     """
 
     def __init__(self, medium: CoolPropMedium, A_in, A_out, P_in, P_out, z_in, z_out, L, epsilon, f_factor_func, q_inflow_func):
@@ -218,7 +229,13 @@ class TwoPortSegment(Model):
         # m_dot <-> w closures, one per face.  Nonlinear in (rho, w) so the
         # trivial reducer leaves them alone -- which is exactly what we want
         # so that `w_in` / `w_out` keep being leaf symbols in the heavy
-        # friction / momentum / energy expressions below.
+        # friction / momentum / energy expressions below.  When two sibling
+        # segments share their geometry Parameters (e.g. all segments of a
+        # `StraightPipe` referencing the same `A` symbol via
+        # `ParameterAlias`), the equation-deduplication pass run during
+        # `instantiate()` collapses `w_out(seg_k)` and `w_in(seg_{k+1})` to
+        # a single variable at every internal interface, dropping one
+        # equation per face.
         eq_w_in = m_dot_in - rho_in * self['A_in'].symbol * w_in
         eq_w_out = m_dot_out - rho_out * self['A_out'].symbol * w_out
 
@@ -959,10 +976,33 @@ class StraightPipe(Model):
         return 0.0
 
     def declare_components(self):
-        L_segments = self.L / self.n_segments
-        A = np.pi * self.D ** 2 / 4
-        P = np.pi * self.D
-        dz = (self.z_out - self.z_in) / self.n_segments
+        # Pipe-level constitutive Parameters.  Hoisting these out of the
+        # per-segment `TwoPortSegment`s and passing them down as shared
+        # `Parameter` references is what makes every segment's equations
+        # reference the SAME SymPy symbols for area, perimeter, and segment
+        # length -- a precondition for `Model.remove_duplicate_equations`
+        # to recognise the per-face `m_dot = rho*A*w` closures of adjacent
+        # segments as structurally identical (apart from a single `w` leaf)
+        # and collapse them.
+        self.add_component('D', Parameter(self.D, "m"))
+        self.add_component('L', Parameter(self.L, "m"))
+        self.add_component('epsilon', Parameter(self.epsilon, "m"))
+        self.add_component('z_in', Parameter(self.z_in, "m"))
+        self.add_component('z_out', Parameter(self.z_out, "m"))
+        # Derived shared geometry.  We register them as their own Parameters
+        # (rather than building `pi*D**2/4` as a SymPy expression every time
+        # a segment references it) because Parameter symbols are flat
+        # leaves: the per-segment friction / momentum / energy expression
+        # trees stay shallow, and the equation-dedup signature comparison
+        # is a single-symbol hash rather than a full subtree walk.
+        A_value = np.pi * self.D ** 2 / 4
+        P_value = np.pi * self.D
+        L_segment_value = self.L / self.n_segments
+        self.add_component('A', Parameter(A_value, "m^2"))
+        self.add_component('P', Parameter(P_value, "m"))
+        self.add_component('L_segment', Parameter(L_segment_value, "m"))
+
+        # Pipe-level port Variables.
         self.add_component('p_in', Variable(101325, "Pa"))
         self.add_component('h_in', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
@@ -970,14 +1010,34 @@ class StraightPipe(Model):
         self.add_component('h_out', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
 
+        # `N+1` axial stations shared between adjacent segments: segment `k`'s
+        # `z_out` and segment `k+1`'s `z_in` reference the same `Parameter`.
+        # Not strictly required for the dedup pass to fire on the face
+        # closures (which don't depend on `z`), but it halves the elevation-
+        # Parameter inventory of a pipe and keeps a single source of truth
+        # for each interface elevation.
+        dz = (self.z_out - self.z_in) / self.n_segments
+        for j in range(self.n_segments + 1):
+            self.add_component(f'z_{j}', Parameter(self.z_in + j * dz, "m"))
+
+        A_param = self['A']
+        P_param = self['P']
+        L_seg_param = self['L_segment']
         for i in range(self.n_segments):
-            z_in = self.z_in + i * dz
-            z_out = self.z_in + (i + 1) * dz
             fr_f = self.get_churchill_f_factor
             q_f = self.get_q_inflow if not self.adiabatic else self.get_q_inflow_adiabatic
             self.add_component(
                 f'pipe_segment_{i}',
-                TwoPortSegment(self.medium, A, A, P, P, z_in, z_out, L_segments, self.epsilon, fr_f, q_f),
+                TwoPortSegment(
+                    self.medium,
+                    A_in=A_param, A_out=A_param,
+                    P_in=P_param, P_out=P_param,
+                    z_in=self[f'z_{i}'], z_out=self[f'z_{i + 1}'],
+                    L=L_seg_param,
+                    epsilon=self.epsilon,
+                    f_factor_func=fr_f,
+                    q_inflow_func=q_f,
+                ),
             )
 
     def declare_equations(self):
@@ -996,15 +1056,22 @@ class StraightPipe(Model):
         for port in ('p_in', 'h_in', 'm_dot_in'):
             self.add_connection(self[port], self['pipe_segment_0'][port])
         # Inter-segment wiring.  We deliberately do NOT union `w` between
-        # adjacent segments: each segment owns a pair of closure equations
-        # `m_dot = rho * A * w` (one per face), and at an internal interface
-        # both equations would reduce to the same statement after `(p, h,
-        # m_dot)` are unioned -- collapsing the two `w` symbols into one
-        # would leave the system over-determined by one equation per shared
-        # face.  Letting `w_out(seg_k)` and `w_in(seg_{k+1})` stay distinct
-        # algebraic Variables that independently converge to the same value
-        # costs `N - 1` extra unknowns per pipe but keeps the equation count
-        # square.
+        # adjacent segments via `add_connection`: each segment owns a pair
+        # of closure equations `m_dot = rho * A * w` (one per face), and at
+        # an internal interface both equations reduce to the same statement
+        # after `(p, h, m_dot)` are unioned -- collapsing the two `w`
+        # symbols via `add_connection` would leave the system over-
+        # determined by one equation per shared face.
+        #
+        # Instead, `Model.remove_duplicate_equations` (run during
+        # `instantiate()`, controlled by the same-named flag) detects the
+        # two face closures as structurally identical apart from their `w`
+        # leaf and unifies them -- removing both the redundant `w` symbol
+        # AND its closure equation per internal interface (`N - 1`
+        # eliminations per pipe).  For this to fire, both segments must
+        # reference the SAME SymPy symbols for area / perimeter /
+        # segment-length, which is exactly what `declare_components` above
+        # wires up via shared `A` / `P` / `L_segment` Parameters.
         for i in range(self.n_segments - 1):
             for io in ('p', 'h', 'm_dot'):
                 self.add_connection(

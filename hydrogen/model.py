@@ -347,6 +347,11 @@ class Model:
         vars_references = []
         param_references = []
         for _, c in self.components.items():
+            if isinstance(c, ParameterAlias):
+                # The target Parameter is owned (and accounted for) by
+                # whichever Model has it directly in its `components`;
+                # the alias only forwards reads.
+                continue
             if isinstance(c, Parameter):
                 param_references.append(c)
             if isinstance(c, Variable) and not c.is_connected:
@@ -383,6 +388,11 @@ class Model:
                 # is one, otherwise fall back to the class name.
                 dotted_prefix = getattr(self, 'name', None) or self.__class__.__name__
         for c in self.components.values():
+            if isinstance(c, ParameterAlias):
+                # Alias: the target Parameter is owned by another Model in
+                # the tree and that Model's `assign_symbols` walk assigns
+                # the symbol there.  Skip here to avoid double-naming.
+                continue
             if prefix:
                 compound_name = f"{prefix}_{c.name}"
             else:
@@ -416,10 +426,20 @@ class Model:
         leaf reachable from this Model.  Used by the Step-B per-class equation
         cache to remap a cached template's symbols onto a fresh instance's
         symbols by structural path (e.g., `('pipe_segment_0', 'p_in')`).
+
+        `ParameterAlias` entries are included under their LOCAL path: this
+        is what lets the cache replay correctly across instances that
+        share the same alias structure but point at different target
+        Parameters (e.g. `pipe1.pipe_segment_*.A_in -> pipe1.A` vs
+        `pipe2.pipe_segment_*.A_in -> pipe2.A`).
         """
         out = {}
         for name, c in self.components.items():
-            if isinstance(c, (Variable, Parameter)):
+            if isinstance(c, ParameterAlias):
+                sym = c.symbol
+                if sym is not None:
+                    out[(name,)] = sym
+            elif isinstance(c, (Variable, Parameter)):
                 sym = getattr(c, 'symbol', None)
                 if sym is not None:
                     out[(name,)] = sym
@@ -789,11 +809,153 @@ class Model:
         updated_var_symbols = [v for v in var_symbols_list if v not in removed_vars]
         return new_eqs, updated_var_symbols, substitutions
 
+    # --- duplicate-equation reduction -------------------------------------------------
+
+    @line_profiler.profile
+    def remove_duplicate_equations(self, equations, var_symbols):
+        """Collapse pairs (or groups) of equations of the shape
+        `alpha * var + R == 0` whose `(alpha, R)` are structurally identical
+        apart from the linear leaf `var`.
+
+        Such pairs imply `var_a == var_b` (one degree of redundancy per
+        match: `var_a` and `var_b` differ only by a single rename in two
+        otherwise-identical equations).  Removing one equation and rewriting
+        `var_b -> var_a` in every survivor leaves the system square AND
+        smaller.
+
+        The canonical motivating case is a `StraightPipe`'s per-segment
+        face-velocity closures: after `add_connection` unifies `(p, h,
+        m_dot)` across an internal interface and `StraightPipe`'s shared
+        `A` Parameter makes both sides reference the same area symbol, the
+        two closures
+            m_dot - rho_ph(p, h) * A * w_out(seg_k)         == 0
+            m_dot - rho_ph(p, h) * A * w_in(seg_{k+1})      == 0
+        are structurally identical apart from the `w_*` leaf.  This pass
+        unifies `w_in(seg_{k+1}) := w_out(seg_k)` and drops one of the two
+        equations, saving `N - 1` variables AND equations per pipe.
+
+        Strategy:
+          1. For each equation, enumerate every leaf Variable that appears
+             strictly linearly with an in-leaf-constant coefficient (so the
+             equation decomposes as `coeff * var + rest == 0`).
+          2. Bucket equations by `(coeff, rest)` SymPy structural identity.
+          3. The first equation registered in each bucket becomes the
+             representative; subsequent matches schedule `dup_var ->
+             keeper_var` substitutions and drop their equation.
+          4. Close substitution chains, apply via `xreplace` to survivors,
+             and mirror onto the prev-step companion symbols so the
+             time-stepping bookkeeping stays consistent.
+
+        Safety:
+          * Only acts on `coeff != 0` (structural zero check, matching the
+            convention used by `remove_trivial_equations`).
+          * The implicit division by `coeff` it represents is safe for the
+            face-closure use case because `coeff = -rho * A` is non-zero on
+            the physical domain (positive density, positive area); users
+            with constructions where the candidate coefficient can pass
+            through zero should disable this pass via
+            `instantiate(remove_duplicate_equations=False)`.
+        """
+        raw_var_set = set(self.raw_var_symbols)
+        var_set = set(var_symbols)
+        current_to_prev = {var.symbol: var.prev_symbol for var in self.raw_vars_references}
+
+        # `signatures[(coeff, rest)] = (var, idx)` -- first equation registered
+        # for each structural template gets to keep its variable.
+        signatures = {}
+        duplicate_subs = {}     # var_to_eliminate -> keeper (current AND prev)
+        drop_indices = set()
+        removed_vars = set()
+
+        def _decompose(eq):
+            """Enumerate (var, coeff, rest) splits of `eq` where `var` is a
+            current-step Variable leaf appearing strictly linearly."""
+            out = []
+            for s in eq.free_symbols:
+                if s not in raw_var_set or s not in var_set or s in removed_vars:
+                    continue
+                coeff = eq.coeff(s, 1)
+                if coeff == 0:
+                    continue
+                if s in coeff.free_symbols:
+                    continue
+                rest = eq - coeff * s
+                if s in rest.free_symbols:
+                    continue
+                out.append((s, coeff, rest))
+            return out
+
+        print("Identifying duplicate equations (structural)")
+        for idx, eq in enumerate(equations):
+            cands = _decompose(eq)
+            if not cands:
+                continue
+
+            matched = False
+            for var, coeff, rest in cands:
+                sig = (coeff, rest)
+                existing = signatures.get(sig)
+                if existing is None:
+                    continue
+                keeper_var, _ = existing
+                if keeper_var is var or keeper_var in removed_vars:
+                    continue
+                duplicate_subs[var] = keeper_var
+                removed_vars.add(var)
+                var_prev = current_to_prev.get(var)
+                keeper_prev = current_to_prev.get(keeper_var)
+                if var_prev is not None and keeper_prev is not None:
+                    duplicate_subs[var_prev] = keeper_prev
+                    removed_vars.add(var_prev)
+                drop_indices.add(idx)
+                matched = True
+                break
+
+            if matched:
+                continue
+
+            # No match -- register EVERY decomposition of this equation so
+            # future equations can match on any of them.  This matters
+            # because the matching decomposition may not be the
+            # `_decompose` iteration order's first (e.g. the face closure
+            # has BOTH a `var=m_dot, coeff=1, rest=-rho*A*w` decomposition
+            # AND a `var=w, coeff=-rho*A, rest=m_dot` decomposition; the
+            # latter is the cross-segment-aligned one).
+            for var, coeff, rest in cands:
+                sig = (coeff, rest)
+                if sig not in signatures:
+                    signatures[sig] = (var, idx)
+
+        if not duplicate_subs:
+            print("No duplicate equations found")
+            return equations, var_symbols, {}
+
+        print(
+            f"Identified {len(drop_indices)} duplicate equation(s) / "
+            f"{len(duplicate_subs)} substitution(s)"
+        )
+        Model._close_substitutions(duplicate_subs)
+        sub_keys = set(duplicate_subs.keys())
+
+        new_eqs = []
+        for idx, eq in enumerate(equations):
+            if idx in drop_indices:
+                continue
+            if eq.free_symbols.isdisjoint(sub_keys):
+                new_eqs.append(eq)
+            else:
+                new_eqs.append(eq.xreplace(duplicate_subs))
+
+        removed_set = set(duplicate_subs.keys())
+        new_var_symbols = [s for s in var_symbols if s not in removed_set]
+
+        return new_eqs, new_var_symbols, duplicate_subs
+
     # --- compilation ------------------------------------------------------------------
 
     @line_profiler.profile
     def instantiate(self, cse=True, aditional_modules=None, max_remove_trival_passes=1,
-                    lambda_cache_dir=None):
+                    lambda_cache_dir=None, remove_duplicate_equations=True):
         # Step B's `declare_equations()` template cache is scoped to this single
         # `instantiate()` call to avoid cross-call contamination (e.g. Air's
         # `Air_rho_ph` Function nodes leaking into a subsequent Hydrogen
@@ -806,13 +968,15 @@ class Model:
                 aditional_modules=aditional_modules,
                 max_remove_trival_passes=max_remove_trival_passes,
                 lambda_cache_dir=lambda_cache_dir,
+                remove_duplicate_equations=remove_duplicate_equations,
             )
         finally:
             _eq_cache_var.reset(_eq_cache_token)
 
     @line_profiler.profile
     def _instantiate_impl(self, cse=True, aditional_modules=None,
-                          max_remove_trival_passes=1, lambda_cache_dir=None):
+                          max_remove_trival_passes=1, lambda_cache_dir=None,
+                          remove_duplicate_equations=True):
         if aditional_modules is None:
             aditional_modules = []
         # `_NUMPY_LAMBDIFY_COMPAT` patches sympy callables that `lambdify`
@@ -1004,6 +1168,35 @@ class Model:
             self.improved_vars = [s for s in self.raw_var_symbols if s in improved_symbols_set]
             stop_time = time.time()
             print(f"Removed equations and variables: {len(self.raw_var_symbols) - len(self.improved_vars)} in {stop_time - start_time} s")
+
+        # Duplicate-equation reduction.  Runs AFTER trivial reduction so the
+        # equation list is in its most-reduced form (which only helps when
+        # the trivial reducer rewrote symbols that show up in duplicate
+        # signatures; for the headline use case -- StraightPipe face
+        # closures -- the relevant equations are nonlinear and survive
+        # trivial reduction unchanged).
+        if remove_duplicate_equations:
+            print("Removing duplicate equations")
+            dup_start = time.time()
+            before_n = len(self.improved_equations)
+            self.improved_equations, self.all_improved_symbols, dup_subs = (
+                self.remove_duplicate_equations(
+                    self.improved_equations, self.all_improved_symbols)
+            )
+            if dup_subs:
+                # Stitch the new substitutions into the running improve_subs
+                # map exactly the same way the trivial-pass loop does.
+                for prev_key in list(self.improve_subs.keys()):
+                    self.improve_subs[prev_key] = self.improve_subs[prev_key].xreplace(dup_subs)
+                self.improve_subs.update(dup_subs)
+                improved_symbols_set = set(self.all_improved_symbols)
+                self.improved_vars = [s for s in self.raw_var_symbols if s in improved_symbols_set]
+            after_n = len(self.improved_equations)
+            print(
+                f"Duplicate-equation pass: {before_n - after_n} equation(s) / "
+                f"{len(dup_subs)} variable(s) eliminated in "
+                f"{time.time() - dup_start:.2f} s"
+            )
 
         self.n_v = len(self.improved_vars)
         self.n_p = len(self.raw_param_symbols)
@@ -2194,7 +2387,35 @@ _ADAPTIVE_STRATEGIES = {
 
 
 class Parameter(Model):
-    """Compile-time-known scalar that is passed to the lambdified residual but never solved for."""
+    """Compile-time-known scalar that is passed to the lambdified residual but never solved for.
+
+    Pass a Python scalar (`float`, `int`, ...) to declare a fresh Parameter
+    owned by this `Model`.  Alternatively, pass an EXISTING `Parameter`
+    instance owned by another `Model` to declare an *alias* into it: the
+    constructor short-circuits via `__new__` and returns a
+    `ParameterAlias` that transparently forwards `.symbol`, `.value`, and
+    `.unit` to the underlying target.  This lets a child component
+    reference a Parameter owned by its parent (e.g. all `TwoPortSegment`s
+    of a `StraightPipe` referencing the same `A` symbol) without the
+    component author having to special-case the float-vs-Parameter
+    dispatch -- everything looks idiomatic at the call site:
+
+        self.add_component('A_in', Parameter(self.A_in, "m^2"))
+
+    works regardless of whether `self.A_in` is a `float` or a `Parameter`.
+    """
+
+    def __new__(cls, value=None, unit=None):
+        # Unwrap alias chains so we never build alias-to-alias references --
+        # the target is always a concrete `Parameter`.
+        while isinstance(value, ParameterAlias):
+            value = value._target
+        if isinstance(value, Parameter):
+            # Returning an instance whose class is NOT `cls` causes Python
+            # to skip the subsequent `__init__` call, so the alias is not
+            # re-initialised as a real Parameter.
+            return ParameterAlias(value)
+        return super().__new__(cls)
 
     def __init__(self, value, unit=None):
         self.components = {}
@@ -2227,6 +2448,89 @@ class Parameter(Model):
     def __repr__(self):
         unit_str = f" {self.unit}" if self.unit else ""
         return f"{super().__repr__()} with value: {self.value}{unit_str}"
+
+
+class ParameterAlias:
+    """Transparent alias to a `Parameter` owned by another `Model`.
+
+    Instances are produced automatically by `Parameter(value, ...)` when
+    the supplied `value` is itself a `Parameter` -- see the dispatch in
+    `Parameter.__new__`.  An alias exposes the read-only surface
+    (`symbol`, `value`, `unit`) that `declare_equations()` actually
+    consumes, plus the structural hooks that the framework uses for
+    composition (`set_name`, `is_composite`, `get_vars_references`,
+    `collect_equations`).  Critically, an alias is NOT a `Parameter`
+    subclass, so the framework's structural walks (`assign_symbols`,
+    `get_vars_references`, `_build_sym_paths`) can skip it cheaply via
+    an `isinstance(..., ParameterAlias)` check -- the underlying target
+    is reached via the OWNER's component tree exactly once and its
+    symbol gets assigned there.
+
+    Two `TwoPortSegment`s of the same `StraightPipe` end up holding two
+    separate `ParameterAlias` objects, both pointing at the parent's
+    single `A` Parameter.  Reading `self['A_in'].symbol` from either
+    segment returns the SAME SymPy symbol, which is exactly what the
+    duplicate-equation pass needs to collapse the per-face `m_dot =
+    rho * A * w` closures across interior interfaces.
+    """
+
+    __slots__ = ('_target', 'name')
+
+    def __init__(self, target):
+        self._target = target
+        self.name = None
+
+    # --- forwarded attributes -----------------------------------------
+
+    @property
+    def symbol(self):
+        return self._target.symbol
+
+    @property
+    def value(self):
+        return self._target.value
+
+    @property
+    def unit(self):
+        return getattr(self._target, 'unit', None)
+
+    @property
+    def target(self):
+        return self._target
+
+    # --- composition hooks expected by the framework -------------------
+
+    def set_name(self, name):
+        self.name = name
+
+    def is_composite(self):
+        return False
+
+    def get_vars_references(self):
+        # The owner's component tree accounts for the target Parameter;
+        # aliases contribute nothing of their own.
+        return [], []
+
+    def get_vars_len(self):
+        return 0
+
+    def check(self):
+        return True
+
+    def get_equations(self):
+        return []
+
+    def collect_equations(self):
+        return []
+
+    def collect_connections(self):
+        return []
+
+    def setup_t_values_referece(self, t_values):
+        pass
+
+    def __repr__(self):
+        return f"ParameterAlias(target={self._target!r})"
 
 
 class Variable(Model):
