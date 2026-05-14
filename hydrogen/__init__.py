@@ -19,6 +19,7 @@ from .components import (
     AdiabaticPump,
     AmbientInlet,
     AmbientOutlet,
+    FluidPort_phm,
     LoopBuffer,
     MixingJunction,
     PressureOutlet,
@@ -38,15 +39,12 @@ from .model import (
 )
 from .plotting import local_results_path, plot_results
 from .ports import (
-    ElectricalPort_VI,
-    FluidPort_phm,
     Port,
     PortAlreadyConnectedError,
     PortChannelMissingError,
     PortError,
     PortKindMismatchError,
     PortMediumMismatchError,
-    ThermalPort_TQ,
 )
 from .test_models import (
     InnerODE_1,
@@ -65,16 +63,15 @@ __all__ = [
     # medium
     "CoolPropMedium",
     "get_symbolic_property_function",
-    # ports
+    # port machinery (generic)
     "Port",
-    "FluidPort_phm",
-    "ThermalPort_TQ",
-    "ElectricalPort_VI",
     "PortError",
     "PortAlreadyConnectedError",
     "PortKindMismatchError",
     "PortChannelMissingError",
     "PortMediumMismatchError",
+    # fluid-library ports
+    "FluidPort_phm",
     # components
     "AmbientInlet",
     "AmbientOutlet",

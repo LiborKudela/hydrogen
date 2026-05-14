@@ -1,36 +1,40 @@
-"""Typed connectors (`Port`) for the hydrogen DAE framework.
+"""Generic port machinery for the hydrogen DAE framework.
 
-A `Port` is a small, declarative wrapper around a group of `Variable`s that
-together describe a physical interface on a `Model`.  It exists for one
-reason: to let users replace the brittle per-channel loops
+This module defines only the *domain-agnostic* core:
 
-    for io in ('p', 'h', 'm_dot'):
-        self.add_connection(self['a'][f'{io}_out'], self['b'][f'{io}_in'])
+  * `Port` -- declarative base class binding a group of Variables to a
+    typed connector with a `kind` discriminator, channel inventory,
+    flow/across split, and single-use multiplicity.
+  * `PortError` + subclasses -- the wiring-error hierarchy raised by
+    `Model.connect()` and `Port._mark_connected()`.
 
-with a single, type-checked `connect()` call
+Concrete port subclasses (`FluidPort_phm`, future `ThermalPort_TQ`,
+`ElectricalPort_VI`, ...) live in their respective domain libraries at
+the top of the same file that defines the components using them, e.g.
+`hydrogen.components.fluid_components`.  Keeping the library-specific
+ports next to the components that own them means each physics domain is
+self-contained: a user reading the fluid module sees the port contract
+and the component implementations side-by-side, without cross-module
+hopping into a global "ports.py".
 
-    self.connect(self['a'].ports['outlet'], self['b'].ports['inlet'])
+Wiring contract (enforced by `Model.connect()`):
 
-that
+  * matching `kind`,
+  * matching channel sets,
+  * matching `medium` when both ports declare one,
+  * each side wired exactly once (fan-out/fan-in must go through a
+    dedicated junction component such as `Splitter` or `MixingJunction`),
+  * sign on every `add_connection` chosen automatically from the two
+    ports' `flow_orientation`s -- opposite -> direct equality, same ->
+    sum-to-zero on flow channels (Kirchhoff / Modelica connector rule).
 
-  * generates one `Model.add_connection` per channel (so the whole port
-    still rides the union-find fast path at instantiate time),
-  * verifies port kind compatibility (you can't wire a fluid port to an
-    electrical port),
-  * verifies single-use multiplicity (a port can be wired exactly once;
-    fan-out / fan-in must go through a `Splitter` / `MixingJunction`),
-  * picks the per-channel `sign` automatically based on the two ports'
-    `flow_orientation` -- opposite orientations are direct equality, same
-    orientations are sum-to-zero (the Kirchhoff / Modelica convention).
+The Port layer is **purely declarative**: it never owns Variables.  A
+port binds itself to Variables that already live in the owner Model's
+`components` dict, so existing code that talks to those Variables
+directly keeps working byte-for-byte.  This is what lets the codebase
+migrate to ports incrementally without an all-or-nothing rewrite.
 
-The Port layer is **purely declarative**: it never owns Variables.  A port
-binds itself to Variables that already live in the owner Model's
-`components` dict, so existing code that talks to those Variables directly
-keeps working byte-for-byte.  This is what lets the codebase migrate to
-ports incrementally without an all-or-nothing rewrite.
-
-See `hydrogen/components.py` for component-side port declarations and
-`Model.connect` (in `hydrogen/model.py`) for the wiring entry point.
+See `Model.connect` in `hydrogen/model.py` for the wiring entry point.
 """
 
 from __future__ import annotations
@@ -185,56 +189,3 @@ class Port:
     def _path(self) -> str:
         owner_name = getattr(self.owner, "name", None) or type(self.owner).__name__
         return f"{owner_name}.{self.name or '<unnamed>'}"
-
-
-# ---------------------------------------------------------------------------
-# Built-in port kinds
-# ---------------------------------------------------------------------------
-
-
-class FluidPort_phm(Port):
-    """Compressible-fluid interface carrying `(p, h, m_dot)`.
-
-    * `p`       - port pressure                   [Pa]  (across)
-    * `h`       - port specific enthalpy          [J/kg] (across)
-    * `m_dot`   - port mass flow rate             [kg/s] (THROUGH)
-                  positive = "INTO me" for orientation="in";
-                  positive = "OUT of me" for orientation="out".
-
-    All standard fluid components in the package expose either an `outlet`
-    (orientation="out") or `inlet` (orientation="in") port of this kind,
-    and `Model.connect()` automatically picks the right per-channel sign
-    based on those two orientations.
-    """
-
-    kind = "fluid_phm"
-    required_channels = ("p", "h", "m_dot")
-    flow_channels = ("m_dot",)
-
-
-class ThermalPort_TQ(Port):
-    """Heat-transfer interface: temperature (across) + heat-flow (through).
-
-    Not used by any in-tree component today; declared here as a worked
-    example of cross-domain extension.  Add a `T_wall` / `Q_dot_wall`
-    port to a heated pipe segment and you can wire it directly to an
-    insulating sleeve or a heat source via `connect()`.
-    """
-
-    kind = "thermal_TQ"
-    required_channels = ("T", "Q_dot")
-    flow_channels = ("Q_dot",)
-
-
-class ElectricalPort_VI(Port):
-    """Single-pin electrical interface: voltage (across) + current (through).
-
-    Reserved for future electrolyser / fuel-cell components.  Same wiring
-    rules: same `kind`, opposite orientation -> direct equality on `V` and
-    on `I`; same orientation -> equality on `V` plus sum-to-zero on `I`
-    (Kirchhoff's current law on a node).
-    """
-
-    kind = "electrical_VI"
-    required_channels = ("V", "I")
-    flow_channels = ("I",)

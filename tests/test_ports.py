@@ -19,10 +19,10 @@ import pytest
 from hydrogen import (
     FluidPort_phm,
     Model,
+    Port,
     PortAlreadyConnectedError,
     PortKindMismatchError,
     PortMediumMismatchError,
-    ThermalPort_TQ,
     Variable,
 )
 from hydrogen.components import (
@@ -32,6 +32,21 @@ from hydrogen.components import (
     StraightPipe,
 )
 from hydrogen.medium import CoolPropMedium
+
+
+class _ThermalPort_TQ_Stub(Port):
+    """Local thermal-port subclass for the kind-mismatch test.
+
+    The framework no longer ships any built-in thermal / electrical port
+    type -- domain libraries declare their own port kinds at the top of
+    their module (see `hydrogen.components.fluid_components.FluidPort_phm`).
+    This stub stands in here purely to exercise the `kind` guard in
+    `Model.connect()`.
+    """
+
+    kind = "thermal_TQ"
+    required_channels = ("T", "Q_dot")
+    flow_channels = ("Q_dot",)
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +288,14 @@ def test_kind_mismatch_raises():
             self.add_component('inlet', AmbientInlet(
                 medium, p_ambient=101325, T_ambient=293.15, m_flow=0.05, D=0.02,
             ))
-            # A throwaway sub-model that exposes a ThermalPort_TQ with the
-            # same channel names but a different `kind`.
+            # A throwaway sub-model that exposes a thermal-style port with
+            # the same channel cardinality as a fluid port but a different
+            # `kind` discriminator.
             class _ThermalStub(Model):
                 def declare_components(_self):
                     _self.add_component('T', Variable(300.0))
                     _self.add_component('Q_dot', Variable(0.0))
-                    _self.add_port('port', ThermalPort_TQ(
+                    _self.add_port('port', _ThermalPort_TQ_Stub(
                         _self,
                         channels={'T': _self['T'], 'Q_dot': _self['Q_dot']},
                         flow_orientation='in',

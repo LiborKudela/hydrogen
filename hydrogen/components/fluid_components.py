@@ -1,14 +1,58 @@
-"""Reusable fluid-system components built on top of `hydrogen.model`."""
+"""Reusable fluid-system components built on top of `hydrogen.model`.
+
+Module layout:
+
+  1. `FluidPort_phm` -- the typed port that this library exposes on every
+     component.  Lives at the top of the module (rather than in the
+     generic `hydrogen.ports`) so that each physics-domain library owns its
+     own port kinds; `hydrogen.ports` only defines the generic `Port`
+     base class and the shared error hierarchy.
+  2. Components -- AmbientInlet, AmbientOutlet, TwoPortSegment,
+     AdiabaticPump, PressureOutlet, Splitter, PressureSource,
+     PressureVessel, MixingJunction, LoopBuffer, StraightPipe.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 import sympy as sp
 
-from .medium import CoolPropMedium
-from .model import DifferentialVariable, Model, Parameter, Variable
-from .numerics import G_const
-from .ports import FluidPort_phm
+from ..medium import CoolPropMedium
+from ..model import DifferentialVariable, Model, Parameter, Variable
+from ..numerics import G_const
+from ..ports import Port
+
+
+# ---------------------------------------------------------------------------
+# Fluid port -- (p, h, m_dot) interface used by every component below
+# ---------------------------------------------------------------------------
+
+
+class FluidPort_phm(Port):
+    """Compressible-fluid interface carrying `(p, h, m_dot)`.
+
+    * `p`       - port pressure                   [Pa]   (across)
+    * `h`       - port specific enthalpy          [J/kg] (across)
+    * `m_dot`   - port mass flow rate             [kg/s] (THROUGH;
+                  positive = "INTO me" under the Modelica
+                  "flow into me" convention used package-wide)
+
+    All standard fluid components in this module declare either an
+    `outlet` or an `inlet` port of this kind.  Both faces use
+    `flow_orientation='in'` (positive m_dot enters the component),
+    so `Model.connect()` emits a sum-to-zero on the flow channel
+    when two same-orientation ports are wired -- the Kirchhoff /
+    Modelica connector convention.
+
+    Two FluidPort_phm of different `medium` are refused at
+    connect-time (`PortMediumMismatchError`) to catch air<->hydrogen
+    cross-wiring before it produces a confusing CoolProp NameError
+    in the lambdified residual.
+    """
+
+    kind = "fluid_phm"
+    required_channels = ("p", "h", "m_dot")
+    flow_channels = ("m_dot",)
 
 
 class AmbientInlet(Model):
