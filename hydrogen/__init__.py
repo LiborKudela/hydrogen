@@ -6,7 +6,7 @@ Public API:
         Model, Parameter, Variable, DifferentialVariable,        # framework
         CoolPropMedium,                                          # medium
         AmbientInlet, AmbientOutlet, TwoPortSegment,             # components
-        AdiabaticPump, StraightPipe, LoopBuffer,
+        AdiabaticPump, StraightPipe, LoopBuffer, MixingJunction,
         IntegrationTest, SimpleODE, InnerODE_1, InnerODE_2,      # ODE test sub-models
         plot_results,                                            # plotting
     )
@@ -20,6 +20,7 @@ from .components import (
     AmbientInlet,
     AmbientOutlet,
     LoopBuffer,
+    MixingJunction,
     PressureOutlet,
     PressureSource,
     PressureVessel,
@@ -63,6 +64,7 @@ __all__ = [
     "PressureOutlet",
     "PressureVessel",
     "LoopBuffer",
+    "MixingJunction",
     "Splitter",
     # ODE test sub-models
     "IntegrationTest",

@@ -510,124 +510,392 @@ class PressureVessel(Model):
         return [eq_mass, eq_energy, eq_density, eq_energy_state, eq_port_p]
 
 
-class LoopBuffer(Model):
-    """Two-port well-mixed lumped-volume buffer for closed-loop topologies.
+class MixingJunction(Model):
+    """`N`-port well-mixed junction with smooth donor-cell upwind on enthalpy flux.
 
-    Like `PressureVessel` but with both an inflow and an outflow port, so it
-    can sit *inline* in a flow path.  The point of having one of these in a
-    closed loop is to break the structural rank-deficiency that an
-    otherwise-pure pipe+pump loop carries:
+    Operates in two modes, selected via the `dynamic` flag:
 
-      * In a fully-wired closed loop, the steady-state continuity equations
-        are linearly dependent (`rho*w` is conserved through every segment,
-        so the loop-closing continuity equation is implied by the others).
-      * In an adiabatic closed loop, the steady-state energy equations are
-        likewise dependent (`h + w**2/2` is conserved through every
-        adiabatic segment).
+        dynamic=True  (default)  -- mass + internal energy are differential
+                                    states; the junction has compressible
+                                    storage.  Required for closed loops
+                                    (breaks rank-deficiency the same way
+                                    `LoopBuffer` does) and for fast transients.
+        dynamic=False            -- purely algebraic "ideal mixer" with
+                                    instant mass and energy balance.  Smaller
+                                    symbolic system, no initial conditions,
+                                    no `V`.  Requires that the surrounding
+                                    network determines `p` (at least one
+                                    pressure boundary somewhere) and that the
+                                    attached `m_dot`s aren't all independently
+                                    over-prescribed (the algebraic mass
+                                    balance must have a degree of freedom to
+                                    close).  An explicit `h`-anchor
+                                    regularization (see `h_anchor_strength`)
+                                    keeps the energy balance well-conditioned
+                                    at exact zero flow.
 
-    The buffer breaks both: its `m` and `U` are *state* variables that
-    enter their own residuals (`dm/dt = m_in - m_out`,
-    `dU/dt = m_in*h_in - m_out*h_out`).  Even at steady state where
-    `dm/dt = dU/dt = 0`, those residuals constrain `(m, U)` (and via the
-    EoS closure `(p, h)`) to specific values rather than collapsing to
-    `0 = 0`, so the global Jacobian stays full rank.
+    Both modes share the same port API, the same smooth-blend port-enthalpy
+    closure, and the same flow-reversal handling -- only the bulk mass /
+    energy balance and the EoS closures differ.
 
-    Differential states:
-        m  - total mass in the buffer                            [kg]
-        U  - total internal energy in the buffer                 [J]
+    Sign convention (junction-centric, consistent with `m_dot_in` semantics
+    elsewhere in the package -- positive m_dot means "flow into me"):
 
-    Algebraic states (well-mixed = single (p, h) inside the volume):
-        p  - pressure                                            [Pa]
-        h  - specific enthalpy                                   [J/kg]
+        m_dot_k > 0   ->   flow INTO the junction through port k (inflow)
+        m_dot_k < 0   ->   flow OUT OF the junction through port k (outflow)
 
-    Ports (matches the (p, h, m_dot) convention used everywhere):
-        p_in,  h_in,  m_dot_in       (driven by the upstream component)
-        p_out, h_out, m_dot_out      (drives the downstream component)
+    Wire each port to the matching `_out` port of the adjacent component
+    (`add_connection(pipe.m_dot_out, junction.m_dot_k)`); the directions then
+    align automatically.
+
+    Stream-variable port convention (per port, k = 0 .. N-1):
+
+        p_k       - port pressure (always == p, glued via union-find)
+        h_k       - port CARRIER enthalpy: the value any connected component
+                    actually sees on its side of the wire.
+                      * in outflow: h_k == h (well-mixed value flows out)
+                      * in inflow : h_k == h_set_k (whatever upstream supplies)
+                    blended smoothly across the zero-crossing.
+        h_set_k   - port STREAM-IN enthalpy: the value the upstream component
+                    *would* push into the junction if flow were inward at this
+                    port.  The connected component MUST set `h_set_k` (e.g.
+                    via `add_connection(src.h_set_out, junction.h_set_k)` or
+                    by writing a residual `h_set_k - h_upstream == 0`); the
+                    junction itself does not constrain it.  Modelica calls
+                    the analogous concept a "stream variable" + `inStream()`.
+        m_dot_k   - port mass flow rate (positive = into the junction).
+
+    Decoupling the "stream-in" enthalpy from the "carrier" enthalpy is what
+    makes a single, well-conditioned smooth-blend closure work at every flow
+    direction; without it, the inflow-side residual collapses to `0 = 0`
+    while the upstream's own `h = h_set` constraint persists, over-determining
+    the global system.  See the design notes in `tests/test_mixing_junction.py`.
+
+    Algebraic well-mixed conditions (both modes):
+        p  - pressure                                             [Pa]
+        h  - specific enthalpy                                    [J/kg]
+
+    Dynamic-mode-only differential states:
+        m  - total mass in the junction                           [kg]
+        U  - total internal energy in the junction                [J]
 
     Equations (returned):
-        dm/dt = m_dot_in - m_dot_out                        (continuity)
-        dU/dt = m_dot_in * h_in - m_dot_out * h             (energy)
-        m  = rho(p, h) * V                                  (density closure)
-        U  = m*h - p*V                                      (internal-energy closure)
 
-    Port equalities, declared via `add_connection` (so they collapse out of
-    the symbolic Jacobian via union-find rather than living as residuals):
-        p_in  == p
-        p_out == p              (no inlet/outlet throttling)
-        h_out == h              (well-mixed: outflow carries the vessel's h)
+        # mass balance
+        if dynamic:    dm/dt = sum_k m_dot_k
+        if not dynamic: 0    = sum_k m_dot_k                     (algebraic)
 
-    `h_in` and the two mass flow rates `m_dot_in`, `m_dot_out` stay as free
-    port variables, fixed by whatever the buffer is wired into.
+        # energy balance, smooth donor-cell upwind on the per-port enthalpy
+        # flux:
+        flux_total = sum_k [ m_inflow_k * h_set_k - m_outflow_k * h ]
 
-    Notes / simplifications:
-      * Rigid wall (V constant), no heat loss, no shaft work.
+            if dynamic:    dU/dt = flux_total
+            if not dynamic: 0    = flux_total
+                                 + h_anchor_strength * (h_init - h)
+                                                                   (algebraic
+                                                                   + regularization)
+
+        where the smooth `max`s are
+            |m_dot_k|_smooth = sqrt(m_dot_k**2 + m_dot_eps**2)
+            m_inflow_k       = (m_dot_k + |m_dot_k|_smooth) / 2   ~ max(m_dot_k, 0)
+            m_outflow_k      = (|m_dot_k|_smooth - m_dot_k) / 2   ~ max(-m_dot_k, 0)
+
+        # EoS closures (dynamic mode only -- they tie storage to (p, h))
+        m = rho(p, h) * V
+        U = m * h - p * V
+
+        # per-port carrier-enthalpy closure (both modes, smooth blend,
+        # always non-degenerate):
+        h_k = alpha_k * h_set_k + (1 - alpha_k) * h
+        where alpha_k = (1 + m_dot_k / |m_dot_k|_smooth) / 2  ~ step(m_dot_k > 0)
+
+            - alpha_k -> 1 (port in heavy inflow):   h_k == h_set_k
+            - alpha_k -> 0 (port in heavy outflow):  h_k == h
+            - alpha_k = 0.5 (zero-flow):             h_k = (h_set_k + h) / 2
+
+    Port pressure equalities (both modes, via union-find, eliminated
+    structurally):
+        p_k == p   for every k.
+
+    Regularization of the quasi-static energy balance
+    -------------------------------------------------
+    At exact zero net flow the donor-cell coefficients collapse to
+    `m_inflow_k = m_outflow_k = m_dot_eps / 2`, so the energy balance reduces
+    to `(m_dot_eps / 2) * (sum h_set_k - N * h) = 0`, which still determines
+    `h` but with a Jacobian row scaled by `m_dot_eps` -- tiny.  Newton can
+    still converge but the step quality suffers.  We add an explicit
+    `h`-anchor term that smoothly pulls `h` toward `h_init` only when the
+    flux terms are small:
+
+        flux_total + h_anchor_strength * (h_init - h)
+
+    Default `h_anchor_strength = m_dot_eps` keeps the perturbation below
+    `m_dot_eps * |h| ~ 1e-6 * 1e5 = 0.1 J/kg` at typical scales (well below
+    Newton tol), while bumping the Jacobian floor up to `m_dot_eps` so the
+    solver doesn't crawl at startup or after a reversal pass.  Pass
+    `h_anchor_strength=0` to disable.  In `dynamic=True` mode this term is
+    ignored because the EoS closure `U = m*h - p*V` already pins `h`
+    independently of the flux balance.
+
+    Other notes / simplifications:
+      * Rigid wall (V constant in dynamic mode), no heat loss, no shaft work,
+        no port-throttling.
       * Inflow / outflow kinetic energy is neglected (consistent with
-        `PressureVessel`).  For typical loop applications `h >> w**2/2`.
-      * Reverse flow is not modelled.  If `m_dot_in` becomes negative the
-        energy balance still integrates, but the inlet would be carrying
-        downstream conditions, not the prescribed `h_in`.
+        `PressureVessel` and `LoopBuffer`).
+      * `m_dot_eps` controls the width of the smoothed direction-switch
+        region.  Default `1e-6` kg/s is several orders below typical flow
+        rates yet large enough to keep `d alpha / d m_dot` well-conditioned
+        across the zero-crossing.  Tighten it (smaller value) for sharper
+        switching at the cost of stiffer Newton iterations near reversal;
+        loosen it for smoother but less direction-faithful blending.
     """
 
-    def __init__(self, medium: CoolPropMedium, V,
-                 p_init=101325.0, T_init=293.15):
+    def __init__(self, medium: CoolPropMedium, N, V=None,
+                 p_init=101325.0, T_init=293.15,
+                 m_dot_eps=1e-6, dynamic=True, h_anchor_strength=None):
+        if N < 2:
+            raise ValueError(f"MixingJunction needs at least 2 ports, got N={N}")
+        if dynamic and V is None:
+            raise ValueError(
+                "dynamic=True MixingJunction requires V (control volume) for "
+                "the mass and internal-energy storage states.  Pass V=<m^3>, "
+                "or set dynamic=False to use the purely-algebraic mixer."
+            )
         self.medium = medium
+        self.N = N
         self.V = V
         self.p_init = p_init
         self.T_init = T_init
-        # Pre-compute thermodynamically consistent initial conditions so the
-        # t=0 Newton solve starts on (or very near) the algebraic manifold.
+        self.m_dot_eps = m_dot_eps
+        self.dynamic = dynamic
+        # Default the regularization to `m_dot_eps` for the quasi-static case
+        # and to `0` for dynamic (where the EoS closure already conditions `h`).
+        if h_anchor_strength is None:
+            h_anchor_strength = 0.0 if dynamic else m_dot_eps
+        self.h_anchor_strength = h_anchor_strength
+        # Pre-compute thermodynamically consistent initial conditions.  Used
+        # for variable seeds in both modes and for the storage states + EoS
+        # closure in dynamic mode.
         self.h_init = float(medium.eval_h_pT(p_init, T_init))
-        self.rho_init = float(medium.eval_rho_ph(p_init, self.h_init))
-        self.m_init = self.rho_init * V
-        self.U_init = self.m_init * self.h_init - p_init * V  # u = h - p/rho, m/rho = V
+        if dynamic:
+            self.rho_init = float(medium.eval_rho_ph(p_init, self.h_init))
+            self.m_init = self.rho_init * V
+            self.U_init = self.m_init * self.h_init - p_init * V
         super().__init__()
 
     def declare_components(self):
-        self.add_component('V', Parameter(self.V, "m^3"))
-
-        # Differential states (auto-attaches `der_m`, `der_U` companions).
-        self.add_component('m', DifferentialVariable(self.m_init, "kg"))
-        self.add_component('U', DifferentialVariable(self.U_init, "J"))
-
-        # Vessel-average algebraic states.
+        # Well-mixed algebraic states (both modes).
         self.add_component('p', Variable(self.p_init, "Pa"))
         self.add_component('h', Variable(self.h_init, "J/kg"))
 
-        # Inlet / outlet ports (driven by adjacent components).
-        self.add_component('p_in', Variable(self.p_init, "Pa"))
-        self.add_component('h_in', Variable(self.h_init, "J/kg"))
-        self.add_component('m_dot_in', Variable(0.0, "kg/s"))
-        self.add_component('p_out', Variable(self.p_init, "Pa"))
-        self.add_component('h_out', Variable(self.h_init, "J/kg"))
+        # Storage states + volume parameter, dynamic mode only.
+        if self.dynamic:
+            self.add_component('V', Parameter(self.V, "m^3"))
+            self.add_component('m', DifferentialVariable(self.m_init, "kg"))
+            self.add_component('U', DifferentialVariable(self.U_init, "J"))
+
+        # N ports.  Each port has both a CARRIER enthalpy (`h_k`, what the
+        # downstream component actually sees through the wire) and a STREAM-IN
+        # enthalpy (`h_set_k`, what the upstream would push into the junction
+        # if flow were inward).  See the class docstring for why both are
+        # needed for clean flow reversal.
+        for k in range(self.N):
+            self.add_component(f'p_{k}',     Variable(self.p_init, "Pa"))
+            self.add_component(f'h_{k}',     Variable(self.h_init, "J/kg"))
+            self.add_component(f'h_set_{k}', Variable(self.h_init, "J/kg"))
+            self.add_component(f'm_dot_{k}', Variable(0.0, "kg/s"))
+
+    def declare_equations(self):
+        # No port-throttling: every port's pressure equals the well-mixed
+        # pressure.  Routed via union-find so these never appear as residuals.
+        for k in range(self.N):
+            self.add_connection(self[f'p_{k}'], self['p'])
+
+        p = self['p'].symbol
+        h = self['h'].symbol
+        m_dot_eps = self.m_dot_eps
+
+        # Accumulate mass / energy fluxes across ports, and emit one smoothed
+        # direction-switch closure per port (these pieces are mode-independent).
+        port_eqs = []
+        sum_m_dot = 0
+        sum_energy_flux = 0
+        for k in range(self.N):
+            m_dot_k = self[f'm_dot_{k}'].symbol
+            h_k = self[f'h_{k}'].symbol
+            h_set_k = self[f'h_set_{k}'].symbol
+            # Smoothed |m_dot|, max(m_dot, 0), max(-m_dot, 0), step(m_dot > 0).
+            abs_m = sp.sqrt(m_dot_k ** 2 + m_dot_eps ** 2)
+            m_inflow_k = (m_dot_k + abs_m) / 2
+            m_outflow_k = (abs_m - m_dot_k) / 2
+            alpha_k = (1 + m_dot_k / abs_m) / 2
+
+            sum_m_dot = sum_m_dot + m_dot_k
+            # Donor-cell upwind on the energy flux: inflow brings in fluid
+            # with the upstream's `h_set_k`; outflow carries away fluid with
+            # the well-mixed `h`.  Smoothly weighted by the m_dot magnitudes
+            # so the residual is C^0 across the zero-crossing.
+            sum_energy_flux = sum_energy_flux + m_inflow_k * h_set_k - m_outflow_k * h
+            # Carrier-h closure: a single, always-non-degenerate blend.
+            # `(1 - alpha_k)` and `alpha_k` are smooth, strictly-positive
+            # rational expressions of `m_dot_k`, so this residual stays a
+            # proper Newton constraint at every flow direction -- including
+            # the zero-crossing where it collapses to `h_k = (h + h_set_k)/2`.
+            port_eqs.append(h_k - alpha_k * h_set_k - (1 - alpha_k) * h)
+
+        if self.dynamic:
+            # Mass + energy STORAGE residuals (Crank-Nicolson auto-couples
+            # der_m, der_U to m, U).  EoS closures tie storage to (p, h).
+            m = self['m'].symbol
+            U = self['U'].symbol
+            V = self['V'].symbol
+            rho = self.medium.rho_ph(p, h)
+            eq_mass = self['der_m'].symbol - sum_m_dot
+            eq_energy = self['der_U'].symbol - sum_energy_flux
+            eq_density = m - rho * V
+            eq_energy_state = U - m * h + p * V
+            return [eq_mass, eq_energy, eq_density, eq_energy_state] + port_eqs
+
+        # Quasi-static mode: mass + energy balance as algebraic constraints,
+        # no EoS, no V.  The energy balance carries an explicit `h`-anchor
+        # regularization that smoothly pulls `h` toward `h_init` only when
+        # the flux terms are tiny -- see the class docstring for the rationale
+        # and the order-of-magnitude analysis.  Setting `h_anchor_strength=0`
+        # disables it (use only if the network is guaranteed to never sit
+        # at zero net flow).
+        eq_mass = sum_m_dot
+        eq_energy = sum_energy_flux + self.h_anchor_strength * (self.h_init - h)
+        return [eq_mass, eq_energy] + port_eqs
+
+
+class LoopBuffer(MixingJunction):
+    """Two-port well-mixed buffer with directional `_in` / `_out` ports.
+
+    Thin subclass over `MixingJunction(dynamic=True, N=2)` that aliases the
+    indexed `_k` ports to the directional naming used throughout the rest
+    of the package (`m_dot_in` > 0 means "flow into me", `m_dot_out` > 0
+    means "flow out of me").  Apart from the names, everything physical
+    -- mass + internal-energy storage, EoS closure, smooth donor-cell
+    upwind, alpha-blend carrier -- comes from `MixingJunction`.
+
+    Why this exists at all
+    ----------------------
+    Closed-loop pipe+pump topologies are structurally rank-deficient in
+    steady state (continuity is implied because `rho*w` is conserved
+    through every segment; adiabatic energy is implied because
+    `h + w**2/2` is conserved).  The buffer's `m` and `U` differential
+    states attach real residuals to the loop (`dm/dt = m_dot_in - m_dot_out`,
+    `dU/dt = m_dot_in*h_in - m_dot_out*h` in forward flow) so that even
+    at steady state `(m, U)` are pinned by initial conditions rather than
+    collapsing to `0 = 0`.  See `examples/loop_pump_pipe.py` for the
+    canonical usage.
+
+    Bidirectional flow
+    ------------------
+    Unlike the legacy `LoopBuffer` (which was forward-only and would
+    silently give wrong physics for `m_dot_in < 0`), this version
+    inherits `MixingJunction`'s smooth donor-cell upwind, so flow
+    reversal is handled cleanly:
+
+      * Forward (`m_dot_in > 0`):  dU/dt contribution at inlet
+        `=  m_dot_in * h_in  -  0 * h         = m_dot_in * h_in`
+        (upstream's `h_in` flows in).
+      * Reverse (`m_dot_in < 0`):  dU/dt contribution at inlet
+        `=  0 * h_in  -  |m_dot_in| * h        = m_dot_in * h`
+        (buffer's bulk `h` flows out through the inlet).
+
+    The transition is C^0 across the zero-crossing thanks to the
+    `sqrt(m_dot**2 + m_dot_eps**2)` smoothing inherited from
+    `MixingJunction`, so Newton stays well-conditioned during reversal
+    transients.
+
+    Port API
+    --------
+    Unchanged from the pre-subclass version:
+
+        p_in,  h_in,  m_dot_in       (driven by upstream;
+                                      m_dot_in  > 0 = flow INTO buffer)
+        p_out, h_out, m_dot_out      (drives downstream;
+                                      m_dot_out > 0 = flow OUT OF buffer)
+
+    Mapping onto the inherited `MixingJunction` ports:
+
+        p_in       <-> p_0          (unioned)
+        m_dot_in   <-> m_dot_0      (unioned, no sign flip)
+        h_in       <-> h_set_0      (h_in plays the role of the inlet's
+                                     stream-in enthalpy -- this is what
+                                     forward flow physically carries into
+                                     the buffer)
+        p_out      <-> p_1          (unioned)
+        h_out      <-> h_1          (carrier; collapses to bulk h via the
+                                     pin on h_set_1 below)
+        m_dot_out  <-> -m_dot_1     (explicit linear equation:
+                                     `m_dot_out + m_dot_1 == 0`)
+        h_set_1     pinned to h     (the buffer's port API does NOT expose
+                                     a separate downstream stream-in; this
+                                     pin collapses the port-1 blend to
+                                     `h_1 == h`, preserving the legacy
+                                     `h_out == h` semantics in both
+                                     directions)
+
+    Reverse-flow physics caveat
+    ---------------------------
+    Because `h_set_1` is pinned to bulk `h`, reverse flow at the outlet
+    is modelled as "buffer absorbing fluid back at its own h" -- the
+    outlet contributes nothing to dU/dt in reverse.  For a network where
+    the *downstream* component would push physically different `h` back
+    into the buffer through the outlet port, use `MixingJunction(N=2)`
+    directly and wire its `h_set_1` to the downstream's stream-in
+    enthalpy.  All the inlet reversal physics, however, is exact.
+    """
+
+    def __init__(self, medium: CoolPropMedium, V,
+                 p_init=101325.0, T_init=293.15, m_dot_eps=1e-6):
+        super().__init__(medium=medium, N=2, V=V,
+                         p_init=p_init, T_init=T_init,
+                         m_dot_eps=m_dot_eps, dynamic=True)
+
+    def declare_components(self):
+        # Inherit the indexed _k ports + storage states + p, h, V.
+        super().declare_components()
+        # Add the directional alias ports.  Seeded with the same values as
+        # the indexed ports so Newton starts on (or near) the manifold.
+        self.add_component('p_in',      Variable(self.p_init, "Pa"))
+        self.add_component('h_in',      Variable(self.h_init, "J/kg"))
+        self.add_component('m_dot_in',  Variable(0.0, "kg/s"))
+        self.add_component('p_out',     Variable(self.p_init, "Pa"))
+        self.add_component('h_out',     Variable(self.h_init, "J/kg"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
 
     def declare_equations(self):
-        # Port equalities via union-find: p_in == p_out == p and h_out == h.
-        # `h_in` stays free (it is whatever the upstream feeds into the buffer).
-        self.add_connection(self['p_in'], self['p'])
-        self.add_connection(self['p_out'], self['p'])
-        self.add_connection(self['h_out'], self['h'])
+        # Pull in the parent's storage residuals + port blends.
+        eqs = super().declare_equations()
 
-        m = self['m'].symbol
-        U = self['U'].symbol
-        p = self['p'].symbol
-        h = self['h'].symbol
-        V = self['V'].symbol
-        h_in = self['h_in'].symbol
-        m_in_dot = self['m_dot_in'].symbol
-        m_out_dot = self['m_dot_out'].symbol
+        # Inlet alias (port 0, no sign flip on m_dot).  Unioning `h_in` with
+        # `h_set_0` makes h_in serve as the inlet's stream-in -- matches the
+        # original "upstream supplies h_in" semantics, and the parent's
+        # smooth-blend port closure now handles the reversal automatically.
+        self.add_connection(self['p_in'],     self['p_0'])
+        self.add_connection(self['m_dot_in'], self['m_dot_0'])
+        self.add_connection(self['h_in'],     self['h_set_0'])
 
-        rho = self.medium.rho_ph(p, h)
+        # Outlet alias (port 1).  `h_out` is unioned with the carrier `h_1`;
+        # we then pin h_set_1 to bulk h below, which makes the parent's
+        # port-1 blend `h_1 = alpha_1*h_set_1 + (1-alpha_1)*h` collapse to
+        # `h_1 == h` for every direction -- so `h_out == h` always, just
+        # like the legacy LoopBuffer.
+        self.add_connection(self['p_out'],    self['p_1'])
+        self.add_connection(self['h_out'],    self['h_1'])
 
-        # Continuity / energy: net imbalance feeds the differential states.
-        eq_mass = self['der_m'].symbol - (m_in_dot - m_out_dot)
-        eq_energy = self['der_U'].symbol - (m_in_dot * h_in - m_out_dot * h)
+        # Sign-flip for m_dot_out: the parent's m_dot_1 is "into me",
+        # the buffer's m_dot_out is "out of me".  Trivially linear, the
+        # reducer eliminates one of {m_dot_out, m_dot_1} entirely.
+        eqs.append(self['m_dot_out'].symbol + self['m_dot_1'].symbol)
+        # Pin downstream stream-in to bulk h (no separate API for it).
+        # Also trivially linear -- the reducer eliminates h_set_1 = h.
+        eqs.append(self['h_set_1'].symbol - self['h'].symbol)
 
-        # Algebraic closure linking (m, U) to (p, h) via the equation of state.
-        eq_density = m - rho * V
-        eq_energy_state = U - m * h + p * V
-
-        return [eq_mass, eq_energy, eq_density, eq_energy_state]
+        return eqs
 
 
 class StraightPipe(Model):

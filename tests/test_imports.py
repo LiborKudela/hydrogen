@@ -22,6 +22,7 @@ def test_top_level_attributes():
         "PressureOutlet",
         "PressureVessel",
         "LoopBuffer",
+        "MixingJunction",
         "Splitter",
         "IntegrationTest",
         "SimpleODE",
