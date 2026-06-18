@@ -304,6 +304,12 @@ def main():
     print(f"junction mass drift: {(m_junc.max() - m_junc.min()) * 1e9:.2f} ng "
           f"(should be ~ 0, sum m_dot == 0 by construction)")
 
+    # Self-validation: the drive should actually reverse the flow at port 0,
+    # and the well-mixed junction's stored mass must stay essentially constant
+    # (sum of port mass flows is zero by construction).
+    assert sign_flips_0 > 0, "port 0 flow should reverse under the sinusoidal drive"
+    assert (m_junc.max() - m_junc.min()) < 1e-6, "junction mass drift should be ~0"
+
     # --- Plot ------------------------------------------------------------
     out_path = local_results_path("examples", "mixing_junction_reversal.html")
     plot_results(rec, out_path)

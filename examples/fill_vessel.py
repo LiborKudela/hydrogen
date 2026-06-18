@@ -106,9 +106,12 @@ def main():
         if full.endswith('.m_dot_in') or full.endswith('.m_dot_out'):
             var.value = WARM_M_DOT
 
+    # Heavier damping (relaxation=0.3) keeps the t=0 Newton solve from
+    # overshooting into a negative-pressure state that CoolProp can't flash;
+    # the 1 bar source/vessel mismatch makes the first few steps stiff.
     print("Initialising (damped Newton at t = 0)...")
     t0 = time.time()
-    system.initialise(relaxation=0.5, max_iter=400)
+    system.initialise(relaxation=0.3, max_iter=600)
     print(f"  initialise:  {time.time() - t0:.2f} s")
 
     print(f"Running {N_STEPS} steps of dt = {DT:g} s ({N_STEPS * DT:g} s total)...")
@@ -152,6 +155,15 @@ def main():
     print(f"{'t [s]':>7}  {'p_v [bar]':>10}  {'T_v [K]':>8}  {'m_dot [g/s]':>11}  {'m [g]':>7}")
     for i in range(0, len(t), max(1, N_STEPS // 10)):
         print(f"{t[i]:7.3f}  {p_v[i] / 1e5:10.4f}  {T_v[i]:8.2f}  {m_dot_in[i] * 1000:11.4f}  {m_v[i] * 1000:7.3f}")
+
+    # Self-validation: a higher-pressure source filling the vessel must raise
+    # its pressure and mass monotonically toward the source, while the inflow
+    # decays as the driving pressure difference shrinks.
+    assert p_v[-1] > p_v[0], "vessel pressure should rise while filling"
+    assert m_v[-1] > m_v[0], "vessel mass should grow while filling"
+    assert p_v[-1] <= P_SOURCE + 1.0, "vessel pressure should not overshoot the source"
+    assert m_dot_in[-1] < m_dot_in[0], "inflow should decay as the vessel pressurises"
+    assert np.all(np.diff(m_v) >= -1e-9), "vessel mass should be non-decreasing"
 
     out_path = plot_results(system.record, "fill_vessel.html",
                             show=False, subdir="examples")

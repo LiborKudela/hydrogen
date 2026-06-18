@@ -11,7 +11,7 @@ This module defines only the *domain-agnostic* core:
 Concrete port subclasses (`FluidPort_phm`, future `ThermalPort_TQ`,
 `ElectricalPort_VI`, ...) live in their respective domain libraries at
 the top of the same file that defines the components using them, e.g.
-`hydrogen.components.fluid_components`.  Keeping the library-specific
+`hydrogen.components.fluid`.  Keeping the library-specific
 ports next to the components that own them means each physics domain is
 self-contained: a user reading the fluid module sees the port contract
 and the component implementations side-by-side, without cross-module
@@ -47,6 +47,18 @@ if TYPE_CHECKING:
 
 class PortError(RuntimeError):
     """Base class for port-level wiring errors (kind mismatch, etc.)."""
+
+
+class PortNotConnectedWarning(UserWarning):
+    """Emitted at `instantiate()` for a port declared `require_connection=True`
+    that ended up with no wire.
+
+    Such a port leaves its backing across-variable unclosed, so the system is
+    structurally singular and the Newton solve would otherwise fail with an
+    opaque "Factor is exactly singular".  The warning names the offending port
+    so the cause is obvious.  Used by, e.g., the fluid `HeatedSegment` wall
+    port, which only makes sense once a thermal boundary or wall is attached.
+    """
 
 
 class PortAlreadyConnectedError(PortError):
@@ -110,6 +122,13 @@ class Port:
                                  or "out" (positive flow = OUT of me).
                                  Determines whether `connect()` emits a
                                  sign flip for flow channels.
+      * `require_connection`  - when True, `Model.instantiate()` emits a
+                                 `PortNotConnectedWarning` if this port was
+                                 never wired (its across-variable would be
+                                 left unclosed -> singular system).  Default
+                                 False (a port may be intentionally open,
+                                 e.g. a top-level boundary exposed for
+                                 external wiring).
       * `medium`              - optional reference (e.g. a
                                  `CoolPropMedium`); when both connected
                                  ports declare a non-None medium, they
@@ -132,6 +151,7 @@ class Port:
         flow_orientation: str = "in",
         medium=None,
         name: str | None = None,
+        require_connection: bool = False,
     ):
         if not self.kind:
             raise PortError(
@@ -159,6 +179,7 @@ class Port:
         self.channels: Dict[str, "Variable"] = dict(channels)
         self.flow_orientation = flow_orientation
         self.medium = medium
+        self.require_connection = require_connection
         self._connected_to: "Port | None" = None
 
     # --- introspection ----------------------------------------------------

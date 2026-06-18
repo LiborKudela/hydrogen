@@ -14,13 +14,16 @@ Module layout:
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import sympy as sp
 
-from ..medium import CoolPropMedium
-from ..model import DifferentialVariable, Model, Parameter, Variable
-from ..numerics import G_const
-from ..ports import Port
+from ...medium import CoolPropMedium
+from ...model import DifferentialVariable, Model, Parameter, Variable
+from ...numerics import G_const
+from ...ports import Port
+from ..thermal.thermal_components import ThermalPort_TQ
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,12 @@ class AmbientInlet(Model):
     def declare_components(self):
         self.add_component('p_ambient', Parameter(self.p_ambient, "Pa"))
         self.add_component('T_ambient', Variable(self.T_ambient, "K"))
+        # Setpoint the `T_ambient` Variable is pinned to.  Held as a Parameter
+        # (not a baked literal in `eq4`) so the per-class equation template is
+        # instance-invariant: two `AmbientInlet`s with different ambient
+        # temperatures share the cached template and only their parameter
+        # VALUES differ at runtime.
+        self.add_component('T_ambient_set', Parameter(self.T_ambient, "K"))
         self.add_component('h_ambient', Parameter(self.medium.h_pT(self['p_ambient'].value, self['T_ambient'].value), "J/kg"))
         self.add_component('s_ambient', Parameter(self.medium.s_ph(self['p_ambient'].value, self['h_ambient'].value), "J/kg/K"))
         self.add_component('m_flow', Parameter(self.m_flow, "kg/s"))
@@ -121,7 +130,7 @@ class AmbientInlet(Model):
         s_out = self.medium.s_ph(self['p_out'].symbol, self['h_out'].symbol)
         eq2 = s_in - s_out
         eq3 = h_in - (self['h_out'].symbol + self['w_out'].symbol ** 2 / 2)
-        eq4 = self['T_ambient'].symbol - self.T_ambient
+        eq4 = self['T_ambient'].symbol - self['T_ambient_set'].symbol
 
         return [eq1, eq_w, eq2, eq3, eq4]
 
@@ -212,7 +221,14 @@ class TwoPortSegment(Model):
     bloats the lambdified Jacobian (more CoolProp evaluations per non-zero).
 
     `f_factor_func(Re, epsilon, Dh)` returns the friction factor symbolically.
-    `q_inflow_func(w, p, h, rho, T, mu, k, fr, T_wall)` returns the heat input rate.
+    `q_inflow_func(w, p, h, rho, T, mu, k, fr, T_wall, Dh, area)` returns the
+    heat input rate.  The two trailing geometry arguments -- the hydraulic
+    diameter `Dh` and the convective surface area `area` of THIS segment -- are
+    passed in as SymPy expressions built from the segment's own geometry
+    `Parameter` symbols (NOT as Python floats from the parent).  This keeps the
+    heat term free of baked-in numeric literals, so the per-class
+    `declare_equations` template stays instance-invariant and cache-safe even
+    across pipes of different diameter / length.
 
     Each of the seven geometry slots (`A_in`, `A_out`, `P_in`, `P_out`, `z_in`,
     `z_out`, `L`) may be passed either as a plain Python scalar OR as an
@@ -295,8 +311,18 @@ class TwoPortSegment(Model):
         self.add_component('z_in', Parameter(self.z_in, "m"))
         self.add_component('z_out', Parameter(self.z_out, "m"))
         self.add_component('L', Parameter(self.L, "m"))
-        self.add_component('T_wall', Parameter(293.15, "K"))
+        # Wall temperature seen by the convective heat term.  Always an
+        # algebraic Variable (not a fixed Parameter): in the base/adiabatic
+        # segment it is closed by the identity `T_wall = T_avg` (see
+        # `_wall_closure`), driving the convective delta-T -- and hence the
+        # heat -- to zero.  A `HeatedSegment` instead exposes a thermal port
+        # and lets an external wall/boundary set it (see `_declare_wall_interface`).
+        self.add_component('T_wall', Variable(293.15, "K"))
         self.add_component('q_inflow', Variable(0.0, "W"))
+        # Subclass hook: attach a thermal `wall` port (HeatedSegment) or do
+        # nothing (base = adiabatic).  Called here so the port binds to the
+        # `T_wall` / `q_inflow` Variables declared just above.
+        self._declare_wall_interface()
         # Directional fluid ports.  BOTH faces use the Modelica "flow into
         # me" convention -- positive m_dot means fluid entering the segment
         # through that face -- so `flow_orientation='in'` on both, and the
@@ -394,23 +420,41 @@ class TwoPortSegment(Model):
         buoyancy_force = -G_const * (self['z_out'].symbol - self['z_in'].symbol) * A_avg * rho_avg
         eq_momentum = self['p_in'].symbol * self['A_in'].symbol - self['p_out'].symbol * self['A_out'].symbol - delta_P_friction * A_avg - momentum_flux + buoyancy_force
 
-        # Energy
-        q = self.q_inflow_func(w_avg, p_avg, h_avg, rho_avg, T_avg, mu_avg, k_avg, f_avg, self['T_wall'].symbol)
-        # Steady CV energy balance assuming forward flow:
-        #     (h + w^2/2)|in + q = (h + w^2/2)|out
-        # Under reverse flow, fluid enters at "out" and leaves at "in", so q must
-        # be credited at the actual upstream port.  A smoothed sign(w_avg) picks
-        # the correct side:
-        #     forward (w_avg > 0):  +q -> heat added to outflow at "out"
-        #     reverse (w_avg < 0):  -q -> heat added to outflow at "in"
-        # `w_eps` keeps the Jacobian smooth across zero-flow crossings (kink
-        # otherwise hurts Newton convergence near startup / flow reversal).
-        # Pick `w_eps` well below realistic operating velocities; for hydrogen /
-        # air plumbing 1e-4 m/s is several orders below any real flow yet large
-        # enough to keep d sign_w / d w_avg well-conditioned.
+        # Energy.  `q` is the heat-transfer RATE into the fluid CV [W]
+        # (e.g. `alpha * A_surface * (T_wall - T)` for the convective pipe).
+        # Convective surface area of THIS segment = mean wetted perimeter x
+        # segment length, built from the segment's OWN geometry Parameter
+        # symbols (shared via `ParameterAlias` with the parent pipe).  Passing
+        # `Dh_avg` / `area_conv` as symbols -- rather than letting the injected
+        # `q_inflow_func` reach back into the parent's Python floats -- keeps
+        # the heat term literal-free and the cached template instance-invariant.
+        P_avg = (self['P_in'].symbol + self['P_out'].symbol) / 2
+        area_conv = P_avg * self['L'].symbol
+        q = self.q_inflow_func(w_avg, p_avg, h_avg, rho_avg, T_avg, mu_avg, k_avg, f_avg, self['T_wall'].symbol, Dh_avg, area_conv)
+        # Steady CV energy balance.  The advected quantity is the SPECIFIC
+        # total enthalpy `h + w^2/2` [J/kg], so the wall heat must enter as a
+        # SPECIFIC term `q / m_dot` [J/kg] -- NOT as the raw power `q` [W]
+        # (the latter is dimensionally wrong and silently breaks energy
+        # conservation against a connected wall: the fluid would gain
+        # `m_dot * q` watts instead of `q`).  Writing it as `q / m_dot` makes
+        # the fluid gain exactly `m_dot * (q / m_dot) = q` watts, matching the
+        # heat the wall loses through the thermal port.
+        #
+        # `m_dot` is regularised to `sqrt(m_dot_avg^2 + m_eps^2)` so the
+        # division stays finite as the flow crosses zero; combined with the
+        # smoothed `sign_w` this credits the heat to the actual downstream
+        # port under either flow direction.  `w_eps` / `m_eps` keep the
+        # Jacobian smooth across zero-flow crossings (kinks otherwise hurt
+        # Newton convergence near startup / flow reversal); both sit well
+        # below realistic operating values.  For an adiabatic segment `q == 0`,
+        # so the whole term vanishes and this reduces to the classic
+        # `h + w^2/2` conservation (identical to the pre-heat-port model).
         w_eps = 1e-4
+        m_eps = 1e-6
         sign_w = w_avg / sp.sqrt(w_avg ** 2 + w_eps ** 2)
-        eq_energy = self['h_in'].symbol + w_in ** 2 / 2 + sign_w * q - (self['h_out'].symbol + w_out ** 2 / 2)
+        m_dot_reg = sp.sqrt(m_dot_avg ** 2 + m_eps ** 2)
+        q_specific = sign_w * q / m_dot_reg
+        eq_energy = self['h_in'].symbol + w_in ** 2 / 2 + q_specific - (self['h_out'].symbol + w_out ** 2 / 2)
 
         # `q_inflow` stays the raw magnitude of heat transfer (direction-
         # independent) so users get a meaningful "wall heat input" diagnostic
@@ -442,7 +486,27 @@ class TwoPortSegment(Model):
             eq_continuity, eq_w_in, eq_w_out, eq_momentum, eq_energy, eq_q_diag,
             eq_T_in,  eq_rho_in,  eq_mu_in,  eq_k_in,
             eq_T_out, eq_rho_out, eq_mu_out, eq_k_out,
-        ]
+        ] + self._wall_closure()
+
+    # --- wall-temperature interface (subclass hooks) ----------------------
+    #
+    # `T_wall` is always an algebraic Variable; these two hooks decide HOW it
+    # is closed, and they are split by CLASS (base vs `HeatedSegment`) rather
+    # than by an instance flag so the per-class `declare_equations` cache never
+    # sees two different equation structures under the same class.
+
+    def _declare_wall_interface(self):
+        """Base/adiabatic segment: no external thermal interface."""
+        return None
+
+    def _wall_closure(self):
+        """Base/adiabatic segment: close `T_wall` by tying it to the mean
+        fluid temperature (the temperature in the middle of the control
+        volume).  Because the convective law uses `T_wall - T_avg`, this also
+        drives the heat term to zero -- i.e. the base segment is adiabatic."""
+        T_wall = self['T_wall'].symbol
+        T_avg = (self['T_in'].symbol + self['T_out'].symbol) / 2
+        return [T_wall - T_avg]
 
 
 class AdiabaticPump(TwoPortSegment):
@@ -452,7 +516,7 @@ class AdiabaticPump(TwoPortSegment):
         super().__init__(medium, A_in, A_out, P_in, P_out, z_in, z_out, 1, 0.0, self.get_f_from_a_iz, self.get_q_inflow)
         self.adiabatic = True
 
-    def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall):
+    def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
         return 0.0
 
     def get_f_from_a_iz(self, Re_avg, epsilon, Dh_avg):
@@ -461,6 +525,46 @@ class AdiabaticPump(TwoPortSegment):
     def declare_components(self):
         super().declare_components()
         self.add_component('a_iz', Variable(0.0, "W"))
+
+
+class HeatedSegment(TwoPortSegment):
+    """`TwoPortSegment` that exchanges heat with an external wall/boundary
+    through a `ThermalPort_TQ`, instead of being adiabatic.
+
+    The convective heat RATE `q` returned by `q_inflow_func` (e.g.
+    `alpha * A_surface * (T_wall - T)` for a pipe) is published on a `wall`
+    port:
+
+        * across channel `T`     = `T_wall`   (set by whatever is connected)
+        * flow   channel `Q_dot` = `q_inflow` (= q, heat INTO the fluid [W])
+
+    Connecting `wall` to a `CylindricalWall.port_a` gives conjugate heat
+    transfer; connecting it to a `FixedTemperature` reproduces a prescribed
+    wall temperature.  Either way the across-equality closes `T_wall` and the
+    same-orientation sum-to-zero makes the partner absorb `-q`, so energy is
+    conserved across the interface (the fluid's energy balance adds exactly
+    `q` watts -- see `TwoPortSegment.declare_equations`).
+
+    The port is declared `require_connection=True`: an open `wall` port leaves
+    `T_wall` unclosed (singular system), so `instantiate()` warns about it.
+
+    Realised as a distinct class (rather than a flag on `TwoPortSegment`) so
+    the per-class equation cache never sees two different equation structures
+    -- adiabatic (with the `T_wall = T_avg` closure) vs heated (without it) --
+    under one class, which would mis-replay in a model mixing both.
+    """
+
+    def _declare_wall_interface(self):
+        self.add_port('wall', ThermalPort_TQ(
+            self,
+            channels={'T': self['T_wall'], 'Q_dot': self['q_inflow']},
+            flow_orientation='in',
+            require_connection=True,
+        ))
+
+    def _wall_closure(self):
+        # Closed externally via the `wall` port connection; no internal eq.
+        return []
 
 
 class PressureOutlet(Model):
@@ -879,6 +983,15 @@ class MixingJunction(Model):
         loosen it for smoother but less direction-faithful blending.
     """
 
+    # `dynamic` toggles the bulk balance between differential storage (with
+    # `der_m`/`der_U` states + EoS closures) and a purely algebraic mixer, so
+    # the equation structure is NOT determined by the class alone.  Keying the
+    # equation-template cache on it keeps a model mixing dynamic and
+    # quasi-static junctions correct.  (This class also emits `add_connection`
+    # side effects, which already routes it to the 'no-cache' path -- but the
+    # key is declared defensively so correctness never relies on that.)
+    _cache_key_flags = ("dynamic",)
+
     def __init__(self, medium: CoolPropMedium, N, V=None,
                  p_init=101325.0, T_init=293.15,
                  m_dot_eps=1e-6, dynamic=True, h_anchor_strength=None):
@@ -917,11 +1030,22 @@ class MixingJunction(Model):
         self.add_component('p', Variable(self.p_init, "Pa"))
         self.add_component('h', Variable(self.h_init, "J/kg"))
 
+        # Direction-switch smoothing scale.  Held as a Parameter (not a baked
+        # literal) so its appearance in `sqrt(m_dot**2 + m_dot_eps**2)` keeps
+        # the equation template free of instance-varying numeric literals.
+        self.add_component('m_dot_eps', Parameter(self.m_dot_eps, "kg/s"))
+
         # Storage states + volume parameter, dynamic mode only.
         if self.dynamic:
             self.add_component('V', Parameter(self.V, "m^3"))
             self.add_component('m', DifferentialVariable(self.m_init, "kg"))
             self.add_component('U', DifferentialVariable(self.U_init, "J"))
+        else:
+            # Quasi-static `h`-anchor regularization constants, promoted to
+            # Parameters for the same template-invariance reason (they appear
+            # in the algebraic energy balance below).
+            self.add_component('h_init', Parameter(self.h_init, "J/kg"))
+            self.add_component('h_anchor_strength', Parameter(self.h_anchor_strength, "kg/s"))
 
         # N ports.  Each port has both a CARRIER enthalpy (`h_k`, what the
         # downstream component actually sees through the wire) and a STREAM-IN
@@ -942,7 +1066,7 @@ class MixingJunction(Model):
 
         p = self['p'].symbol
         h = self['h'].symbol
-        m_dot_eps = self.m_dot_eps
+        m_dot_eps = self['m_dot_eps'].symbol
 
         # Accumulate mass / energy fluxes across ports, and emit one smoothed
         # direction-switch closure per port (these pieces are mode-independent).
@@ -993,7 +1117,7 @@ class MixingJunction(Model):
         # disables it (use only if the network is guaranteed to never sit
         # at zero net flow).
         eq_mass = sum_m_dot
-        eq_energy = sum_energy_flux + self.h_anchor_strength * (self.h_init - h)
+        eq_energy = sum_energy_flux + self['h_anchor_strength'].symbol * (self['h_init'].symbol - h)
         return [eq_mass, eq_energy] + port_eqs
 
 
@@ -1151,7 +1275,8 @@ class StraightPipe(Model):
     Gnielinski / laminar Nusselt blend for the wall heat-transfer coefficient.
     """
 
-    def __init__(self, medium: CoolPropMedium, D, L, epsilon, z_in, z_out, n_segments=3, adiabatic=False):
+    def __init__(self, medium: CoolPropMedium, D, L, epsilon, z_in, z_out, n_segments=3,
+                 heat_port=False, adiabatic=None):
         self.medium = medium
         self.D = D
         self.L = L
@@ -1159,7 +1284,36 @@ class StraightPipe(Model):
         self.z_in = z_in
         self.z_out = z_out
         self.n_segments = n_segments
-        self.adiabatic = adiabatic
+        # `heat_port` is the single switch for the segment thermal interface:
+        #   * False (default): each segment is a plain adiabatic `TwoPortSegment`
+        #     (T_wall = T_avg, q = 0); the pipe has no thermal connectivity.
+        #   * True: each segment is a `HeatedSegment` exposing a `wall`
+        #     `ThermalPort_TQ`; the convective heat is driven by whatever is
+        #     wired to those ports (a `CylindricalWall`, a `FixedTemperature`,
+        #     ...).  Reproduce the old "convect to a fixed wall temperature"
+        #     behaviour by setting heat_port=True and connecting a
+        #     `FixedTemperature` to each segment wall port.
+        #
+        # `adiabatic` is the deprecated legacy flag.  It only ever toggled the
+        # heat source against a fixed 293.15 K `T_wall` Parameter, which has
+        # been removed; map it onto `heat_port` and warn.
+        if adiabatic is not None:
+            if adiabatic and heat_port:
+                raise ValueError(
+                    "StraightPipe: pass either the deprecated `adiabatic=` or the new "
+                    "`heat_port=`, not both."
+                )
+            if not adiabatic:
+                warnings.warn(
+                    "StraightPipe(adiabatic=False): the legacy fixed-293.15 K wall "
+                    "heating has been removed. Use heat_port=True and connect a thermal "
+                    "boundary (e.g. FixedTemperature) or a wall to each segment's `wall` "
+                    "port to model heat transfer.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            # adiabatic=True simply means "no heat port" == default.
+        self.heat_port = heat_port
         super().__init__()
 
     def get_churchill_f_factor(self, Re, epsilon, D):
@@ -1193,15 +1347,23 @@ class StraightPipe(Model):
         w2 = 1.0 - w1 - w3
         return w1 * nu_1 + w2 * nu_2 + w3 * nu_3
 
-    def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall):
-        Re = w * self.D * rho / mu
+    def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
+        # `Dh` (hydraulic diameter; == D for a circular pipe) and `area` (the
+        # inner wetted surface of ONE segment, = mean perimeter x segment
+        # length) arrive as SymPy expressions built from the SEGMENT's own
+        # geometry Parameter symbols.  Using them -- instead of the parent
+        # pipe's Python floats `self.D` / `self.L` / `self.n_segments` --
+        # keeps this heat term free of baked-in literals, so the cached
+        # `HeatedSegment` template is instance-invariant across pipes of
+        # different diameter or length.  (`area` already accounts for the
+        # per-segment length, so there is no `n_segments` over-counting.)
+        Re = w * Dh * rho / mu
         Pr = mu * rho / k
         nu = self.calculate_nu_smooth(Re, Pr, fr)
-        alpha = nu * k / self.D
-        area = np.pi * self.D * self.L
+        alpha = nu * k / Dh
         return alpha * area * (T_wall - T)
 
-    def get_q_inflow_adiabatic(self, w, p, h, rho, T, mu, k, fr, T_wall):
+    def get_q_inflow_adiabatic(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
         return 0.0
 
     def declare_components(self):
@@ -1264,12 +1426,18 @@ class StraightPipe(Model):
         A_param = self['A']
         P_param = self['P']
         L_seg_param = self['L_segment']
+        # Pick the segment class by `heat_port` (NOT a per-instance flag on a
+        # single class): `HeatedSegment` and `TwoPortSegment` emit different
+        # equation structures, and keeping them as distinct classes keeps the
+        # per-class equation cache correct in models that mix heated and
+        # adiabatic pipes.
+        seg_cls = HeatedSegment if self.heat_port else TwoPortSegment
+        q_f = self.get_q_inflow if self.heat_port else self.get_q_inflow_adiabatic
         for i in range(self.n_segments):
             fr_f = self.get_churchill_f_factor
-            q_f = self.get_q_inflow if not self.adiabatic else self.get_q_inflow_adiabatic
             self.add_component(
                 f'pipe_segment_{i}',
-                TwoPortSegment(
+                seg_cls(
                     self.medium,
                     A_in=A_param, A_out=A_param,
                     P_in=P_param, P_out=P_param,
@@ -1338,3 +1506,16 @@ class StraightPipe(Model):
         for port in ('p_out', 'h_out', 'm_dot_out'):
             self.add_connection(self[port], self[last][port])
         return []
+
+    @property
+    def segment_wall_ports(self):
+        """List of the per-segment `wall` `ThermalPort_TQ` (only when
+        `heat_port=True`).  A parent model connects these to walls/boundaries,
+        e.g. `self.connect(pipe.segment_wall_ports[i], wall_i.ports['port_a'])`.
+        """
+        if not self.heat_port:
+            raise AttributeError(
+                "StraightPipe was built with heat_port=False; it has no segment "
+                "wall ports. Pass heat_port=True to expose them."
+            )
+        return [self[f'pipe_segment_{i}'].ports['wall'] for i in range(self.n_segments)]

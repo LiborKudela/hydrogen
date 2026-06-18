@@ -32,7 +32,8 @@ from .caching import (
     load_lambdified_source,
     save_lambdified_source,
 )
-from .numerics import fast_error_norm, fast_linear_solve, fast_sparse_solve, lambdify_compat
+from .numerics import (fast_error_norm, fast_linear_solve, fast_sparse_solve,
+                        fast_sparse_solve_cached, lambdify_compat)
 
 
 class NewtonConvergenceFailure(RuntimeError):
@@ -95,6 +96,51 @@ _WORKER_PAYLOADS = None  # list of (label, key, args_mat, block, cse), indexed b
 _eq_cache_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "hydrogen_eq_cache", default=None
 )
+
+
+class EquationCacheValidationError(RuntimeError):
+    """A replayed (cached) `declare_equations()` template diverged from a
+    freshly built one for the SAME instance.
+
+    Raised only when the paranoid cache-validation guard is enabled (see
+    `set_equation_cache_validation` / the `HYDROGEN_VALIDATE_EQUATION_CACHE`
+    env var).  A divergence means the per-class template is NOT actually
+    instance-invariant: some value that changes the equation set is being
+    baked into the equations as a Python literal instead of being represented
+    as a `Parameter` (whose numeric value is applied per-instance and so never
+    enters the cached template) or listed in `_cache_key_flags` (so that each
+    variant gets its own cache entry).  Either fix the offending model or, if
+    the difference is a genuine structural toggle, add the controlling flag to
+    that class's `_cache_key_flags`.
+    """
+
+
+def _validate_eq_cache_env_default() -> bool:
+    raw = os.environ.get("HYDROGEN_VALIDATE_EQUATION_CACHE", "")
+    return raw.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+# Paranoid guard: when enabled, EVERY cache replay (`collect_equations` Path A)
+# is checked against a freshly built `declare_equations()` and any mismatch
+# raises `EquationCacheValidationError`.  This catches templates that are not
+# instance-invariant -- e.g. a third instance whose baked literals differ from
+# the first two that happened to agree (the ordinary two-instance validation
+# would have promoted such a class to 'cached' and then silently mis-replayed).
+# Off by default (it doubles equation-building work); turn it on in CI / tests.
+_VALIDATE_EQUATION_CACHE = _validate_eq_cache_env_default()
+
+
+def set_equation_cache_validation(enabled: bool) -> bool:
+    """Enable/disable the paranoid equation-cache validation guard.
+
+    Returns the previous setting so callers (tests) can restore it.  When the
+    guard is on, each cache replay is re-derived and compared, raising
+    `EquationCacheValidationError` on any divergence.
+    """
+    global _VALIDATE_EQUATION_CACHE
+    prev = _VALIDATE_EQUATION_CACHE
+    _VALIDATE_EQUATION_CACHE = bool(enabled)
+    return prev
 
 
 # Numpy doesn't ship a single-arg `Heaviside` (`np.heaviside` is
@@ -241,6 +287,18 @@ class Model:
     #
     # State machine per subclass: 'first' -> 'cached' (after one match) or
     # 'no-cache' (any mismatch / has connections / has side effects).
+    #
+    # The cache is keyed by `(cls, flag_values)` where `flag_values` are the
+    # current values of the per-instance flags named in `_cache_key_flags`.
+    # Most classes' `declare_equations` structure is fully determined by the
+    # class, so the default is an empty tuple (key == just the class).  A class
+    # whose equation structure (or which symbols/variables exist) depends on a
+    # constructor flag MUST list every such flag here, so that two instances
+    # with different flag values get DIFFERENT cache entries instead of one
+    # replaying the other's template.  Example: `TwoNodeWall` lists
+    # `('dynamic',)` because that flag toggles between an ODE form (with
+    # `der_*` states) and an algebraic form.  Flag values must be hashable.
+    _cache_key_flags: tuple = ()
 
     def __init__(self):
         self.can_evaluate = True
@@ -468,6 +526,34 @@ class Model:
                 return True
         return False
 
+    def _iter_ports(self):
+        """Yield every `Port` registered anywhere in this Model's subtree."""
+        for p in getattr(self, "ports", {}).values():
+            yield p
+        for c in self.components.values():
+            if isinstance(c, Model):
+                yield from c._iter_ports()
+
+    def _warn_unconnected_required_ports(self):
+        """Emit a `PortNotConnectedWarning` for each `require_connection` port
+        that ended up unwired.  Such a port leaves its across-variable
+        unclosed, so the system is singular; warning here turns an opaque
+        "Factor is exactly singular" into an actionable message."""
+        import warnings
+
+        from .ports import PortNotConnectedWarning
+
+        for p in self._iter_ports():
+            if getattr(p, "require_connection", False) and not p.is_connected:
+                warnings.warn(
+                    f"Port {p._path()} (kind={p.kind!r}) was declared "
+                    f"require_connection=True but is not connected to anything. "
+                    f"Its across-variable is left unclosed, so the system will be "
+                    f"singular. Connect a boundary/component to this port.",
+                    PortNotConnectedWarning,
+                    stacklevel=2,
+                )
+
     def get_vars_references(self):
         vars_references = []
         param_references = []
@@ -581,10 +667,19 @@ class Model:
         eqs = []
         cls = self.__class__
         eq_cache = _eq_cache_var.get()
+        # Cache key: the class PLUS the values of any per-instance flags the
+        # class declares as equation-structure-affecting (`_cache_key_flags`,
+        # default empty).  Keying by class alone would let two instances of the
+        # same class but with different structure-affecting flags (e.g. a
+        # `dynamic=True` vs `dynamic=False` wall) collide and replay each
+        # other's template.  Including the flag values gives each variant its
+        # own entry, so caching still fires WITHIN a variant while staying
+        # correct ACROSS variants.
+        key = (cls, tuple(getattr(self, name) for name in cls._cache_key_flags))
         # `eq_cache is None` -> running outside `instantiate()` (e.g. via
         # `get_current_system()` or a unit test).  Just rebuild equations
         # every time; the cache exists purely as an `instantiate()` speed-up.
-        cache = eq_cache.get(cls) if eq_cache is not None else None
+        cache = eq_cache.get(key) if eq_cache is not None else None
 
         # Path A: third+ instance of a class whose template has been validated.
         # Replay equations from cached template via a cheap path-based symbol
@@ -602,8 +697,11 @@ class Model:
                     break
                 mapping[first_sym] = target
             if ok:
-                eqs.extend(eq.xreplace(mapping) if eq.free_symbols else eq
-                           for eq in cache['eqs'])
+                replayed = [eq.xreplace(mapping) if eq.free_symbols else eq
+                            for eq in cache['eqs']]
+                if _VALIDATE_EQUATION_CACHE:
+                    self._validate_replayed_equations(replayed)
+                eqs.extend(replayed)
             else:
                 eqs.extend(self.declare_equations())
         # Path B: first or second instance of this class -- run normally and
@@ -619,14 +717,14 @@ class Model:
             if eq_cache is not None:
                 if cache is None:
                     if has_new_conns:
-                        eq_cache[cls] = {'state': 'no-cache'}
+                        eq_cache[key] = {'state': 'no-cache'}
                     else:
                         sym_paths = self._build_sym_paths()
                         sym_to_path = {s: p for p, s in sym_paths.items()}
                         used_syms = set()
                         for eq in run_eqs:
                             used_syms.update(eq.free_symbols)
-                        eq_cache[cls] = {
+                        eq_cache[key] = {
                             'state': 'first',
                             'eqs': run_eqs,
                             'sym_to_path': {s: sym_to_path[s] for s in used_syms
@@ -663,6 +761,48 @@ class Model:
             elif isinstance(c, DifferentialVariable):
                 eqs.extend(c.declare_equations())
         return eqs
+
+    def _validate_replayed_equations(self, replayed):
+        """Paranoid guard: assert a cache-replayed template equals a freshly
+        built `declare_equations()` for THIS instance.
+
+        Only invoked when `_VALIDATE_EQUATION_CACHE` is on.  A mismatch means
+        the cached template is not instance-invariant (a structure-affecting
+        value is baked as a literal rather than a `Parameter`, or a structural
+        toggle is missing from `_cache_key_flags`).  Re-deriving the equations
+        must be side-effect free here: only classes without `add_connection`
+        side effects ever reach the 'cached' state, so `declare_equations()`
+        appends nothing to `self.connections`; we snapshot/restore its length
+        defensively so the guard can never corrupt instantiate state.
+        """
+        n_conns_before = len(self.connections)
+        fresh = self.declare_equations()
+        if len(self.connections) > n_conns_before:
+            del self.connections[n_conns_before:]
+
+        same = (len(fresh) == len(replayed)
+                and all(a == b for a, b in zip(replayed, fresh)))
+        if same:
+            return
+
+        diff_idx = next(
+            (i for i in range(min(len(fresh), len(replayed)))
+             if replayed[i] != fresh[i]),
+            min(len(fresh), len(replayed)),
+        )
+        detail = ""
+        if diff_idx < min(len(fresh), len(replayed)):
+            detail = (f"\n  first divergence at equation #{diff_idx}:"
+                      f"\n    cached : {replayed[diff_idx]}"
+                      f"\n    fresh  : {fresh[diff_idx]}")
+        raise EquationCacheValidationError(
+            f"Cached equation template for {type(self).__name__} does not "
+            f"match a freshly built declare_equations() for this instance "
+            f"({len(replayed)} cached vs {len(fresh)} fresh equations); the "
+            f"template is not instance-invariant.  Represent any "
+            f"structure-affecting value as a Parameter, or add its controlling "
+            f"flag to {type(self).__name__}._cache_key_flags.{detail}"
+        )
 
     @line_profiler.profile
     def get_current_system(self):
@@ -1106,11 +1246,589 @@ class Model:
 
         return new_eqs, new_var_symbols, duplicate_subs
 
+    # --- Tearing (greedy feedback vertex set within BLT blocks) ----------------------
+
+    @staticmethod
+    def _tear_block_greedy(block_rows, block_cols, n_local):
+        """Greedy heuristic tearing for one BLT block.
+
+        Identifies a small set of "tearing" variables whose removal makes the
+        intra-block dependency graph acyclic.  The non-tear variables can then
+        (in principle) be solved in topological order given the tear values --
+        which is what would let an outer Newton iterate over only the tear
+        variables rather than the full block.
+
+        Algorithm (MTK/Cellier-Elmqvist style greedy):
+          1. Build the directed dependency graph on the block's variables: edge
+             var_j -> var_k iff equation matched(j) references var k (j != k,
+             both inside the block).
+          2. While there are SCCs of size > 1 in the remaining graph:
+               * pick the vertex with the largest (in_deg + out_deg) inside any
+                 nontrivial SCC -- this is the variable that, if torn, breaks
+                 the most cycles per removal.
+               * mark it as a tearing variable and remove it from the graph.
+          3. Return the list of tearing variable indices (block-local).
+
+        `block_rows`/`block_cols` are the LOCAL (within-block) coordinates of
+        the block's Jacobian nonzeros (i.e. eq-row to var-col edges, both
+        relabelled to 0..n_local-1 by `_build_blt_plan`'s `eq_local`/`var_local`
+        translation).  The function returns a list of local var indices.
+
+        This is heuristic and small-graphs-only -- for blocks beyond a few
+        hundred variables you'd want a smarter algorithm.  For hydrogen's
+        typical loop blocks (pipe-tree split joints, MixingJunction loops),
+        the input is well under that scale.
+        """
+        # Note on cost: for a 250-var block this runs in a few milliseconds;
+        # we cap the loop to `n_local` iterations as a safety net for
+        # pathological inputs.
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        # Build var-> var directed adjacency from the block's local J pattern.
+        # We assume `_build_blt_plan` ran a perfect matching on the BLOCK so
+        # that local-row i corresponds to local-var i (the diagonal entry).
+        # In practice we pass the diag+lower coords for the block; we just
+        # drop self-loops below.
+        edges_src = []
+        edges_dst = []
+        for r, c in zip(block_rows, block_cols):
+            if r != c:
+                edges_src.append(r)
+                edges_dst.append(c)
+        if not edges_src:
+            return []
+
+        # Use scipy CSR + connected_components for SCC detection.
+        n = n_local
+        adj_data = np.ones(len(edges_src), dtype=np.int8)
+        adj = csr_matrix(
+            (adj_data, (edges_src, edges_dst)), shape=(n, n)
+        )
+
+        tear_vars = []
+        removed = np.zeros(n, dtype=bool)
+
+        for _it in range(n):
+            # Find SCCs of the surviving subgraph.
+            keep_mask = ~removed
+            if not keep_mask.any():
+                break
+            sub = adj[keep_mask][:, keep_mask]
+            n_sub = sub.shape[0]
+            if sub.nnz == 0:
+                break
+            n_comp, labels = connected_components(
+                sub, directed=True, connection='strong', return_labels=True
+            )
+            # Map local labels back to global indices.
+            local_to_global = np.flatnonzero(keep_mask)
+            # Find sizes of each SCC; we only need to tear inside SCCs of size>1.
+            counts = np.bincount(labels)
+            big_sccs = np.where(counts > 1)[0]
+            if big_sccs.size == 0:
+                break
+            # Pick the SCC with the largest count -- tearing inside the
+            # biggest cycle yields the largest structural reduction.
+            target_scc = int(big_sccs[np.argmax(counts[big_sccs])])
+            target_locals = np.where(labels == target_scc)[0]
+            target_globals = local_to_global[target_locals]
+
+            # Score each candidate by total degree within the surviving graph.
+            # Higher = more cycles depend on this var.
+            sub_for_target = adj[target_globals][:, target_globals]
+            out_deg = np.asarray(
+                sub_for_target.sum(axis=1)
+            ).ravel()
+            in_deg = np.asarray(
+                sub_for_target.sum(axis=0)
+            ).ravel()
+            total_deg = in_deg + out_deg
+            pick_local = int(np.argmax(total_deg))
+            pick_global = int(target_globals[pick_local])
+            tear_vars.append(pick_global)
+            removed[pick_global] = True
+
+        return sorted(tear_vars)
+
+    def _compute_tearing(self):
+        """Run greedy tearing on every BLT block of size > 1 and report stats.
+
+        Populates `self._blt_plan['tear_vars_per_block']` with one list per
+        block (empty for 1x1s).  Does not currently change the Newton solve
+        path -- converting tearing into a runtime speedup requires either
+        symbolic re-derivation (so the reduced block can be lambdified at a
+        smaller size) or a nested-Newton solver with implicit differentiation
+        through the inner substitution; both are substantial follow-ups beyond
+        the structural analysis here.  See doc/passes_blt_tearing.md for the
+        full discussion.
+        """
+        plan = self._blt_plan
+        if plan is None:
+            return
+        block_vars = plan['block_vars']
+        diag_local_rows = plan['diag_local_rows']
+        diag_local_cols = plan['diag_local_cols']
+        block_n = plan['block_n']
+
+        tear_per_block = []
+        total_n = 0
+        total_tear = 0
+        biggest_after = 0
+        for b in range(plan['n_blocks']):
+            n_b = int(block_n[b])
+            if n_b <= 1:
+                tear_per_block.append([])
+                continue
+            tears = self._tear_block_greedy(
+                diag_local_rows[b], diag_local_cols[b], n_b
+            )
+            tear_per_block.append(tears)
+            total_n += n_b
+            total_tear += len(tears)
+            reduced = n_b - len(tears)
+            biggest_after = max(biggest_after, reduced)
+        plan['tear_vars_per_block'] = tear_per_block
+
+        n_loop_blocks = sum(1 for ts in tear_per_block if ts)
+        if total_n:
+            print(
+                f"Tearing analysis: {n_loop_blocks} block(s) with cycles; "
+                f"{total_tear}/{total_n} variables flagged as tear "
+                f"({100.0 * total_tear / total_n:.1f}%); biggest "
+                f"post-tear residual block: {biggest_after} variables"
+            )
+
+    # --- BLT (Block Lower Triangular) decomposition ----------------------------------
+
+    @staticmethod
+    def _compute_blt_decomposition(rows, cols, n):
+        """Structural BLT decomposition of a square sparse pattern.
+
+        Given the COO triplet `(rows, cols)` of a `n x n` (eqs x vars) Jacobian
+        pattern, find a permutation that puts the system in block lower
+        triangular form: blocks on the diagonal correspond to strongly-
+        connected components (SCCs) of the var-dependency graph induced by a
+        maximum bipartite matching.
+
+        Returns either None (rectangular or structurally singular) or a dict:
+
+          * 'n_blocks'   -> int
+          * 'block_vars' -> list[np.ndarray] of var indices per block, in
+                            topological *solve* order (ascending label).
+          * 'block_eqs'  -> list[np.ndarray] of eq indices per block, in the
+                            same order as 'block_vars'.  Note: every block
+                            has `len(block_eqs[b]) == len(block_vars[b])`
+                            because the matching is perfect.
+          * 'match'      -> np.ndarray shape (n,): match[i] = j means equation
+                            i is matched to variable j.
+          * 'labels'     -> np.ndarray shape (n,): SCC label per variable.
+                            Lower label = earlier solve order.
+
+        Algorithm: Hopcroft-Karp matching (scipy) -> directed var graph ->
+        Tarjan SCCs (scipy).  Both are O(E + V) up to log factors for sparse
+        patterns; on the pipe_tree N=3 benchmark this is ~50 ms total.
+        """
+        if rows.size == 0:
+            return None
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import (
+            connected_components,
+            maximum_bipartite_matching,
+        )
+
+        data = np.ones(rows.size, dtype=np.int8)
+        A = csr_matrix((data, (rows, cols)), shape=(n, n))
+        A.sum_duplicates()
+
+        # match[i] = j (or -1) -> eq i is matched to var j
+        match = maximum_bipartite_matching(A, perm_type='column')
+        if (match < 0).any():
+            # Structurally singular -- no perfect matching exists.  We surface
+            # this rather than silently producing wrong block structure;
+            # caller is expected to disable BLT and fall back.
+            return None
+
+        # Var graph: edge var_j -> var_k iff eq match^{-1}(j) references var k.
+        # In CSR over (eqs x vars), row i's nonzero cols are A.indices[indptr[i]:indptr[i+1]].
+        # We loop rows once and emit (match[i], k) per nonzero k in row i (k != match[i]).
+        indptr = A.indptr
+        indices = A.indices
+        # Pre-size: at most nnz - n entries (subtract one self-loop per row).
+        nnz = indices.size
+        edge_src = np.empty(nnz, dtype=np.int64)
+        edge_dst = np.empty(nnz, dtype=np.int64)
+        cursor = 0
+        for i in range(n):
+            j = match[i]
+            for k in indices[indptr[i]:indptr[i + 1]]:
+                if k != j:
+                    edge_src[cursor] = j
+                    edge_dst[cursor] = k
+                    cursor += 1
+        edge_src = edge_src[:cursor]
+        edge_dst = edge_dst[:cursor]
+
+        if cursor == 0:
+            # No cross-variable dependencies: every variable is its own SCC,
+            # already in some order.  Skip the SCC scan -- much cheaper to
+            # just use the identity labelling.
+            labels = np.arange(n, dtype=np.int64)
+            n_components = n
+        else:
+            var_graph = csr_matrix(
+                (np.ones(cursor, dtype=np.int8), (edge_src, edge_dst)),
+                shape=(n, n),
+            )
+            n_components, labels = connected_components(
+                var_graph, directed=True, connection='strong', return_labels=True
+            )
+        # scipy gives SCC labels in REVERSE topological order: sinks (no
+        # outgoing edges, solvable first) get LOW labels.  We iterate
+        # ascending so blocks come out in solve order automatically.
+
+        block_vars_lists = [[] for _ in range(n_components)]
+        for j in range(n):
+            block_vars_lists[labels[j]].append(j)
+
+        # inv_match[j] = i: var j is matched to eq i.
+        inv_match = np.empty(n, dtype=np.int64)
+        inv_match[match] = np.arange(n, dtype=np.int64)
+
+        block_vars = [np.asarray(sorted(vs), dtype=np.int64) for vs in block_vars_lists]
+        block_eqs = [inv_match[vs] for vs in block_vars]
+
+        return {
+            'n_blocks': int(n_components),
+            'block_vars': block_vars,
+            'block_eqs': block_eqs,
+            'match': match,
+            'labels': labels,
+        }
+
+    def _build_blt_plan(self, blt, dense_cutoff=32):
+        """Pre-compute per-block index arrays for fast block-wise Newton solve.
+
+        Splits the Jacobian's nonzeros into:
+          * 'diag_*' per block: (row, col) both in this block (the block's own
+                                local Jacobian, used to actually solve the sub-system)
+          * 'lower_*' per block: row in this block, col in any earlier block
+                                 (off-diagonal coupling that gets subtracted from
+                                  the local rhs before solving the sub-system)
+
+        Entries with col in a LATER block would violate BLT-by-construction
+        (they couldn't exist in a true block lower triangle).  If any are
+        found we surface it as a programmer error -- the BLT decomposition
+        was inconsistent with the actual nonzero pattern.
+
+        `dense_cutoff` controls the per-block solver selection:
+            n == 1                          -> 'scalar' (single divide)
+            1 < n <= dense_cutoff           -> 'dense'  (numpy.linalg.solve)
+            n  > dense_cutoff               -> 'sparse' (scipy splu)
+        """
+        n_blocks = blt['n_blocks']
+        block_vars = blt['block_vars']
+        block_eqs = blt['block_eqs']
+        labels = blt['labels']
+
+        # var_block[j] = block label of variable j
+        var_block = labels
+
+        # eq_block[i] = block label of equation i (== block of var match^{-1}(i))
+        eq_block = np.empty(self.n_v, dtype=np.int64)
+        for b in range(n_blocks):
+            eq_block[block_eqs[b]] = b
+
+        rows = self._jac_sparse_rows
+        cols = self._jac_sparse_cols
+        jac_row_block = eq_block[rows]
+        jac_col_block = var_block[cols]
+
+        # Sanity check: no upper-block entries allowed by BLT construction.
+        upper_mask = jac_col_block > jac_row_block
+        if upper_mask.any():
+            raise RuntimeError(
+                f"BLT structural plan violated: {int(upper_mask.sum())} "
+                f"Jacobian entry(s) reference a var in a later block.  "
+                f"This means the matching/SCC pass disagrees with the "
+                f"sparsity pattern -- please report with a reproducer."
+            )
+
+        # Global-symbol -> local-within-block index lookups.
+        eq_local = np.zeros(self.n_v, dtype=np.int64)
+        var_local = np.zeros(self.n_v, dtype=np.int64)
+        for b in range(n_blocks):
+            eq_local[block_eqs[b]] = np.arange(block_eqs[b].size, dtype=np.int64)
+            var_local[block_vars[b]] = np.arange(block_vars[b].size, dtype=np.int64)
+
+        diag_jac_idx = []
+        diag_local_rows = []
+        diag_local_cols = []
+        lower_jac_idx = []
+        lower_local_rows = []
+        lower_global_cols = []
+        block_solver = []
+
+        for b in range(n_blocks):
+            in_block_rows = jac_row_block == b
+
+            diag_mask = in_block_rows & (jac_col_block == b)
+            di = np.nonzero(diag_mask)[0]
+            diag_jac_idx.append(di)
+            diag_local_rows.append(eq_local[rows[di]])
+            diag_local_cols.append(var_local[cols[di]])
+
+            lower_mask = in_block_rows & (jac_col_block < b)
+            li = np.nonzero(lower_mask)[0]
+            lower_jac_idx.append(li)
+            lower_local_rows.append(eq_local[rows[li]])
+            lower_global_cols.append(cols[li].astype(np.int64, copy=False))
+
+            n_b = block_vars[b].size
+            if n_b == 1:
+                block_solver.append('scalar')
+            elif n_b <= dense_cutoff:
+                block_solver.append('dense')
+            else:
+                block_solver.append('sparse')
+
+        block_n = np.asarray([v.size for v in block_vars], dtype=np.int64)
+
+        # Block-wise solve only beats `splu` on the whole system in two
+        # regimes:
+        #   * Pure forward substitution (largest block is 1)            -> chain
+        #     of scalar divides, ~10x faster than splu.
+        #   * Many small-to-medium independent blocks dominate          -> e.g.
+        #     after tearing reduces a loop to a few coupled vars while leaving
+        #     the rest as 1x1.
+        # Otherwise (one dominant SCC or hundreds of 2..32 blocks with Python
+        # dispatch overhead per block) splu's single C call wins.  We therefore
+        # decide solve strategy here and fall back to the flat sparse path
+        # automatically; the BLT structure stays attached on the model so
+        # downstream passes (tearing, scaling) can still consult it.
+        largest_block = int(block_n.max())
+        n_scalar = int((block_n == 1).sum())
+        if largest_block == 1:
+            solve_mode = 'triangular'      # spsolve_triangular on global matrix
+        elif n_scalar / max(1, self.n_v) >= 0.95:
+            solve_mode = 'blockwise'       # tiny tail of larger blocks
+        else:
+            solve_mode = 'monolithic'      # splu on the whole permuted matrix
+
+        # Pre-compute the BLT permutation arrays for `triangular` mode: we
+        # need to permute COO indices into the BLT order so the resulting
+        # CSR matrix is genuinely lower-triangular.
+        var_perm = np.empty(self.n_v, dtype=np.int64)   # old_col -> new_col
+        eq_perm = np.empty(self.n_v, dtype=np.int64)    # old_row -> new_row
+        cursor = 0
+        for b in range(n_blocks):
+            for v in block_vars[b]:
+                var_perm[v] = cursor
+                cursor += 1
+        cursor = 0
+        for b in range(n_blocks):
+            for e in block_eqs[b]:
+                eq_perm[e] = cursor
+                cursor += 1
+        # Inverse perms: new_idx -> old_idx (used to scatter solved delta back)
+        var_perm_inv = np.empty(self.n_v, dtype=np.int64)
+        var_perm_inv[var_perm] = np.arange(self.n_v, dtype=np.int64)
+        eq_perm_inv = np.empty(self.n_v, dtype=np.int64)
+        eq_perm_inv[eq_perm] = np.arange(self.n_v, dtype=np.int64)
+
+        # COO indices in BLT order (precomputed; values come at runtime).
+        perm_rows = eq_perm[self._jac_sparse_rows]
+        perm_cols = var_perm[self._jac_sparse_cols]
+
+        return {
+            'n_blocks': n_blocks,
+            'block_vars': block_vars,
+            'block_eqs': block_eqs,
+            'block_n': block_n,
+            'largest_block': largest_block,
+            'n_scalar': n_scalar,
+            'diag_jac_idx': diag_jac_idx,
+            'diag_local_rows': diag_local_rows,
+            'diag_local_cols': diag_local_cols,
+            'lower_jac_idx': lower_jac_idx,
+            'lower_local_rows': lower_local_rows,
+            'lower_global_cols': lower_global_cols,
+            'block_solver': block_solver,
+            'solve_mode': solve_mode,
+            'var_perm': var_perm,
+            'var_perm_inv': var_perm_inv,
+            'eq_perm': eq_perm,
+            'eq_perm_inv': eq_perm_inv,
+            'perm_rows': perm_rows,
+            'perm_cols': perm_cols,
+        }
+
+    # --- linear-block (multi-var) elimination ----------------------------------------
+
+    @line_profiler.profile
+    def remove_linear_block_equations(self, equations, var_symbols):
+        """Eliminate equations linear in >=3 surviving Variables.
+
+        Extension of `remove_trivial_equations` (which only handles 2-var
+        linear equations).  For an equation
+            c0 + c1*v1 + c2*v2 + ... + cK*vK == 0  (K >= 2, all ci constant)
+        we pick one `v_p` as pivot and substitute
+            v_p = -(c0 + sum_{i != p} ci * vi) / cp
+        into every other equation in the system, then drop the original
+        equation and `v_p`.
+
+        Pivot heuristic: among the linear eq's Variables, pick the one that
+        appears in the FEWEST other equations (linear or nonlinear).  This
+        keeps the substitution from blowing up the AST size of equations it
+        gets pushed into.
+
+        Multiple candidates in the same pass: pivots are applied
+        SEQUENTIALLY, with each new substitution xreplace'd into the
+        remaining candidate equations before the next pivot is picked.
+        This is critical for correctness when later candidates reference
+        earlier pivots -- without the in-loop xreplace, dropping the
+        earlier pivot's contribution from those eqs silently breaks the
+        constraints they express.
+
+        Safety:
+          * Refuses to pivot on a variable whose coefficient `cp` is a
+            sympy expression containing free symbols (would be dividing by
+            something that could vanish).  Plain Numbers (incl. negatives)
+            are fine.
+          * Only Variables (not Parameters) are eligible as pivots.
+        """
+        raw_var_set = set(self.raw_var_symbols)
+        var_set = set(var_symbols)
+        current_to_prev = {v.symbol: v.prev_symbol for v in self.raw_vars_references}
+
+        # Pass 1: count var usage across ALL eqs (linear + nonlinear) and
+        # find candidate indices.  Usage drives pivot selection: prefer
+        # eliminating a var that doesn't bloat many other equations.
+        var_usage = {}
+        candidate_indices = []
+        for idx, eq in enumerate(equations):
+            for s in eq.free_symbols:
+                if s in var_set:
+                    var_usage[s] = var_usage.get(s, 0) + 1
+            res = Model._classify_linear(eq)
+            if res is None:
+                continue
+            c0, coeffs = res
+            n_surviving = sum(
+                1 for s, c in coeffs.items()
+                if c != 0 and s in raw_var_set and s in var_set
+            )
+            if n_surviving >= 3:
+                candidate_indices.append(idx)
+
+        if not candidate_indices:
+            print("No multi-var linear equations found")
+            return equations, var_symbols, {}
+
+        print(f"Linear-block: {len(candidate_indices)} candidate equation(s) "
+              f"(>=3 surviving vars)")
+
+        # Pass 2: sequential pivot picking.  Maintain a MUTABLE per-candidate
+        # equation form so each new pivot's substitution gets folded into
+        # every remaining candidate before the next pivot decision.  This
+        # makes the algorithm equivalent to one-pivot-per-outer-pass, but
+        # without the lambdify-grade cost of re-running the whole instantiate
+        # outer loop per pivot.
+        eqs_state = {idx: equations[idx] for idx in candidate_indices}
+        substitutions = {}
+        drop_indices = set()
+        removed_vars = set()
+
+        for idx in candidate_indices:
+            eq_now = eqs_state[idx]
+            res = Model._classify_linear(eq_now)
+            if res is None:
+                # Earlier pivot substitution turned this candidate nonlinear
+                # (rare but possible if RHS contained a product).  Leave it
+                # in the system; the next outer pass will re-classify.
+                continue
+            c0, coeffs = res
+            live = {
+                s: c for s, c in coeffs.items()
+                if c != 0 and s in raw_var_set and s in var_set
+                and s not in removed_vars
+            }
+            if len(live) < 2:
+                continue
+
+            pivot = min(
+                live.keys(),
+                key=lambda s: (var_usage.get(s, 0), s.name),
+            )
+            cp = live[pivot]
+            try:
+                if cp.free_symbols:
+                    continue
+            except AttributeError:
+                pass
+
+            # v_p = -(c0 + sum_{j != p} cj * vj) / cp.  Build from the
+            # CURRENT (mutated) form of the eq, NOT the original coeffs --
+            # earlier xreplaces may have rewritten the symbols.
+            rest = -c0
+            for s, c in live.items():
+                if s is pivot:
+                    continue
+                rest = rest - c * s
+            sol = rest / cp
+
+            substitutions[pivot] = sol
+            removed_vars.add(pivot)
+            drop_indices.add(idx)
+
+            pivot_prev = current_to_prev.get(pivot)
+            if pivot_prev is not None:
+                sol_prev = sol.xreplace(current_to_prev) if sol.free_symbols else sol
+                substitutions[pivot_prev] = sol_prev
+                removed_vars.add(pivot_prev)
+
+            # Fold this pivot's substitution into ALL OTHER remaining
+            # candidate eqs so the next iteration's `_classify_linear` sees
+            # the up-to-date form.  Only touch eqs that actually mention
+            # the pivot -- xreplace is O(tree) and pipe trees have many
+            # candidates that don't share vars.
+            pivot_sub = {pivot: sol}
+            for other in candidate_indices:
+                if other in drop_indices or other == idx:
+                    continue
+                eq_other = eqs_state[other]
+                if pivot in eq_other.free_symbols:
+                    eqs_state[other] = eq_other.xreplace(pivot_sub)
+
+        if not substitutions:
+            print("No linear-block pivots picked")
+            return equations, var_symbols, {}
+
+        print(f"Linear-block: {len(drop_indices)} equation(s) dropped, "
+              f"{len(substitutions)} substitution(s)")
+        Model._close_substitutions(substitutions)
+        sub_keys = set(substitutions.keys())
+
+        new_eqs = []
+        for idx, eq in enumerate(equations):
+            if idx in drop_indices:
+                continue
+            if eq.free_symbols.isdisjoint(sub_keys):
+                new_eqs.append(eq)
+            else:
+                new_eqs.append(eq.xreplace(substitutions))
+
+        removed_set = set(substitutions.keys())
+        new_var_symbols = [s for s in var_symbols if s not in removed_set]
+        return new_eqs, new_var_symbols, substitutions
+
     # --- compilation ------------------------------------------------------------------
 
     @line_profiler.profile
     def instantiate(self, cse=True, aditional_modules=None, max_remove_trival_passes=1,
-                    lambda_cache_dir=None, max_remove_duplicate_passes=5):
+                    lambda_cache_dir=None, max_remove_duplicate_passes=5,
+                    enable_blt=True, max_remove_linear_block_passes=3,
+                    enable_var_scaling=False):
         # Step B's `declare_equations()` template cache is scoped to this single
         # `instantiate()` call to avoid cross-call contamination (e.g. Air's
         # `Air_rho_ph` Function nodes leaking into a subsequent Hydrogen
@@ -1124,6 +1842,9 @@ class Model:
                 max_remove_trival_passes=max_remove_trival_passes,
                 lambda_cache_dir=lambda_cache_dir,
                 max_remove_duplicate_passes=max_remove_duplicate_passes,
+                enable_blt=enable_blt,
+                max_remove_linear_block_passes=max_remove_linear_block_passes,
+                enable_var_scaling=enable_var_scaling,
             )
         finally:
             _eq_cache_var.reset(_eq_cache_token)
@@ -1131,7 +1852,9 @@ class Model:
     @line_profiler.profile
     def _instantiate_impl(self, cse=True, aditional_modules=None,
                           max_remove_trival_passes=1, lambda_cache_dir=None,
-                          max_remove_duplicate_passes=5):
+                          max_remove_duplicate_passes=5, enable_blt=True,
+                          max_remove_linear_block_passes=3,
+                          enable_var_scaling=False):
         if aditional_modules is None:
             aditional_modules = []
         # `_NUMPY_LAMBDIFY_COMPAT` patches sympy callables that `lambdify`
@@ -1188,6 +1911,10 @@ class Model:
         # per eq.
         self.all_raw_equations = self.collect_equations()
         _t_collect = time.time() - _t0
+        # Connections are now resolved (`connect()` ran inside the
+        # `declare_equations` walk above), so port wiring state is final:
+        # warn about any port that asked to be connected but wasn't.
+        self._warn_unconnected_required_ports()
         self.raw_var_symbols, self.raw_prev_var_symbols, self.raw_param_symbols = vars, prev_vars, params
         self.all_raw_symbols = self.raw_var_symbols + self.raw_prev_var_symbols + self.raw_param_symbols + self.t_symbols
         self.record['vars_names'] = [getattr(v, 'full_name', v.name) for v in self.raw_vars_references]
@@ -1421,6 +2148,43 @@ class Model:
                 f"Duplicate-equation reduction: {before_n - after_n} equation(s) / "
                 f"{total_subs} substitution(s) over {pass_idx + 1} pass(es) in "
                 f"{time.time() - dup_start:.2f} s"
+            )
+
+        # Multi-variable linear-block elimination.  Extends the trivial
+        # reducer (2-var) to any-N-var linear equations: mass balances at
+        # splitters / junctions, geometric area relations, anything where
+        # the dedup pass left a linear sub-block of >= 3 unknowns.  Iterated
+        # because each pass's substitutions can expose new linear-3+
+        # candidates (a multi-var eq with one symbolic subexpression
+        # collapses to fewer vars after substitution).
+        if max_remove_linear_block_passes > 0:
+            print("Removing multi-var linear equations")
+            lb_start = time.time()
+            before_n = len(self.improved_equations)
+            total_lb_subs = 0
+            for pass_idx in range(max_remove_linear_block_passes):
+                print(f"Linear-block pass {pass_idx + 1}")
+                pass_before_n = len(self.improved_equations)
+                self.improved_equations, self.all_improved_symbols, lb_subs = (
+                    self.remove_linear_block_equations(
+                        self.improved_equations, self.all_improved_symbols)
+                )
+                if not lb_subs:
+                    break
+                for prev_key in list(self.improve_subs.keys()):
+                    self.improve_subs[prev_key] = self.improve_subs[prev_key].xreplace(lb_subs)
+                self.improve_subs.update(lb_subs)
+                total_lb_subs += len(lb_subs)
+                if len(self.improved_equations) == pass_before_n:
+                    break
+            improved_symbols_set = set(self.all_improved_symbols)
+            self.improved_vars = [s for s in self.raw_var_symbols
+                                  if s in improved_symbols_set]
+            after_n = len(self.improved_equations)
+            print(
+                f"Linear-block reduction: {before_n - after_n} equation(s) / "
+                f"{total_lb_subs} substitution(s) over {pass_idx + 1} pass(es) "
+                f"in {time.time() - lb_start:.2f} s"
             )
 
         self.n_v = len(self.improved_vars)
@@ -1663,6 +2427,32 @@ class Model:
         self._jac_nnz = len(plan_jac_rows)
         self._template_lambdas = template_lambdas
 
+        # Structural pattern caching for the per-Newton-iter sparse solve.
+        # `precompute_csc_pattern` returns the COO->CSC permutation +
+        # canonical `(indices, indptr)` once; the inner loop then builds
+        # the CSC matrix without re-sorting / dedup-scanning every iter.
+        # Saves ~30-50us per Newton iter on the run_system workload --
+        # small in absolute terms here (CoolProp dominates) but free, and
+        # the relative win grows once the per-iter symbolic work drops.
+        if self._jac_nnz > 0:
+            from .numerics import precompute_csc_pattern
+            n = self.n_v
+            (
+                self._jac_csc_perm,
+                self._jac_csc_indices,
+                self._jac_csc_indptr,
+            ) = precompute_csc_pattern(
+                self._jac_sparse_rows, self._jac_sparse_cols, (n, n)
+            )
+            print(
+                f"Sparse Jacobian CSC pattern cached: nnz={self._jac_nnz}, "
+                f"shape=({n}, {n})"
+            )
+        else:
+            self._jac_csc_perm = None
+            self._jac_csc_indices = None
+            self._jac_csc_indptr = None
+
         # ---- Vectorised plan: pre-compute per-template gather + scatter ----
         # The per-instance Newton loop (`_eval_per_template`, kept below as a
         # fallback) calls each template's lambda once per instance.  At
@@ -1726,6 +2516,46 @@ class Model:
               f"({n_templates} templates, {self._n_instances} instances, "
               f"{self._jac_nnz} nonzeros, "
               f"{100.0 * self._jac_nnz / max(1, self.n_v * n_eq):.2f}% dense)")
+
+        # ---- BLT decomposition + block-wise solve plan (Pass: BLT) ---------
+        # Splits the post-dedup Jacobian into strongly-connected blocks and
+        # routes the per-Newton-iteration linear solve through a block-wise
+        # forward substitution.  For feed-forward topologies (pipe trees,
+        # series pipe chains) the SCC pass produces hundreds of 1x1 blocks
+        # and the entire Newton step becomes O(nnz) flops instead of one
+        # whole-system splu factorisation; loop topologies collapse the
+        # loop into a single dense/sparse block while leaving the rest as
+        # 1x1.  Enabled by default; pass `enable_blt=False` to fall back
+        # to the flat `fast_sparse_solve` path used pre-BLT.
+        self._blt_plan = None
+        if enable_blt and self._jac_nnz > 0 and self.n_v == n_eq:
+            t_blt = time.time()
+            blt = self._compute_blt_decomposition(
+                self._jac_sparse_rows, self._jac_sparse_cols, self.n_v
+            )
+            if blt is not None:
+                self._blt_plan = self._build_blt_plan(blt)
+                bn = self._blt_plan['block_n']
+                n_blocks = self._blt_plan['n_blocks']
+                n_scalar = int((bn == 1).sum())
+                n_small = int(((bn > 1) & (bn <= 32)).sum())
+                n_large = int((bn > 32).sum())
+                largest = int(bn.max())
+                mode = self._blt_plan['solve_mode']
+                print(
+                    f"BLT decomposition: {n_blocks} block(s) over {self.n_v} "
+                    f"variables (1x1: {n_scalar}, 2..32: {n_small}, >32: "
+                    f"{n_large}; largest block {largest}; solve_mode={mode}) "
+                    f"in {time.time() - t_blt:.2f} s"
+                )
+                if largest > 1:
+                    t_tear = time.time()
+                    self._compute_tearing()
+                    print(f"  tearing analysis in {time.time() - t_tear:.2f} s")
+            else:
+                print("BLT skipped: no perfect matching (structurally singular)")
+        elif enable_blt:
+            print(f"BLT skipped: n_v={self.n_v}, n_eq={n_eq}, nnz={self._jac_nnz}")
 
         # Eval routines that mimic the previous lambda interface.
         n_eq_local = n_eq
@@ -1884,6 +2714,46 @@ class Model:
 
         self.active_vars_references = [var for var in self.raw_vars_references if var.symbol in self.improved_vars]
 
+        # Per-variable scale vector for the Newton convergence metric.
+        # Per-Variable `scale` attribute wins; otherwise we fall back to
+        # max(|initial_value|, 1.0) -- a Modelica-style "nominal" default
+        # that auto-rescales mixed-magnitude systems (pressure ~1e5,
+        # mass flow ~1e-3) so they share a comparable convergence
+        # threshold.  When `enable_var_scaling=False` we leave the metric
+        # un-scaled (==1.0) so the legacy unscaled L2 norm is recovered.
+        if enable_var_scaling:
+            scales = []
+            for v in self.active_vars_references:
+                s = getattr(v, 'scale', None)
+                if s is None:
+                    s = max(abs(float(v.value)), 1.0)
+                scales.append(float(s) if float(s) > 0 else 1.0)
+            self.var_scales = np.asarray(scales, dtype=float)
+        else:
+            self.var_scales = np.ones(self.n_v, dtype=float)
+        # Pre-compute the inverse and a scratch buffer so the inner Newton
+        # loop's scaled-norm metric is a single fused mul (no array alloc,
+        # no division) -- otherwise the 338-var/20-step bench shows a
+        # ~25ms hot-loop regression from `delta / scales` allocating fresh
+        # output every iter.
+        self._var_inv_scales = 1.0 / self.var_scales
+        self._scaled_delta_buf = np.empty(self.n_v, dtype=float)
+        # Only flag scaling as ACTIVE if at least 2 orders of magnitude
+        # separate the smallest and largest scale -- below that the
+        # un-scaled L2 norm is fine and the per-iter mul is pure overhead.
+        if self.n_v and enable_var_scaling:
+            log_s = np.log10(self.var_scales)
+            span = float(log_s.max() - log_s.min())
+            self._var_scaling_active = span >= 2.0
+            print(
+                f"Var scaling: span log10 = [{log_s.min():.1f}, "
+                f"{log_s.max():.1f}] ({self.n_v} vars; "
+                f"{int((self.var_scales != 1.0).sum())} non-unit scales; "
+                f"{'active' if self._var_scaling_active else 'inactive (span<2)'})"
+            )
+        else:
+            self._var_scaling_active = False
+
         # The "raw vars reconstructor" maps the improved state vector to the FULL
         # set of original variables (in `raw_vars_references` order).  For most
         # variables this is just an index permutation; only the ones that were
@@ -1941,6 +2811,25 @@ class Model:
         if not self._raw_sub_exprs:
             self.improve_subs = {}
             self.record['subs'] = {}
+
+        # --- time-dependent Input signals --------------------------------------
+        # Each `Input` contributed two ordinary Parameters (`cur`/`prev`) into
+        # the param block.  Cache (input, slot_cur, slot_prev) so that
+        # `_refresh_inputs` can rewrite those two slots in place every time the
+        # integrator moves the time level -- no full `set_param_values` needed.
+        # Slot index == position in `raw_param_references`, which is the exact
+        # order the param block is laid out (the same invariant `initialise`
+        # relies on for `set_param_values`).
+        self._input_refs = []
+        inputs = self._collect_inputs()
+        if inputs:
+            param_index = {id(p): i for i, p in enumerate(self.raw_param_references)}
+            for inp in inputs:
+                i_cur = param_index.get(id(inp.components['cur']))
+                i_prev = param_index.get(id(inp.components['prev']))
+                if i_cur is not None and i_prev is not None:
+                    self._input_refs.append((inp, i_cur, i_prev))
+
         gc.collect()
 
     def _lambdify_with_cache(self, label, args, expr, modules, cse):
@@ -2018,6 +2907,7 @@ class Model:
 
     def set_t_values(self, t_values):
         self.values[2 * self.n_v + self.n_p:2 * self.n_v + self.n_p + 3] = t_values
+        self._refresh_inputs()
 
     @property
     def time(self):
@@ -2045,9 +2935,50 @@ class Model:
 
     def set_t(self, t):
         self.values[2 * self.n_v + self.n_p] = t
+        self._refresh_inputs()
 
     def set_t_prev(self, t_prev):
         self.values[2 * self.n_v + self.n_p + 1] = t_prev
+        self._refresh_inputs()
+
+    # --- time-dependent Input signals ------------------------------------------------
+
+    def _collect_inputs(self):
+        """Every `Input` reachable in the component tree (depth-first)."""
+        found = []
+
+        def _walk(node):
+            for c in node.components.values():
+                if isinstance(c, Input):
+                    found.append(c)
+                elif isinstance(c, Model):
+                    _walk(c)
+
+        _walk(self)
+        return found
+
+    def _refresh_inputs(self):
+        """Re-sample every `Input` at the current `(t, t_prev)` and write the
+        results straight into their two parameter slots in `self.values`.
+
+        Called from the time setters so the lambdified residual/Jacobian
+        always sees `u(t_{k+1})` and `u(t_k)` consistent with the time level
+        being solved.  No-op (single attribute read) for systems without any
+        `Input`, so the hot path is unaffected.
+        """
+        refs = getattr(self, "_input_refs", None)
+        if not refs:
+            return
+        base = 2 * self.n_v
+        t = self.values[base + self.n_p]
+        t_prev = self.values[base + self.n_p + 1]
+        for inp, i_cur, i_prev in refs:
+            cur = float(inp.func(t))
+            prev = float(inp.func(t_prev))
+            inp.components['cur'].value = cur
+            inp.components['prev'].value = prev
+            self.values[base + i_cur] = cur
+            self.values[base + i_prev] = prev
 
     # --- evaluation / Newton solve / time stepping -----------------------------------
 
@@ -2128,28 +3059,174 @@ class Model:
         self.next_step()
 
     def update_delta(self):
-        # Sparse path: when we built a sparse-Jacobian evaluator at instantiate
-        # time, evaluate just the nonzero values and solve via scipy's SuperLU.
-        # This avoids both materialising a dense (n_eq x n_v) matrix and the
-        # cubic-time dense LU.  For the pipe-tree case the Jacobian is < 7%
-        # dense, so SuperLU wins both in time and memory.
+        # BLT path: per-block forward substitution.  For feed-forward
+        # topologies (linear pipe chain, pipe tree) this is much faster
+        # than a whole-system splu because most blocks are 1x1 (single
+        # divide).  For loop-containing systems the loop becomes one block
+        # solved with dense/sparse LU and the rest stay 1x1.
+        if getattr(self, "_blt_plan", None) is not None:
+            self._update_delta_blt()
+            return
+        # Sparse path: evaluate Jacobian nonzero values and solve via
+        # scipy's SuperLU on the full system.  Used when BLT is disabled
+        # or didn't apply.  For the pipe-tree case the Jacobian is < 7%
+        # dense, so SuperLU wins both in time and memory vs a dense LU.
         if getattr(self, "_lambdified_jac_values", None) is not None:
             self.set_vars_values(self.get_vars_values())  # no-op write to refresh `values`
             jac_vals = np.asarray(self._lambdified_jac_values(*self.values)).reshape(-1)
             r = np.asarray(self.eval_residuals(self.get_vars_values())).reshape(-1)
             n_eq = self.delta_values.size  # square system: n_eq == n_v
-            self.delta_values[:] = fast_sparse_solve(
-                jac_vals,
-                self._jac_sparse_rows,
-                self._jac_sparse_cols,
-                (n_eq, self.n_v),
-                r,
-            )
+            if self._jac_csc_perm is not None:
+                self.delta_values[:] = fast_sparse_solve_cached(
+                    jac_vals,
+                    self._jac_csc_perm,
+                    self._jac_csc_indices,
+                    self._jac_csc_indptr,
+                    (n_eq, self.n_v),
+                    r,
+                )
+            else:
+                self.delta_values[:] = fast_sparse_solve(
+                    jac_vals,
+                    self._jac_sparse_rows,
+                    self._jac_sparse_cols,
+                    (n_eq, self.n_v),
+                    r,
+                )
             return
         # Dense fallback for legacy / non-sparse codepaths.
         j = self.eval_jacobian(self.get_vars_values())
         r = self.eval_residuals(self.get_vars_values())
         self.delta_values[:] = fast_linear_solve(j, r).T[0]
+
+    def _update_delta_blt(self):
+        """BLT-guided Newton-step solve.  Dispatches on `plan['solve_mode']`:
+
+          * 'triangular' (largest block == 1): permute Jacobian into BLT order
+            and run scipy's `spsolve_triangular` -- a C-level forward
+            substitution that's ~4x faster than `splu` on fully-1x1 systems.
+          * 'blockwise'  (>= 95% of vars in 1x1 blocks with a tiny tail of
+            larger blocks): per-block forward substitution loop.  Useful
+            mainly post-tearing.
+          * 'monolithic' (one dominant SCC OR many medium-sized blocks):
+            permute into BLT order and run `splu` on the permuted matrix.
+            The permutation gives SuperLU a head-start on the fill-reducing
+            ordering AND keeps the BLT structure intact for future
+            block-aware passes; the per-iteration cost is at parity with
+            the un-permuted `splu` path.
+        """
+        self.set_vars_values(self.get_vars_values())  # refresh `values`
+        jac_vals = np.asarray(
+            self._lambdified_jac_values(*self.values)
+        ).reshape(-1)
+        r = np.asarray(self.eval_residuals(self.get_vars_values())).reshape(-1)
+
+        plan = self._blt_plan
+        mode = plan['solve_mode']
+        if mode == 'triangular':
+            self._blt_solve_triangular(jac_vals, r)
+        elif mode == 'blockwise':
+            self._blt_solve_blockwise(jac_vals, r)
+        else:
+            self._blt_solve_monolithic(jac_vals, r)
+
+    def _blt_solve_triangular(self, jac_vals, r):
+        """Pure forward substitution on a BLT-permuted matrix (all 1x1 blocks).
+
+        After permutation the matrix is strictly lower-triangular with the
+        Jacobian's diagonal entries on the diagonal.  `spsolve_triangular`
+        runs the entire forward substitution as one C call with no Python
+        loop overhead.
+        """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.linalg import spsolve_triangular
+        plan = self._blt_plan
+        n = self.n_v
+        A = csr_matrix(
+            (jac_vals, (plan['perm_rows'], plan['perm_cols'])),
+            shape=(n, n),
+        )
+        # Permute r by row permutation
+        r_perm = r[plan['eq_perm_inv']]
+        delta_perm = spsolve_triangular(A, r_perm, lower=True,
+                                        unit_diagonal=False)
+        # Inverse-permute delta back into original variable order
+        self.delta_values[:] = delta_perm[plan['var_perm']]
+
+    def _blt_solve_monolithic(self, jac_vals, r):
+        """Permute Jacobian into BLT row/col order, then run splu on the
+        permuted CSC.  Equivalent in speed to splu on the unpermuted matrix
+        (SuperLU re-orders internally) but keeps the BLT framing intact for
+        block-aware passes layered above.
+        """
+        n = self.n_v
+        if self._jac_csc_perm is not None:
+            self.delta_values[:] = fast_sparse_solve_cached(
+                jac_vals,
+                self._jac_csc_perm,
+                self._jac_csc_indices,
+                self._jac_csc_indptr,
+                (n, n),
+                r,
+            )
+        else:
+            self.delta_values[:] = fast_sparse_solve(
+                jac_vals,
+                self._jac_sparse_rows,
+                self._jac_sparse_cols,
+                (n, n),
+                r,
+            )
+
+    def _blt_solve_blockwise(self, jac_vals, r):
+        """Per-block forward substitution.  Used when most vars are in 1x1
+        blocks but a small tail of larger blocks needs dense/sparse LU."""
+        plan = self._blt_plan
+        block_vars = plan['block_vars']
+        block_eqs = plan['block_eqs']
+        block_n = plan['block_n']
+        diag_jac_idx = plan['diag_jac_idx']
+        diag_local_rows = plan['diag_local_rows']
+        diag_local_cols = plan['diag_local_cols']
+        lower_jac_idx = plan['lower_jac_idx']
+        lower_local_rows = plan['lower_local_rows']
+        lower_global_cols = plan['lower_global_cols']
+        block_solver = plan['block_solver']
+
+        delta = np.empty(self.n_v)
+        _coo = None
+        _splu = None
+
+        for b in range(plan['n_blocks']):
+            n_b = int(block_n[b])
+            vidx = block_vars[b]
+            eidx = block_eqs[b]
+
+            r_local = r[eidx].copy()
+            li = lower_jac_idx[b]
+            if li.size:
+                contribs = jac_vals[li] * delta[lower_global_cols[b]]
+                np.add.at(r_local, lower_local_rows[b], -contribs)
+
+            di = diag_jac_idx[b]
+            solver = block_solver[b]
+            if solver == 'scalar':
+                delta[vidx[0]] = r_local[0] / jac_vals[di[0]]
+            elif solver == 'dense':
+                A = np.zeros((n_b, n_b))
+                A[diag_local_rows[b], diag_local_cols[b]] = jac_vals[di]
+                delta[vidx] = np.linalg.solve(A, r_local)
+            else:
+                if _coo is None:
+                    from scipy.sparse import coo_matrix as _coo
+                    from scipy.sparse.linalg import splu as _splu
+                A = _coo(
+                    (jac_vals[di], (diag_local_rows[b], diag_local_cols[b])),
+                    shape=(n_b, n_b),
+                ).tocsc()
+                delta[vidx] = _splu(A).solve(r_local)
+
+        self.delta_values[:] = delta
 
     @line_profiler.profile
     def custom_solve(self, tol=1e-6, max_iter=100, relaxation=1.0,
@@ -2157,10 +3234,22 @@ class Model:
         guess = self.get_vars_values()
         error_norm = np.inf
         i = 0
+        # Pre-fetch the scale vector once; the inner Newton loop must be
+        # tight.  When scaling is inactive (span < 2 orders of magnitude
+        # or disabled), we hit the unscaled fast path that's identical
+        # to the legacy code.
+        is_scaled = getattr(self, '_var_scaling_active', False)
+        if is_scaled:
+            inv_scales = self._var_inv_scales
+            buf = self._scaled_delta_buf
         while error_norm > tol and i < max_iter:
             self.update_delta()
             self.delta_values *= relaxation
-            error_norm = fast_error_norm(self.delta_values)
+            if is_scaled:
+                np.multiply(self.delta_values, inv_scales, out=buf)
+                error_norm = fast_error_norm(buf)
+            else:
+                error_norm = fast_error_norm(self.delta_values)
             guess -= self.delta_values
             i += 1
         # Expose the last solve's outcome so `solve_adaptive_step` (and any
@@ -2768,9 +3857,17 @@ class Variable(Model):
     inappropriate -- e.g. mass flow `kg/s` (~1e-3) needs a much smaller
     `atol` than pressure `Pa` (~1e5).  See "Performance & tuning" in the
     README for guidance.
+
+    `scale` is an optional per-variable typical magnitude.  When set (or
+    when `enable_var_scaling=True` is passed to `instantiate()` and the
+    initial value can be used as a proxy), the Newton convergence metric
+    becomes `||delta / scale||_2` rather than the raw `||delta||_2`,
+    preventing fast-converging large-magnitude variables (pressure ~1e5)
+    from masking unconverged small-magnitude variables (mass flow ~1e-3).
+    Leave as `None` to inherit `max(|initial_value|, 1.0)` automatically.
     """
 
-    def __init__(self, value, unit=None, atol=None):
+    def __init__(self, value, unit=None, atol=None, scale=None):
         self.components = {}
         self.value = value
         self._symbold_index = None
@@ -2779,6 +3876,7 @@ class Variable(Model):
         self.prev_symbol = None
         self.unit = unit
         self.atol = atol
+        self.scale = scale
         self.can_evaluate = False
         self.is_connected = False
         self.connected_to = []
@@ -2845,8 +3943,8 @@ class DifferentialVariable(Variable):
     of the ODE).
     """
 
-    def __init__(self, value, unit=None, atol=None):
-        super().__init__(value, unit, atol=atol)
+    def __init__(self, value, unit=None, atol=None, scale=None):
+        super().__init__(value, unit, atol=atol, scale=scale)
         self.der_variable = Variable(0.0, None)
 
     def declare_equations(self):
@@ -2856,3 +3954,107 @@ class DifferentialVariable(Variable):
 
     def get_derivative_variable(self):
         return self.der_variable
+
+
+class Input(Model):
+    """Time-dependent driving signal `u(t)` that is supplied, not solved for.
+
+    An `Input` sits alongside `Parameter` in a `Model`'s component list, but
+    where a `Parameter` is a single compile-time constant, an `Input` is a
+    *known function of time* that the framework re-evaluates as the
+    integrator advances.  It is NOT a `Variable`: it never enters the Jacobian
+    and the Newton solve never touches it.
+
+    Crucially -- and unlike a `Parameter` -- an `Input` carries TWO values at
+    once so it can appear on either side of a Crank-Nicolson balance:
+
+        * `self['u'].symbol`       -> the value at the new level   u(t_{k+1})
+        * `self['u'].prev_symbol`  -> the value at the old level   u(t_k)
+
+    This lets a `DifferentialVariable`'s RHS depend on the input correctly:
+    the trapezoidal closure `x = x_prev + 0.5*dt*(der_x + der_x_prev)` already
+    pairs `der_x` (built from `u.symbol`) with `der_x_prev` (built from
+    `u.prev_symbol`), so the source term is integrated at full second-order
+    accuracy without the user managing any history.
+
+    The signal is given as a Python callable `func(t) -> float`.  The
+    framework calls it automatically whenever the time level changes (each
+    solve step, at `initialise`, and on adaptive-step restore); user code
+    never sets the value by hand.
+
+    Implementation note: an `Input` is realised as a two-leaf composite of
+    ordinary `Parameter`s (`cur` and `prev`).  That makes it ride the
+    existing symbol-assignment, reference-collection and lambdify-argument
+    plumbing for free -- the two leaves simply live in the parameter block
+    of the state vector, and `Model._refresh_inputs` rewrites their two slots
+    in place from `func` every time `t`/`t_prev` move.
+
+    Example
+    -------
+        class HeatedMass(Model):
+            def declare_components(self):
+                self.add_component('T', DifferentialVariable(300.0, "K"))
+                self.add_component('C', Parameter(500.0, "J/K"))
+                # ambient temperature ramp, a known driver:
+                self.add_component('T_amb', Input(lambda t: 300.0 + 0.5 * t, "K"))
+                self.add_component('G', Parameter(2.0, "W/K"))
+
+            def declare_equations(self):
+                der_T = self['der_T'].symbol
+                T     = self['T'].symbol
+                C, G  = self['C'].symbol, self['G'].symbol
+                T_amb = self['T_amb'].symbol        # u(t_{k+1})
+                return [C * der_T - G * (T_amb - T)]
+    """
+
+    def __init__(self, func, unit=None, value=None):
+        if not callable(func):
+            raise TypeError("Input(func, ...) expects a callable t -> float")
+        self.func = func
+        self._unit = unit
+        if value is None:
+            v0 = float(func(0.0))
+        else:
+            v0 = float(value)
+        self._init_value = v0
+        super().__init__()
+
+    def declare_components(self):
+        # `cur` holds u(t_{k+1}); `prev` holds u(t_k).  Both are real
+        # Parameters (floats, never aliases) so they slot into the param
+        # block exactly like any other compile-time scalar.
+        self.add_component('cur', Parameter(self._init_value, self._unit))
+        self.add_component('prev', Parameter(self._init_value, self._unit))
+
+    # --- read-only surface consumed by declare_equations -------------------
+
+    @property
+    def symbol(self):
+        """SymPy symbol carrying the value at the new time level u(t_{k+1})."""
+        return self.components['cur'].symbol
+
+    @property
+    def prev_symbol(self):
+        """SymPy symbol carrying the value at the old time level u(t_k)."""
+        return self.components['prev'].symbol
+
+    @property
+    def value(self):
+        return self.components['cur'].value
+
+    @property
+    def prev_value(self):
+        return self.components['prev'].value
+
+    @property
+    def unit(self):
+        return self._unit
+
+    def evaluate(self, t):
+        """Sample the underlying signal at time `t` (handy for assertions/plots)."""
+        return float(self.func(t))
+
+    def __repr__(self):
+        unit_str = f" {self._unit}" if self._unit else ""
+        name = getattr(self, 'name', None) or 'Input'
+        return f"Input({name}){unit_str}"

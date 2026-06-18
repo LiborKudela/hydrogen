@@ -11,11 +11,13 @@ def test_top_level_attributes():
         "Parameter",
         "Variable",
         "DifferentialVariable",
+        "Input",
         "NewtonConvergenceFailure",
         "CoolPropMedium",
         "AmbientInlet",
         "AmbientOutlet",
         "TwoPortSegment",
+        "HeatedSegment",
         "AdiabaticPump",
         "StraightPipe",
         "PressureSource",
@@ -24,10 +26,21 @@ def test_top_level_attributes():
         "LoopBuffer",
         "MixingJunction",
         "Splitter",
+        "ThermalPort_TQ",
+        "FixedTemperature",
+        "FixedHeatFlow",
+        "ConvectiveBoundary",
+        "ThermalConductor",
+        "TwoNodeWall",
+        "FlatWall",
+        "CylindricalWall",
+        "ConjugatePipe",
         "IntegrationTest",
         "SimpleODE",
         "InnerODE_1",
         "InnerODE_2",
+        "Interpolation1D",
+        "Interpolation2D",
         "plot_results",
         "local_results_path",
     }
@@ -40,8 +53,13 @@ def test_top_level_attributes():
 def test_submodule_imports():
     from hydrogen.caching import ModelCache, hash_args, numpy_cache  # noqa: F401
     from hydrogen.components import StraightPipe  # noqa: F401
+    from hydrogen.components.fluid import FluidPort_phm, HeatedSegment  # noqa: F401
+    from hydrogen.components.power import ConjugatePipe  # noqa: F401
+    from hydrogen.components.thermal import FlatWall, ThermalPort_TQ  # noqa: F401
     from hydrogen.medium import CoolPropMedium  # noqa: F401
     from hydrogen.model import Model, Variable  # noqa: F401
     from hydrogen.numerics import G_const, fast_error_norm, lambdify_compat  # noqa: F401
     from hydrogen.plotting import plot_results  # noqa: F401
     from hydrogen.test_models import IntegrationTest  # noqa: F401
+    from hydrogen.utilities import Interpolation1D, Interpolation2D  # noqa: F401
+    from hydrogen.utilities.interpolation import Interpolation2D as _I2  # noqa: F401

@@ -333,6 +333,9 @@ def run_tree(label: str, system: TreeSystem, *, warm_m_dot: float | None = None,
     print()
     print(f"Mass conservation ({label}):")
     print(f"  source m_dot                        = {m_dot_source * 1000:9.4f} g/s")
+    # Source must actually be flowing, otherwise the conservation check below
+    # is vacuously satisfied at zero.
+    assert abs(m_dot_source) > 1e-6, "source mass flow should be non-trivial"
     for depth in sorted(pipes_by_depth):
         rows = pipes_by_depth[depth]
         m_dot_d = sum(float(m_dot) for _, m_dot, _, _ in rows)
@@ -340,6 +343,11 @@ def run_tree(label: str, system: TreeSystem, *, warm_m_dot: float | None = None,
         print(
             f"  depth {depth} ({system.K ** depth:2d} pipes) m_dot   = {m_dot_d * 1000:9.4f} g/s"
             f"  (rel err vs source: {rel_err:.2e})"
+        )
+        # Each depth must pass the full source mass flow (balanced K-way tree):
+        # what the source emits is conserved across every cross-section.
+        assert rel_err < 1e-6, (
+            f"mass not conserved at depth {depth} ({label}): rel err {rel_err:.2e}"
         )
 
     if output_html is None:

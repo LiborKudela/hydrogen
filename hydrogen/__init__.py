@@ -3,10 +3,14 @@
 Public API:
 
     from hydrogen import (
-        Model, Parameter, Variable, DifferentialVariable,        # framework
+        Model, Parameter, Variable, DifferentialVariable, Input,  # framework
         CoolPropMedium,                                          # medium
-        AmbientInlet, AmbientOutlet, TwoPortSegment,             # components
+        AmbientInlet, AmbientOutlet, TwoPortSegment,             # fluid components
         AdiabaticPump, StraightPipe, LoopBuffer, MixingJunction,
+        FlatWall, CylindricalWall, FixedTemperature,             # thermal components
+        FixedHeatFlow, ConvectiveBoundary, ThermalConductor,
+        ConjugatePipe,                                           # power components
+        Interpolation1D, Interpolation2D,                        # interpolation utilities
         IntegrationTest, SimpleODE, InnerODE_1, InnerODE_2,      # ODE test sub-models
         plot_results,                                            # plotting
     )
@@ -19,7 +23,14 @@ from .components import (
     AdiabaticPump,
     AmbientInlet,
     AmbientOutlet,
+    ConjugatePipe,
+    ConvectiveBoundary,
+    CylindricalWall,
+    FixedHeatFlow,
+    FixedTemperature,
+    FlatWall,
     FluidPort_phm,
+    HeatedSegment,
     LoopBuffer,
     MixingJunction,
     PressureOutlet,
@@ -27,15 +38,21 @@ from .components import (
     PressureVessel,
     Splitter,
     StraightPipe,
+    ThermalConductor,
+    ThermalPort_TQ,
+    TwoNodeWall,
     TwoPortSegment,
 )
 from .medium import CoolPropMedium, get_symbolic_property_function
 from .model import (
     DifferentialVariable,
+    EquationCacheValidationError,
+    Input,
     Model,
     NewtonConvergenceFailure,
     Parameter,
     Variable,
+    set_equation_cache_validation,
 )
 from .plotting import local_results_path, plot_results
 from .ports import (
@@ -52,6 +69,7 @@ from .test_models import (
     IntegrationTest,
     SimpleODE,
 )
+from .utilities import Interpolation1D, Interpolation2D
 
 __all__ = [
     # framework
@@ -59,7 +77,10 @@ __all__ = [
     "Parameter",
     "Variable",
     "DifferentialVariable",
+    "Input",
     "NewtonConvergenceFailure",
+    "EquationCacheValidationError",
+    "set_equation_cache_validation",
     # medium
     "CoolPropMedium",
     "get_symbolic_property_function",
@@ -72,10 +93,11 @@ __all__ = [
     "PortMediumMismatchError",
     # fluid-library ports
     "FluidPort_phm",
-    # components
+    # fluid components
     "AmbientInlet",
     "AmbientOutlet",
     "TwoPortSegment",
+    "HeatedSegment",
     "AdiabaticPump",
     "StraightPipe",
     "PressureSource",
@@ -84,11 +106,26 @@ __all__ = [
     "LoopBuffer",
     "MixingJunction",
     "Splitter",
+    # thermal-library ports
+    "ThermalPort_TQ",
+    # thermal components
+    "FixedTemperature",
+    "FixedHeatFlow",
+    "ConvectiveBoundary",
+    "ThermalConductor",
+    "TwoNodeWall",
+    "FlatWall",
+    "CylindricalWall",
+    # power components
+    "ConjugatePipe",
     # ODE test sub-models
     "IntegrationTest",
     "SimpleODE",
     "InnerODE_1",
     "InnerODE_2",
+    # utilities
+    "Interpolation1D",
+    "Interpolation2D",
     # plotting
     "plot_results",
     "local_results_path",

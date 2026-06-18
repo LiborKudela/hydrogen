@@ -1,4 +1,8 @@
-"""End-to-end demo: ambient inlet -> two heated pipes, plus a decoupled IntegrationTest.
+"""End-to-end demo: ambient inlet -> two adiabatic pipes, plus a decoupled IntegrationTest.
+
+(The pipes are adiabatic: `StraightPipe` defaults to `heat_port=False`.  To make
+them exchange heat, build them with `heat_port=True` and wire a thermal boundary
+or wall to each segment's `wall` port -- see `examples/conjugate_pipe.py`.)
 
 Run with `python -m examples.run_system` from the project root, or just
 `python examples/run_system.py` (the small `sys.path` shim below makes the latter
@@ -134,6 +138,15 @@ def main():
     print(f"Harmonic oscillator z_osc  : max |err| = {np.max(np.abs(z_osc_num - z_osc_exact)):.3e}    (CN expected: ~ {expected_osc_z:.1e})")
     print(f"  (CN preserves amplitude; residual is pure phase drift, bounded by")
     print(f"   ~ (omega*dt_max)^3 / 12 per step at dt_max = {dt_max_used:.4f} s.)")
+
+    # Self-validation: the integrator must track the analytical solutions
+    # within the Crank-Nicolson error budget computed above (with headroom).
+    err_decay = float(np.max(np.abs(y_decay_num - y_decay_exact)))
+    err_osc_y = float(np.max(np.abs(y_osc_num - y_osc_exact)))
+    err_osc_z = float(np.max(np.abs(z_osc_num - z_osc_exact)))
+    assert err_decay < max(1e-3, 3 * expected_decay), "y_decay outside CN budget"
+    assert err_osc_y < max(1e-2, 3 * expected_osc_y), "y_osc outside CN phase-drift budget"
+    assert err_osc_z < max(1e-2, 3 * expected_osc_z), "z_osc outside CN phase-drift budget"
 
     out_path = plot_results(model_test.record, "model_test.html",
                             show=False, subdir="examples")

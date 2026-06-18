@@ -64,7 +64,9 @@ def _build_and_warm():
         full = getattr(var, "full_name", "")
         if full.endswith(".m_dot_in") or full.endswith(".m_dot_out"):
             var.value = warm_m_dot
-    system.initialise(relaxation=0.5, max_iter=400)
+    # relaxation=0.3 (not 0.5) keeps the t=0 Newton solve from overshooting
+    # into a negative-pressure state CoolProp can't flash (see fill_vessel).
+    system.initialise(relaxation=0.3, max_iter=600)
     return system
 
 
