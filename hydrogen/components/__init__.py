@@ -19,6 +19,9 @@ Currently shipped domains:
   * `power/` -- coupled (conjugate) power-engineering models composed from the
     fluid and thermal domains.  Exposes `ConjugatePipe` (a fluid pipe wrapped
     segment-by-segment in a cylindrical metal wall).
+  * `control/` -- Modelica.Blocks-style signal blocks (sources, maths,
+    controllers) wired through the `RealSignal` connector.  Used to build
+    setpoints / feedback controllers that drive actuators in other domains.
 
 This `__init__` re-exports the top-level public API of every shipped
 domain so existing call sites can keep writing
@@ -28,12 +31,30 @@ adding their subpackage here and re-exporting the symbols they want at
 this package level.
 """
 
+from .control import (
+    Add,
+    Constant,
+    Feedback,
+    FirstOrder,
+    Gain,
+    Integrator,
+    Limiter,
+    PID,
+    Product,
+    Ramp,
+    RealSignal,
+    Sine,
+    Step,
+    Sum,
+)
 from .fluid import (
     AdiabaticPump,
     AmbientInlet,
     AmbientOutlet,
+    CompressibleValve,
     FluidPort_phm,
     HeatedSegment,
+    IncompressibleValve,
     LoopBuffer,
     MixingJunction,
     PressureOutlet,
@@ -42,6 +63,7 @@ from .fluid import (
     Splitter,
     StraightPipe,
     TwoPortSegment,
+    Valve,
 )
 from .power import ConjugatePipe
 from .thermal import (
@@ -65,6 +87,9 @@ __all__ = [
     "HeatedSegment",
     "AdiabaticPump",
     "StraightPipe",
+    "Valve",
+    "IncompressibleValve",
+    "CompressibleValve",
     "PressureOutlet",
     "PressureSource",
     "PressureVessel",
@@ -83,4 +108,20 @@ __all__ = [
     "CylindricalWall",
     # power components
     "ConjugatePipe",
+    # control-library port
+    "RealSignal",
+    # control components
+    "Constant",
+    "Step",
+    "Ramp",
+    "Sine",
+    "Gain",
+    "Add",
+    "Feedback",
+    "Sum",
+    "Product",
+    "Limiter",
+    "Integrator",
+    "FirstOrder",
+    "PID",
 ]

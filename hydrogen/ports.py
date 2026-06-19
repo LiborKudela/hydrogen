@@ -129,14 +129,27 @@ class Port:
                                  False (a port may be intentionally open,
                                  e.g. a top-level boundary exposed for
                                  external wiring).
+      * `allow_fanout`        - when True, this port may be wired more than
+                                 once (one->many).  Only safe for ports with
+                                 NO flow channels: each extra wire is a pure
+                                 value-equality, so all partners collapse to
+                                 one symbol and the constraint set stays
+                                 consistent.  Used by signal OUTPUT ports
+                                 (`RealSignal`) so one block output can drive
+                                 several inputs, as in Modelica.  Default
+                                 False -- ports are single-use, and fan-out of
+                                 a FLOW channel must go through a dedicated
+                                 junction (`Splitter` / `MixingJunction`).
       * `medium`              - optional reference (e.g. a
                                  `CoolPropMedium`); when both connected
                                  ports declare a non-None medium, they
                                  must match.
-      * `_connected_to`       - back-reference to the other end after a
-                                 successful `connect()`.  `None` until
-                                 wired; raises on a second connect
-                                 attempt.
+      * `_connected_to`       - back-reference to the FIRST partner after a
+                                 successful `connect()`.  `None` until wired;
+                                 a second connect raises unless
+                                 `allow_fanout=True`.
+      * `_connections`        - list of ALL partners (length 1 for a normal
+                                 single-use port; longer for a fan-out output).
     """
 
     kind: str = ""
@@ -152,6 +165,7 @@ class Port:
         medium=None,
         name: str | None = None,
         require_connection: bool = False,
+        allow_fanout: bool = False,
     ):
         if not self.kind:
             raise PortError(
@@ -174,13 +188,25 @@ class Port:
                 f"{type(self).__name__} declares flow channels {self.flow_channels} "
                 f"but {unknown_flow} are not in the binding {list(channels)}"
             )
+        if allow_fanout and self.flow_channels:
+            raise PortError(
+                f"{type(self).__name__} sets allow_fanout=True but declares flow "
+                f"channels {self.flow_channels}; fan-out is only sound for ports "
+                "with no THROUGH variables (otherwise Kirchhoff is violated). Use "
+                "a Splitter/MixingJunction for flow fan-out."
+            )
         self.owner = owner
         self.name = name
         self.channels: Dict[str, "Variable"] = dict(channels)
         self.flow_orientation = flow_orientation
         self.medium = medium
         self.require_connection = require_connection
+        self.allow_fanout = allow_fanout
+        # `_connected_to` keeps the FIRST partner (so `is_connected` and the
+        # single-wire serialization walk keep working unchanged); `_connections`
+        # records every partner for fan-out outputs.
         self._connected_to: "Port | None" = None
+        self._connections: list["Port"] = []
 
     # --- introspection ----------------------------------------------------
 
@@ -199,13 +225,15 @@ class Port:
     # --- internal wiring hook (called by Model.connect) -------------------
 
     def _mark_connected(self, other: "Port") -> None:
-        if self._connected_to is not None:
+        if self._connected_to is not None and not self.allow_fanout:
             raise PortAlreadyConnectedError(
                 f"Port {self._path()} is already wired to "
                 f"{self._connected_to._path()}; insert a Splitter or "
                 "MixingJunction if you need fan-out / fan-in."
             )
-        self._connected_to = other
+        if self._connected_to is None:
+            self._connected_to = other
+        self._connections.append(other)
 
     def _path(self) -> str:
         owner_name = getattr(self.owner, "name", None) or type(self.owner).__name__

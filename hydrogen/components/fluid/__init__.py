@@ -11,8 +11,10 @@ from .fluid_components import (
     AdiabaticPump,
     AmbientInlet,
     AmbientOutlet,
+    CompressibleValve,
     FluidPort_phm,
     HeatedSegment,
+    IncompressibleValve,
     LoopBuffer,
     MixingJunction,
     PressureOutlet,
@@ -21,6 +23,7 @@ from .fluid_components import (
     Splitter,
     StraightPipe,
     TwoPortSegment,
+    Valve,
 )
 
 __all__ = [
@@ -33,6 +36,9 @@ __all__ = [
     "HeatedSegment",
     "AdiabaticPump",
     "StraightPipe",
+    "Valve",
+    "IncompressibleValve",
+    "CompressibleValve",
     "PressureOutlet",
     "PressureSource",
     "PressureVessel",

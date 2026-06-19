@@ -20,28 +20,45 @@ respective submodules; import directly from there if you need them.
 """
 
 from .components import (
+    Add,
     AdiabaticPump,
     AmbientInlet,
     AmbientOutlet,
+    CompressibleValve,
     ConjugatePipe,
+    Constant,
     ConvectiveBoundary,
     CylindricalWall,
+    Feedback,
+    FirstOrder,
     FixedHeatFlow,
     FixedTemperature,
     FlatWall,
     FluidPort_phm,
+    Gain,
     HeatedSegment,
+    IncompressibleValve,
+    Integrator,
+    Limiter,
     LoopBuffer,
     MixingJunction,
+    PID,
     PressureOutlet,
     PressureSource,
     PressureVessel,
+    Product,
+    Ramp,
+    RealSignal,
+    Sine,
     Splitter,
+    Step,
     StraightPipe,
+    Sum,
     ThermalConductor,
     ThermalPort_TQ,
     TwoNodeWall,
     TwoPortSegment,
+    Valve,
 )
 from .medium import CoolPropMedium, get_symbolic_property_function
 from .model import (
@@ -100,6 +117,9 @@ __all__ = [
     "HeatedSegment",
     "AdiabaticPump",
     "StraightPipe",
+    "Valve",
+    "IncompressibleValve",
+    "CompressibleValve",
     "PressureSource",
     "PressureOutlet",
     "PressureVessel",
@@ -118,6 +138,22 @@ __all__ = [
     "CylindricalWall",
     # power components
     "ConjugatePipe",
+    # control-library port
+    "RealSignal",
+    # control components
+    "Constant",
+    "Step",
+    "Ramp",
+    "Sine",
+    "Gain",
+    "Add",
+    "Feedback",
+    "Sum",
+    "Product",
+    "Limiter",
+    "Integrator",
+    "FirstOrder",
+    "PID",
     # ODE test sub-models
     "IntegrationTest",
     "SimpleODE",
@@ -129,6 +165,15 @@ __all__ = [
     # plotting
     "plot_results",
     "local_results_path",
+    # serialization
+    "to_dict",
+    "from_dict",
+    "to_json",
+    "from_json",
 ]
 
 __version__ = "0.1.0"
+
+# Imported last: the serialization subpackage reads `__version__` and the
+# fully-populated component registry, both of which must exist by import time.
+from .serialization import from_dict, from_json, to_dict, to_json  # noqa: E402

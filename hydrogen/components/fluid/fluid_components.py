@@ -23,6 +23,7 @@ from ...medium import CoolPropMedium
 from ...model import DifferentialVariable, Model, Parameter, Variable
 from ...numerics import G_const
 from ...ports import Port
+from ..control.control_components import RealSignal
 from ..thermal.thermal_components import ThermalPort_TQ
 
 
@@ -413,12 +414,21 @@ class TwoPortSegment(Model):
         eq_w_in = m_dot_in - rho_in * self['A_in'].symbol * w_in
         eq_w_out = m_dot_out + rho_out * self['A_out'].symbol * w_out
 
-        # Momentum
+        # Momentum.  `f_avg` is computed here (it also feeds the heat term
+        # below), but the actual pressure/flow RELATION is delegated to the
+        # `_momentum_eq` hook so subclasses can swap the physics without
+        # re-deriving continuity / energy / face closures.  The default hook
+        # is the distributed duct balance (friction + momentum flux +
+        # buoyancy); a `Valve` overrides it with a Kv flow law.  Splitting by
+        # CLASS (not an instance flag) keeps the per-class equation cache
+        # clean -- see the `_wall_closure` hook for the same pattern.
         f_avg = self.f_factor_func(Re_avg, self.epsilon, Dh_avg)
-        delta_P_friction = f_avg * (self['L'].symbol / Dh_avg) * (rho_avg * abs(w_avg) * w_avg / 2)
-        momentum_flux = m_dot_avg * (w_out - w_in)
-        buoyancy_force = -G_const * (self['z_out'].symbol - self['z_in'].symbol) * A_avg * rho_avg
-        eq_momentum = self['p_in'].symbol * self['A_in'].symbol - self['p_out'].symbol * self['A_out'].symbol - delta_P_friction * A_avg - momentum_flux + buoyancy_force
+        eq_momentum = self._momentum_eq(
+            p_in=self['p_in'].symbol, p_out=self['p_out'].symbol,
+            A_in=self['A_in'].symbol, A_out=self['A_out'].symbol, A_avg=A_avg,
+            rho_avg=rho_avg, w_in=w_in, w_out=w_out, w_avg=w_avg,
+            m_dot_avg=m_dot_avg, f_avg=f_avg, Dh_avg=Dh_avg,
+        )
 
         # Energy.  `q` is the heat-transfer RATE into the fluid CV [W]
         # (e.g. `alpha * A_surface * (T_wall - T)` for the convective pipe).
@@ -495,6 +505,26 @@ class TwoPortSegment(Model):
     # than by an instance flag so the per-class `declare_equations` cache never
     # sees two different equation structures under the same class.
 
+    def _momentum_eq(self, *, p_in, p_out, A_in, A_out, A_avg, rho_avg,
+                     w_in, w_out, w_avg, m_dot_avg, f_avg, Dh_avg):
+        """Default momentum residual: distributed duct balance.
+
+        Force balance on the control volume in the axial direction:
+
+            p_in*A_in - p_out*A_out
+                - f_avg*(L/Dh)*(rho/2)*|w|*w * A_avg     (Darcy friction)
+                - m_dot_avg*(w_out - w_in)               (momentum flux)
+                - g*(z_out - z_in)*A_avg*rho             (buoyancy)
+            == 0
+
+        Subclasses (e.g. `Valve`) override this to substitute a different
+        pressure/flow relation while reusing every other segment equation.
+        """
+        delta_P_friction = f_avg * (self['L'].symbol / Dh_avg) * (rho_avg * abs(w_avg) * w_avg / 2)
+        momentum_flux = m_dot_avg * (w_out - w_in)
+        buoyancy_force = -G_const * (self['z_out'].symbol - self['z_in'].symbol) * A_avg * rho_avg
+        return p_in * A_in - p_out * A_out - delta_P_friction * A_avg - momentum_flux + buoyancy_force
+
     def _declare_wall_interface(self):
         """Base/adiabatic segment: no external thermal interface."""
         return None
@@ -565,6 +595,173 @@ class HeatedSegment(TwoPortSegment):
     def _wall_closure(self):
         # Closed externally via the `wall` port connection; no internal eq.
         return []
+
+
+class Valve(TwoPortSegment):
+    """Base class for control valves: an adiabatic throttle whose pressure/
+    flow relation is set by a sizing coefficient and a 0..1 opening signal.
+
+    Built on `TwoPortSegment` so it reuses continuity, the *adiabatic* energy
+    balance -- which makes an equal-area valve isenthalpic, the correct
+    throttling physics -- and the face-property closures; only the momentum
+    relation is swapped, via the `_momentum_eq` hook.  Heat transfer is off
+    (`q = 0`) and wall friction is irrelevant, so the inherited `L` / `epsilon`
+    geometry is inert (a nominal `L = 1 m`, `epsilon = 0` are passed); the
+    flow area used by the `m_dot = rho*A*w` closures comes from the connecting
+    diameter `D`.
+
+    The `opening` (0 = shut, 1 = full open) is an algebraic `Variable` exposed
+    on a `RealSignal` INPUT port named ``opening``, so a control block drives
+    it: wire a `control.Constant` for a fixed position, or
+    `control.PID -> control.Limiter` for closed-loop control.  The port is
+    ``require_connection=True`` -- an unconnected opening leaves the Variable
+    unclosed (singular system), which `instantiate()` flags by name.
+
+    Subclasses implement `_valve_flow(dp, rho_avg, theta) -> m_dot` (axial
+    mass flow [kg/s] for pressure drop ``dp = p_in - p_out``).
+    """
+
+    def __init__(self, medium: CoolPropMedium, D, opening=1.0,
+                 z_in=0.0, z_out=0.0, dp_eps=1.0):
+        A = float(np.pi * D ** 2 / 4.0)
+        P = float(np.pi * D)
+        # Store the constructor scalars under their own names so the reflective
+        # serializer can recover them (it maps each __init__ arg to a like-named
+        # attribute); `D` / `opening` are not otherwise kept by the base.
+        self.D = D
+        self.opening = opening
+        self.dp_eps = dp_eps
+        super().__init__(medium, A, A, P, P, z_in, z_out, 1.0, 0.0,
+                         self._no_friction, self._no_heat)
+
+    @staticmethod
+    def _no_friction(Re, epsilon, Dh):
+        return 0.0
+
+    @staticmethod
+    def _no_heat(w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
+        return 0.0
+
+    def declare_components(self):
+        super().declare_components()
+        # Opening setpoint driven through the signal port; regulariser for the
+        # sign*sqrt(|dp|) flow law.  Both are leaf symbols, so the valve's
+        # equation template stays instance-invariant / cache-safe.
+        self.add_component('opening', Variable(self.opening, "-"))
+        self.add_component('dp_eps', Parameter(self.dp_eps, "Pa"))
+        self.add_port('opening', RealSignal.as_input(
+            self, self['opening'], name='opening'))
+
+    def _momentum_eq(self, *, p_in, p_out, rho_avg, m_dot_avg, **_):
+        dp = p_in - p_out
+        theta = self['opening'].symbol
+        return m_dot_avg - self._valve_flow(dp, rho_avg, theta)
+
+    def _valve_flow(self, dp, rho_avg, theta):  # pragma: no cover - abstract
+        raise NotImplementedError
+
+
+class IncompressibleValve(Valve):
+    """Liquid / low-Mach valve sized by metric Kv with a linear opening trim.
+
+        m_dot = (theta * Kv / 36000) * sign(dp) * sqrt(rho * |dp|)   [kg/s, Pa]
+
+    where ``Kv`` is the metric flow coefficient (m^3/h of water at 1 bar) and
+    ``theta`` the 0..1 opening.  Calibration: Kv=1, water (rho=1000), dp=1 bar
+    gives 0.2778 kg/s = 1 m^3/h.  Valid while compressibility is negligible
+    (``Delta p << p_1``); use `CompressibleValve` for gases at large pressure
+    ratio.  The discontinuous ``sign(dp)*sqrt(|dp|)`` is regularised as
+    ``dp / (dp^2 + dp_eps^2)^(1/4)`` so the Jacobian stays smooth through
+    ``dp = 0`` (flow reversal).
+    """
+
+    def __init__(self, medium: CoolPropMedium, Kv, D, opening=1.0,
+                 z_in=0.0, z_out=0.0, dp_eps=1.0):
+        self.Kv = Kv
+        super().__init__(medium, D, opening=opening, z_in=z_in, z_out=z_out,
+                         dp_eps=dp_eps)
+
+    def declare_components(self):
+        super().declare_components()
+        self.add_component('Kv', Parameter(self.Kv, "m^3/h"))
+
+    def _valve_flow(self, dp, rho_avg, theta):
+        C = self['Kv'].symbol / 36000.0
+        dp_eps = self['dp_eps'].symbol
+        return C * theta * sp.sqrt(rho_avg) * dp / (dp ** 2 + dp_eps ** 2) ** 0.25
+
+
+class CompressibleValve(Valve):
+    """Gas valve sized by Kv with IEC 60534-2-1 compressibility (expansion
+    factor ``Y`` and choked flow).
+
+        m_dot  = sign(dp) * (theta*Kv/36000) * Y * sqrt(rho_up * dp_eff)
+        x      = |dp| / p_up                  (pressure-drop ratio)
+        Fgamma = gamma / 1.4
+        x_eff  = min(x, Fgamma*xT)            (choke clamp -> flow saturates)
+        Y      = 1 - x_eff / (3*Fgamma*xT)    (1 .. 2/3)
+        dp_eff = x_eff * p_up
+
+    ``xT`` is the valve's pressure-differential-ratio factor (~0.7 for many
+    globe valves) and ``gamma = cp/cv`` the gas specific-heat ratio.  Reduces
+    to the incompressible Kv law as ``x -> 0`` (``Y -> 1``).  Upstream
+    pressure / density and the choke clamp are selected with smooth min/max so
+    the residual stays differentiable through flow reversal and the onset of
+    choking.  ``p_eps`` sets the smoothing scale on pressures.
+    """
+
+    def __init__(self, medium: CoolPropMedium, Kv, D, xT=0.7, gamma=1.4,
+                 opening=1.0, z_in=0.0, z_out=0.0, dp_eps=1.0, p_eps=1.0):
+        self.Kv = Kv
+        self.xT = xT
+        self.gamma = gamma
+        self.p_eps = p_eps
+        super().__init__(medium, D, opening=opening, z_in=z_in, z_out=z_out,
+                         dp_eps=dp_eps)
+
+    def declare_components(self):
+        super().declare_components()
+        self.add_component('Kv', Parameter(self.Kv, "m^3/h"))
+        self.add_component('xT', Parameter(self.xT, "-"))
+        self.add_component('gamma', Parameter(self.gamma, "-"))
+        self.add_component('p_eps', Parameter(self.p_eps, "Pa"))
+
+    def _valve_flow(self, dp, rho_avg, theta):
+        Kv = self['Kv'].symbol
+        xT = self['xT'].symbol
+        gamma = self['gamma'].symbol
+        dp_eps = self['dp_eps'].symbol      # Pa: sqrt(|dp|) regulariser
+        p_eps = self['p_eps'].symbol        # Pa: smooth max/min scale
+        p_in = self['p_in'].symbol
+        p_out = self['p_out'].symbol
+        rho_in = self['rho_in'].symbol
+        rho_out = self['rho_out'].symbol
+
+        # All smooth-max/min arguments below are PRESSURES (Pa), so `p_eps`
+        # (Pa) is the only blending scale -- no dimensionless/dimensional mix.
+        def smax(a, b):
+            return 0.5 * (a + b + sp.sqrt((a - b) ** 2 + p_eps ** 2))
+
+        def smin(a, b):
+            return 0.5 * (a + b - sp.sqrt((a - b) ** 2 + p_eps ** 2))
+
+        s = dp / sp.sqrt(dp ** 2 + dp_eps ** 2)            # smooth sign(dp)
+        frac = 0.5 * (1 + s)                                # ~1 fwd, ~0 rev
+        p_up = smax(p_in, p_out)                            # upstream pressure
+        rho_up = frac * rho_in + (1 - frac) * rho_out       # upstream density
+        Fg = gamma / 1.4
+        x_choke = Fg * xT                                   # critical x
+        dp_choke = x_choke * p_up                           # Pa, > 0
+
+        # Cap the (signed) pressure drop at +/- the choke value in Pascals,
+        # then take the always-real regularised sign*sqrt(|.|).  Because the
+        # cap and the sqrt are both in Pa, the radicand is never negative.
+        dp_used = smin(smax(dp, -dp_choke), dp_choke)
+        x_eff = sp.sqrt(dp_used ** 2 + dp_eps ** 2) / p_up  # |dp_used| / p_up
+        Y = 1 - x_eff / (3 * x_choke)                       # 2/3 .. 1
+        g = dp_used / (dp_used ** 2 + dp_eps ** 2) ** 0.25  # sign*sqrt(|dp_used|)
+        C = Kv / 36000.0
+        return C * theta * Y * sp.sqrt(rho_up) * g
 
 
 class PressureOutlet(Model):
