@@ -1,0 +1,150 @@
+{
+  "format": "hydrogen-ui-project",
+  "version": 1,
+  "hydrogen_version": "0.1.0",
+  "canvas": {
+    "nodes": [
+      {
+        "comp_id": "pipe_1",
+        "type": "hydrogen.thermofluid.Pipe",
+        "x": 1291.7177690883652,
+        "y": 449.60954058132677,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": {
+          "D": 0.01,
+          "L": 1.0,
+          "epsilon": 1e-06,
+          "z_in": 0.0,
+          "z_out": 0.0,
+          "n_segments": 1,
+          "layers": [
+            {
+              "__type__": "WallLayer",
+              "material": {
+                "__type__": "WallMaterial",
+                "name": "AISI 316/316L",
+                "rho": 7990.0,
+                "cp": 500.0,
+                "k": 15.0
+              },
+              "thickness": 0.002,
+              "permeation": null,
+              "dynamic": true
+            }
+          ],
+          "multiphase": "single",
+          "outer_thermal": "adiabatic",
+          "h_ext": 10.0,
+          "T_ext": 293.15,
+          "T_outer": 293.15,
+          "p_ext": 0.0,
+          "T_wall_init": 293.15,
+          "p_init": 101325.0
+        },
+        "ports": {
+          "wall_outer_0": [
+            67.98504817024195,
+            0.0,
+            -1
+          ]
+        }
+      },
+      {
+        "comp_id": "pressuresource_2",
+        "type": "hydrogen.thermofluid.PressureSource",
+        "x": 1043.4323057968504,
+        "y": 452.6845417665279,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": {
+          "p_source": 101325.0,
+          "T_source": 293.15,
+          "A": 0.001,
+          "p_control": true
+        },
+        "ports": {}
+      },
+      {
+        "comp_id": "ramp_3",
+        "type": "hydrogen.control.Ramp",
+        "x": 814.3492199318832,
+        "y": 442.9155536953646,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": null,
+        "params": {
+          "height": 10000000.0,
+          "duration": 100.0,
+          "start_time": 0.0,
+          "offset": 101325.0,
+          "unit": "Pa"
+        },
+        "ports": {}
+      },
+      {
+        "comp_id": "closedend_4",
+        "type": "hydrogen.thermofluid.ClosedEnd",
+        "x": 1539.2228815222054,
+        "y": 449.6684553848596,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": null,
+        "ports": {}
+      }
+    ],
+    "connections": [
+      {
+        "from": "ramp_3.y",
+        "to": "pressuresource_2.p_set"
+      },
+      {
+        "from": "pipe_1.outlet",
+        "to": "closedend_4.inlet"
+      },
+      {
+        "from": "pressuresource_2.outlet",
+        "to": "pipe_1.inlet"
+      }
+    ]
+  },
+  "sim_options": {
+    "instantiate": {
+      "cse": true,
+      "enable_blt": true,
+      "enable_var_scaling": false,
+      "max_remove_trival_passes": 1,
+      "max_remove_duplicate_passes": 5,
+      "max_remove_linear_block_passes": 3
+    },
+    "initialise": {
+      "n": 1,
+      "relaxation": 1.0,
+      "tol": 1e-06,
+      "max_iter": 200
+    },
+    "simulate": {
+      "strategy": "richardson",
+      "stop_time": 1000.0,
+      "dt": 0.1,
+      "dt_start": 0.0001,
+      "dt_min": 1e-09,
+      "dt_max": 100.0,
+      "grow": 1.5,
+      "shrink": 0.5,
+      "max_retries": 20,
+      "relaxation": 1.0,
+      "tol": 1e-06,
+      "max_iter": 200,
+      "tol_local": 0.001,
+      "atol": 1.0
+    }
+  }
+}

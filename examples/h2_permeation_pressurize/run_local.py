@@ -44,7 +44,7 @@ L_PIPE = 10.0          # m      length
 A_BORE = math.pi * R_IN ** 2
 
 N_SEG = 2              # pipe flow segments (each with its own wall)
-N_NODES = 8            # wall diffusion shells (transient model)
+N_NODES = 8             # wall diffusion shells (transient model)
 T_RAMP = 0.06          # s      pressurisation window (ramp 1 bar -> 20 MPa)
 
 # --- run configuration ------------------------------------------------------
@@ -72,6 +72,17 @@ class PressurizedPipe(hd.Model):
         # The walled pipe: a flow pipe wrapped per segment in a permeable
         # AISI-316 wall (transient diffusion), held isothermal and venting to a
         # near-zero external H2 partial pressure.
+        #
+        # The wall layer is `dynamic=True`, so its surface temperatures are
+        # capacitive (differential) states.  A `dynamic` node must NOT be
+        # rigidly clamped by `outer_thermal="fixed"` (a prescribed temperature
+        # wired straight onto a heat capacity is a high-index/redundant
+        # constraint -> singular Jacobian at t=0).  We instead tie the outer
+        # surface to the 150 C environment through a stiff `convective` film:
+        # it imposes a heat *flux* from the node, not the node temperature, so
+        # the system stays well-posed.  With `T_ext = T_OP` the surface sits at
+        # 150 C just like `fixed` would (the thermal side carries no driving
+        # gradient here -- the physics of interest is the wall permeation).
         self.add_component("pipe", hd.components.thermofluid.Pipe(
             H2, D=2 * R_IN, L=L_PIPE, epsilon=1e-6, z_in=0.0, z_out=0.0,
             n_segments=N_SEG,
@@ -79,8 +90,8 @@ class PressurizedPipe(hd.Model):
                 hd.components.materials.AISI_316, R_OUT - R_IN,
                 permeation=hd.components.thermofluid.TransientDiffusion(
                     hd.components.thermofluid.H2_IN_AISI_304, n_nodes=N_NODES),
-                dynamic=False)],
-            outer_thermal="fixed", T_outer=T_OP, p_ext=P_EXT,
+                dynamic=True)],
+            outer_thermal="convective", h_ext=1.0e5, T_ext=T_OP, p_ext=P_EXT,
             T_wall_init=T_OP, p_init=P_START))
         # Far end sealed -> the only outflow is the wall permeation.
         self.add_component("cap", hd.components.thermofluid.ClosedEnd(

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Control maths: multiply two inputs (x). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <circle cx="60" cy="30" r="18"/>
+  <line x1="53" y1="23" x2="67" y2="37"/>
+  <line x1="67" y1="23" x2="53" y2="37"/>
+</svg>

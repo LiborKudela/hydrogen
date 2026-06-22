@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- P&ID-style pressure vessel: a horizontal drum (capsule) with a single
+     fill stub reaching the inlet port on the centreline. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <!-- inlet fill stub (on the centreline, like the port) -->
+  <line x1="2" y1="30" x2="34" y2="30"/>
+  <!-- drum / vessel body -->
+  <rect x="34" y="13" width="68" height="34" rx="17" ry="17"/>
+</svg>

@@ -10,21 +10,22 @@ component, not three).  Organised into submodules:
   * `flow`        -- compressible-flow components: `TwoPortSegment`,
     `StraightPipe`, vessels, valves, junctions, sources/outlets.
   * `walls`       -- lumped wall conduction: `TwoNodeWall`, `FlatWall`,
-    `CylindricalWall` (optionally `leaky=True` for gas permeation), plus
-    thermal boundary conditions.
+    `CylindricalWall`, `SphericalWall` (any `leaky=True` for gas permeation),
+    plus thermal boundary conditions.
   * `permeation`  -- gas-permeation materials (`Permeant`, `TransportFit`),
     flux models (`SteadyRichardson`, `TransientDiffusion`) injected into a
     leaky wall, and the `FixedPartialPressure` boundary.  A leaky flow volume
     is just `PressureVessel(leaky=True)` / `StraightPipe(leaky=True)`.
 
   * `assemblies`  -- batteries-included composites: `Pipe` (a flowing pipe
-    wrapped per-segment in a `WallLayer` stack, optionally permeable) built from
-    the modules above.
+    wrapped per-segment in a `WallLayer` stack, optionally permeable) and `Tank`
+    (a lumped-gas pressure vessel with a cylindrical barrel + spherical caps,
+    conjugate heat, and optional permeation) built from the modules above.
 
 See `README.md` in this folder for the full domain overview.
 """
 
-from .assemblies import Pipe, WallLayer
+from .assemblies import Pipe, Tank, WallLayer
 from .flow import (
     AdiabaticPump,
     AmbientInlet,
@@ -63,6 +64,7 @@ from .walls import (
     FixedHeatFlow,
     FixedTemperature,
     FlatWall,
+    SphericalWall,
     ThermalConductor,
     TwoNodeWall,
 )
@@ -96,8 +98,10 @@ __all__ = [
     "TwoNodeWall",
     "FlatWall",
     "CylindricalWall",
+    "SphericalWall",
     # composite assemblies
     "Pipe",
+    "Tank",
     "WallLayer",
     # permeation materials
     "Permeant",

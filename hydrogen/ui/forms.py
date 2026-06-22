@@ -1,49 +1,35 @@
-"""Dynamic Qt form renderer for a hydrogen `component_spec`.
+"""Dynamic Qt form widgets driven by a hydrogen ``component_spec``.
 
-Renders one component (default: hydrogen.thermofluid.Pipe) into a single window,
-driven purely by the metadata `hd.component_spec()` returns:
+Everything here is metadata-driven -- give a field descriptor (as returned by
+``hd.component_spec()`` / ``hd.value_object_spec()``) and you get the right
+editor:
 
-  * scalars        -> line edits / checkboxes (unit in the label, description tip)
-  * enums          -> combo boxes seeded from `choices`
-  * nested objects -> recursive sub-forms
-  * abstract object-> a type chooser over `options`, swapping the sub-form
-  * nullable object-> a "(none)" choice
-  * lists          -> add / remove element rows (seeded with one, like the template)
-  * relevant_when  -> a row shows/hides as its sibling changes
+  * scalars         -> line edits / checkboxes (unit in the label, description tip)
+  * enums           -> combo boxes seeded from ``choices``
+  * nested objects  -> recursive sub-forms (:class:`ObjectEditor`)
+  * abstract object -> a type chooser over ``options``, swapping the sub-form
+  * nullable object -> a "(none)" choice
+  * lists           -> add / remove element rows (:class:`ListEditor`)
+  * relevant_when   -> a row shows/hides as its sibling changes
 
-"Build spec" reads the widget tree into the embedded `spec["template"]` and runs
-it through `hd.from_dict` to confirm it loads.
-
-Needs a Qt binding (PySide6 preferred, PyQt5 accepted)::
-
-    pip install PySide6
-
-Run::
-
-    python3 examples/UI/qt_spec_renderer.py
+:class:`FieldsForm` is the entry point; ``.value()`` reads the whole tree back
+into the plain dict shape a spec's ``params`` expects.
 """
 
 from __future__ import annotations
 
-import json
-import sys
-from pathlib import Path
+from .qt import QtCore, QtWidgets, Signal
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-try:
-    from PySide6 import QtCore, QtWidgets
-except ImportError:  # fall back to PyQt5
-    from PyQt5 import QtCore, QtWidgets  # type: ignore
-
-Signal = getattr(QtCore, "Signal", None) or QtCore.pyqtSignal  # PySide6 / PyQt5
-
-import hydrogen as hd  # noqa: E402
-from hydrogen.serialization import SCHEMA_VERSION  # noqa: E402
-
-COMPONENT_TYPE = "hydrogen.thermofluid.Pipe"
+__all__ = [
+    "field_label",
+    "field_tooltip",
+    "build_scalar",
+    "build_field",
+    "set_widget_value",
+    "FieldsForm",
+    "ObjectEditor",
+    "ListEditor",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -114,7 +100,7 @@ def build_scalar(field: dict):
 
 
 def set_widget_value(editor, val):
-    """Set an editor's value (used when applying a preset)."""
+    """Set an editor's value (used when applying a preset / restoring a node)."""
     if isinstance(editor, QtWidgets.QCheckBox):
         editor.setChecked(bool(val))
     elif isinstance(editor, QtWidgets.QComboBox):
@@ -124,7 +110,8 @@ def set_widget_value(editor, val):
         editor.setText("" if val is None else str(val))
     elif isinstance(editor, ObjectEditor):
         editor.set_value(val)
-    # ListEditor presets are not supported (no current use case).
+    elif isinstance(editor, ListEditor):
+        editor.set_value(val)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,9 +129,9 @@ def build_field(field: dict):
 
 
 class FieldsForm(QtWidgets.QWidget):
-    """A form over a list of field descriptors; `.value()` -> dict of values.
+    """A form over a list of field descriptors; ``.value()`` -> dict of values.
 
-    Owns `relevant_when` visibility for its own (sibling) scope.
+    Owns ``relevant_when`` visibility for its own (sibling) scope.
     """
 
     changed = Signal()
@@ -221,8 +208,8 @@ class FieldsForm(QtWidgets.QWidget):
 
 
 class ObjectEditor(QtWidgets.QWidget):
-    """Editor for an `object` field: concrete `value_spec`, abstract `options`,
-    and/or nullable (adds a "(none)" choice)."""
+    """Editor for an ``object`` field: concrete ``value_spec``, abstract
+    ``options``, and/or nullable (adds a "(none)" choice)."""
 
     changed = Signal()
 
@@ -349,7 +336,7 @@ class ObjectEditor(QtWidgets.QWidget):
 
 
 class ListEditor(QtWidgets.QWidget):
-    """Editor for a `list` field: add / remove element rows."""
+    """Editor for a ``list`` field: add / remove element rows."""
 
     changed = Signal()
 
@@ -368,7 +355,7 @@ class ListEditor(QtWidgets.QWidget):
 
         self._add()  # seed one element, like spec_template does
 
-    def _add(self):
+    def _add(self, value=None):
         row = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
@@ -396,85 +383,23 @@ class ListEditor(QtWidgets.QWidget):
         rm.clicked.connect(remove)
         if changed is not None:
             changed.connect(lambda *_a: self.changed.emit())
+        if value is not None:
+            set_widget_value(editor, value)
+        self.changed.emit()
+
+    def set_value(self, values):
+        """Rebuild the rows from a serialized list so existing values (e.g. a
+        Pipe's ``layers`` with their permeation models) round-trip back into the
+        editor instead of falling back to the default seeded element."""
+        if not isinstance(values, list):
+            return
+        while self._entries:                       # drop the current rows
+            row, _ = self._entries.pop()
+            row.setParent(None)
+            row.deleteLater()
+        for v in values:
+            self._add(v)
         self.changed.emit()
 
     def value(self):
         return [getter() for _, getter in self._entries]
-
-
-class SpecWindow(QtWidgets.QMainWindow):
-    def __init__(self, type_name: str):
-        super().__init__()
-        self._spec = hd.component_spec(type_name)
-        self.setWindowTitle(f"component_spec: {type_name}")
-
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        outer = QtWidgets.QVBoxLayout(central)
-
-        header = QtWidgets.QLabel(
-            f"<b>{self._spec['name']}</b> &mdash; {self._spec['summary']}")
-        header.setWordWrap(True)
-        outer.addWidget(header)
-
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        body = QtWidgets.QWidget()
-        body_layout = QtWidgets.QVBoxLayout(body)
-
-        self._medium = None
-        if self._spec["needs_medium"]:
-            mrow = QtWidgets.QWidget()
-            mform = QtWidgets.QFormLayout(mrow)
-            self._medium = QtWidgets.QLineEdit("H2")
-            mform.addRow("medium *", self._medium)
-            body_layout.addWidget(mrow)
-
-        self._params = FieldsForm(self._spec["parameters"])
-        body_layout.addWidget(self._params)
-        body_layout.addStretch(1)
-        scroll.setWidget(body)
-        outer.addWidget(scroll, 1)
-
-        build = QtWidgets.QPushButton("Build spec")
-        build.clicked.connect(self._build)
-        outer.addWidget(build)
-
-        self._out = QtWidgets.QPlainTextEdit()
-        self._out.setReadOnly(True)
-        outer.addWidget(self._out, 1)
-
-    def _build(self):
-        template = dict(self._spec["template"])
-        template["params"] = self._params.value()
-        medium_name = None
-        if self._medium is not None:
-            medium_name = self._medium.text().strip() or None
-            template["medium"] = medium_name
-
-        system = {
-            "hydrogen_version": hd.__version__,
-            "schema_version": SCHEMA_VERSION,
-            "media": {medium_name: {"fluid": "Hydrogen"}} if medium_name else {},
-            "components": {"comp": template},
-            "connections": [],
-        }
-        try:
-            hd.from_dict(system)
-            status = "OK -- from_dict() accepted the spec."
-        except Exception as exc:  # surface validation feedback in the UI
-            status = f"from_dict() rejected the spec:\n{exc}"
-        self._out.setPlainText(status + "\n\n" + json.dumps(template, indent=2))
-
-
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    win = SpecWindow(COMPONENT_TYPE)
-    win.resize(680, 860)
-    win.show()
-    exec_ = getattr(app, "exec", None) or app.exec_
-    sys.exit(exec_())
-
-
-if __name__ == "__main__":
-    main()

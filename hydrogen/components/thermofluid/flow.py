@@ -447,7 +447,7 @@ class TwoPortSegment(Model):
         Dh_in = 4 * self['A_in'].symbol / self['P_in'].symbol
         Dh_out = 4 * self['A_out'].symbol / self['P_out'].symbol
         Dh_avg = (Dh_in + Dh_out) / 2
-        Re_avg = rho_avg * abs(w_avg) * Dh_avg / mu_avg
+        Re_avg = rho_avg * abs(w_avg) * Dh_avg / mu_avg + 1
 
         # Mass-flow continuity.
         eq_continuity = m_dot_in + m_dot_out
@@ -550,11 +550,19 @@ class StraightPipe(Model):
       * `heat_port=True` -> a `wall` `ThermalPort_TQ` per segment, collected by
         `segment_wall_ports` (conjugate heat transfer).
       * `leaky=True`     -> a `leak` `PermeationPort_pN` per segment, collected
-        by `segment_leak_ports` (hydrogen permeation through the wall).  A
-        leaky pipe uses a zero-flow-robust Churchill friction so a dead-ended,
-        slowly-bleeding line (Re -> 0) stays well-conditioned.
+        by `segment_leak_ports` (hydrogen permeation through the wall).
+
+    The friction factor is the Churchill correlation evaluated on a Reynolds
+    number floored away from zero (see `TwoPortSegment`), so a dead-ended /
+    stagnant line (Re -> 0) stays well-conditioned regardless of `leaky`.
 
     A pipe may be heated, leaky, both, or neither.
+
+    `count=N` simulates `N` identical pipes in parallel as one component: the
+    flow area and wetted perimeter scale by `N` (keeping the hydraulic diameter,
+    so velocity / Reynolds number / friction / per-pipe pressure drop are
+    unchanged), while the total mass flow, wall heat, and permeation scale by
+    `N`.  Wire walls / boundaries with the matching `count` (see `Pipe`).
     """
 
     def __init__(
@@ -578,6 +586,13 @@ class StraightPipe(Model):
         multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
         leaky: Annotated[bool, ParamSpec("If true, each segment exposes a "
                         "permeation `leak` port.", structural=True)] = False,
+        count: Annotated[int, ParamSpec("Number of identical parallel pipes "
+                        "this one component represents (multiplicity >= 1); "
+                        "scales the flow area and wetted perimeter by N so the "
+                        "hydraulic diameter, velocity, friction and per-pipe "
+                        "pressure drop are unchanged while the total mass flow / "
+                        "heat / leak scale by N -- N pipes for one pipe's "
+                        "equations.", unit="1", default=1)] = 1,
     ):
         self.medium = medium
         if multiphase not in TwoPortSegment._MULTIPHASE_MODES:
@@ -586,6 +601,9 @@ class StraightPipe(Model):
                 f"got {multiphase!r}")
         if n_segments < 1:
             raise ValueError(f"n_segments must be >= 1, got {n_segments!r}")
+        if int(count) != count or count < 1:
+            raise ValueError(
+                f"StraightPipe: count must be an integer >= 1, got {count!r}")
         # Forwarded verbatim to every segment so the whole pipe shares one
         # thermodynamic-property mode (see `TwoPortSegment.multiphase`).
         self.multiphase = multiphase
@@ -630,26 +648,18 @@ class StraightPipe(Model):
         # wires each to its own leaky `CylindricalWall`.  Orthogonal to
         # `heat_port` -- a pipe may be heated, leaky, both, or neither.
         self.leaky = bool(leaky)
+        # Multiplicity: this one pipe stands in for `count` identical parallel
+        # pipes.  Realised by scaling the flow area `A` and wetted perimeter `P`
+        # by `count` in `declare_components` (keeps Dh = 4A/P = D), so velocity,
+        # Reynolds number, friction factor and per-pipe pressure drop are
+        # unchanged while m_dot / heat / leak scale by `count`.
+        self.count = int(count)
         super().__init__()
 
     def get_churchill_f_factor(self, Re, epsilon, D):
-        term1 = (8.0 / (Re + 1)) ** 12
+        term1 = (8.0 / Re) ** 12
         A = (-2.457 * sp.log((7.0 / Re) ** 0.9 + 0.27 * epsilon / D)) ** 16
-        B = (37530.0 / (Re + 1)) ** 16
-        term2 = 1.0 / (A + B) ** 1.5
-        f = (term1 + term2) ** (1.0 / 12.0)
-        return f * 8
-
-    def get_churchill_f_factor_regularized(self, Re, epsilon, D):
-        # Churchill, but every `Re` in a denominator is `Re + 1` (including the
-        # log term, unlike `get_churchill_f_factor`).  This keeps the factor --
-        # and its Jacobian -- finite as the flow goes to zero (-> the laminar
-        # limit ~64), which is the operating point of a dead-ended, slowly
-        # leaking pipe (`leaky=True`).  At any non-trivial Re the two forms
-        # agree to well within a percent.
-        term1 = (8.0 / (Re + 1)) ** 12
-        A = (-2.457 * sp.log((7.0 / (Re + 1)) ** 0.9 + 0.27 * epsilon / D)) ** 16
-        B = (37530.0 / (Re + 1)) ** 16
+        B = (37530.0 / Re) ** 16
         term2 = 1.0 / (A + B) ** 1.5
         return (term1 + term2) ** (1.0 / 12.0) * 8
 
@@ -716,8 +726,12 @@ class StraightPipe(Model):
         # leaves: the per-segment friction / momentum / energy expression
         # trees stay shallow, and the equation-dedup signature comparison
         # is a single-symbol hash rather than a full subtree walk.
-        A_value = np.pi * self.D ** 2 / 4
-        P_value = np.pi * self.D
+        # `count` parallel pipes -> scale the flow area and wetted perimeter by
+        # N.  Dh = 4A/P = D is unchanged, so every intensive flow quantity is
+        # the same as a single pipe and only the extensive m_dot / heat / leak
+        # scale by N.
+        A_value = self.count * np.pi * self.D ** 2 / 4
+        P_value = self.count * np.pi * self.D
         L_segment_value = self.L / self.n_segments
         self.add_component('A', Parameter(A_value, "m^2"))
         self.add_component('P', Parameter(P_value, "m"))
@@ -762,11 +776,12 @@ class StraightPipe(Model):
         # wall-temperature closure; the convective heat CORRELATION is injected
         # separately via `q_inflow_func` (zero heat when adiabatic).
         q_f = self.get_q_inflow if self.heat_port else self.get_q_inflow_adiabatic
-        # A leaky pipe is typically dead-ended and bleeds at near-zero flow, so
-        # use the zero-flow-robust Churchill (regularised log term) to keep the
-        # friction Jacobian finite as Re -> 0.
-        fr_f = (self.get_churchill_f_factor_regularized if self.leaky
-                else self.get_churchill_f_factor)
+        # Single Churchill friction factor for every pipe.  Zero-flow
+        # robustness is handled once, by the `Re_avg` floor in
+        # `TwoPortSegment.declare_equations`, so a dead-ended / stagnant line
+        # (leaky or not) keeps a finite friction factor and a non-singular
+        # Jacobian as Re -> 0.
+        fr_f = self.get_churchill_f_factor
         for i in range(self.n_segments):
             self.add_component(
                 f'pipe_segment_{i}',
@@ -914,6 +929,11 @@ class Valve(TwoPortSegment):
     mass flow [kg/s] for pressure drop ``dp = p_in - p_out``).
     """
 
+    #: P&ID-style SVG symbol for the UI canvas (a filename in
+    #: ``hydrogen/components/icons/``; surfaced via the catalog as ``"icon"``).
+    #: Inherited by the concrete valve subclasses below.
+    UI_ICON = "valve.svg"
+
     def __init__(
         self,
         medium: CoolPropMedium,
@@ -981,6 +1001,8 @@ class IncompressibleValve(Valve):
     ``dp = 0`` (flow reversal).
     """
 
+    UI_ICON = "valve.svg"
+
     def __init__(
         self,
         medium: CoolPropMedium,
@@ -1022,6 +1044,8 @@ class CompressibleValve(Valve):
     the residual stays differentiable through flow reversal and the onset of
     choking.  ``p_eps`` sets the smoothing scale on pressures.
     """
+
+    UI_ICON = "valve.svg"
 
     def __init__(
         self,
@@ -1265,6 +1289,10 @@ class PressureSource(Model):
         p_set (signal, if `p_control`) - commanded supply pressure [Pa]
     """
 
+    #: P&ID-style SVG symbol for the UI canvas (file in
+    #: ``hydrogen/components/icons/``; surfaced via the catalog as ``"icon"``).
+    UI_ICON = "pressure_source.svg"
+
     def __init__(
         self,
         medium: CoolPropMedium,
@@ -1377,8 +1405,29 @@ class PressureVessel(Model):
           as the partial pressure (pure-gas assumption).
         - `False` (default): the `leak` port is removed; the vessel is sealed.
 
+    Conjugate heat / multi-wall coupling (`heat_ports`, `leak_ports`):
+        Set `heat_ports > 0` to expose that many `heat_{k}` `ThermalPort_TQ`s,
+        each publishing the bulk gas temperature `T = T(p, h)` and feeding heat
+        into the energy balance::
+
+            dU/dt += sum_k Q_dot_wall_k          (Q into the gas through port k)
+
+        The conjugate partner (e.g. a wall surface, optionally through a
+        `ThermalConductor` film of conductance `h*A`) sets the relation between
+        `Q_dot_wall_k` and the surface temperature.  This is how a walled tank
+        couples its gas to a barrel and to its end caps -- one `heat_{k}` per
+        wall (the framework's `connect()` is pairwise, so each wall needs its
+        own port).
+
+        Set `leak_ports > 0` to expose that many *additional* `leak_{k}`
+        permeation ports (independent of the single `leaky` `leak` port); each
+        publishes `p` as the partial pressure and feeds the mass / energy
+        balance exactly like `leaky`.  Used by the `Tank` assembly to drive one
+        permeation chain per wall.
+
     Notes / simplifications:
-      * Rigid wall (V constant), no heat loss, no shaft work, no outflow.
+      * Rigid wall (V constant), no shaft work, no outflow.  Heat exchange is
+        only through the optional `heat_{k}` ports (otherwise adiabatic).
       * Inflow kinetic energy is neglected.  For typical vessel-filling regimes
         the contribution `(m_dot_in / (rho * A))**2 / 2` is several orders of
         magnitude below `h_in`; if you need it, add it to the energy balance
@@ -1387,6 +1436,10 @@ class PressureVessel(Model):
         balance will still integrate, but `h_in` would no longer represent the
         true outflow enthalpy (you'd need an upwinding switch on `h_in <-> h`).
     """
+
+    #: P&ID-style SVG symbol for the UI canvas (file in
+    #: ``hydrogen/components/icons/``; surfaced via the catalog as ``"icon"``).
+    UI_ICON = "pressure_vessel.svg"
 
     def __init__(
         self,
@@ -1402,13 +1455,29 @@ class PressureVessel(Model):
         leaky: Annotated[bool, ParamSpec("If true, expose a permeation `leak` "
                         "port that feeds the mass / energy balance; if false "
                         "the vessel is sealed.", structural=True)] = False,
+        heat_ports: Annotated[int, ParamSpec("Number of conjugate `heat_{k}` "
+                            "thermal ports (each publishes the bulk gas "
+                            "temperature and feeds heat into the energy "
+                            "balance); 0 = adiabatic.", unit="1",
+                            structural=True)] = 0,
+        leak_ports: Annotated[int, ParamSpec("Number of additional `leak_{k}` "
+                            "permeation ports (each publishes the vessel "
+                            "pressure as partial pressure and feeds the mass / "
+                            "energy balance); 0 = none.", unit="1",
+                            structural=True)] = 0,
     ):
+        if int(heat_ports) < 0 or int(leak_ports) < 0:
+            raise ValueError(
+                f"PressureVessel: heat_ports / leak_ports must be >= 0; got "
+                f"heat_ports={heat_ports}, leak_ports={leak_ports}")
         self.medium = medium
         self.V = V
         self.A_in = A_in
         self.p_init = p_init
         self.T_init = T_init
         self.leaky = bool(leaky)
+        self.heat_ports = int(heat_ports)
+        self.leak_ports = int(leak_ports)
         # Pre-compute thermodynamically consistent initial conditions so the t=0 Newton
         # solve starts near a converged state.
         self.h_init = float(medium.eval_h_pT(p_init, T_init))
@@ -1450,6 +1519,29 @@ class PressureVessel(Model):
                 require_connection=True,
             ))
 
+        # Conjugate heat ports: publish the bulk gas temperature, draw heat from
+        # the energy balance.  `T = T(p, h)` is closed in `declare_equations`.
+        if self.heat_ports > 0:
+            self.add_component('T', Variable(self.T_init, "K"))
+            for k in range(self.heat_ports):
+                self.add_component(f'Q_dot_wall_{k}', Variable(0.0, "W"))
+                self.add_port(f'heat_{k}', ThermalPort_TQ(
+                    self,
+                    channels={'T': self['T'], 'Q_dot': self[f'Q_dot_wall_{k}']},
+                    flow_orientation='in',
+                    require_connection=True,
+                ))
+
+        # Extra permeation ports (one per leaky wall), each publishing vessel p.
+        for k in range(self.leak_ports):
+            self.add_component(f'm_dot_leak_{k}', Variable(0.0, "kg/s"))
+            self.add_port(f'leak_{k}', PermeationPort_pN(
+                self,
+                channels={'p_partial': self['p'], 'm_dot_leak': self[f'm_dot_leak_{k}']},
+                flow_orientation='in',
+                require_connection=True,
+            ))
+
     def declare_equations(self):
         m = self['m'].symbol
         U = self['U'].symbol
@@ -1466,13 +1558,21 @@ class PressureVessel(Model):
         m_in_dot = self['m_dot_in'].symbol
 
         # A leaky vessel also gains/loses mass (and its carried enthalpy)
-        # through the permeation port; `m_dot_leak < 0` when gas permeates out.
+        # through the permeation port(s); `m_dot_leak < 0` when gas permeates
+        # out.  Sum the single `leak` (if `leaky`) and any indexed `leak_{k}`.
         m_leak = self['m_dot_leak'].symbol if self.leaky else 0
+        for k in range(self.leak_ports):
+            m_leak = m_leak + self[f'm_dot_leak_{k}'].symbol
+
+        # Conjugate wall heat into the gas (0 when adiabatic).
+        Q_wall = 0
+        for k in range(self.heat_ports):
+            Q_wall = Q_wall + self[f'Q_dot_wall_{k}'].symbol
 
         # Continuity: m grows at the inflow + leak mass rate.
         eq_mass = self['der_m'].symbol - (m_in_dot + m_leak)
-        # Energy: adiabatic open system; inflow and leaked mass carry enthalpy.
-        eq_energy = self['der_U'].symbol - (m_in_dot * h_in + m_leak * h)
+        # Energy: open system; inflow and leaked mass carry enthalpy, walls add heat.
+        eq_energy = self['der_U'].symbol - (m_in_dot * h_in + m_leak * h + Q_wall)
 
         # Algebraic closure linking (m, U) to (p, h) via the equation of state.
         eq_density = m - rho * V
@@ -1481,7 +1581,12 @@ class PressureVessel(Model):
         # Port pressure equality: vessel pressure feeds back as the upstream's back-pressure.
         eq_port_p = p_in - p
 
-        return [eq_mass, eq_energy, eq_density, eq_energy_state, eq_port_p]
+        eqs = [eq_mass, eq_energy, eq_density, eq_energy_state, eq_port_p]
+
+        # Bulk-temperature closure (only when a conjugate heat port needs it).
+        if self.heat_ports > 0:
+            eqs.append(self['T'].symbol - self.medium.T_ph(p, h))
+        return eqs
 
 
 class MixingJunction(Model):
@@ -1624,6 +1729,12 @@ class MixingJunction(Model):
         loosen it for smoother but less direction-faithful blending.
     """
 
+    #: When True, `declare_components` publishes one `FluidPort_phm` per port
+    #: (`port_0` .. `port_{N-1}`) so the junction wires like any other
+    #: thermofluid component.  Subclasses that expose their own directional
+    #: ports (e.g. `LoopBuffer`) set this False to avoid duplicate connectors.
+    _AUTO_FLUID_PORTS = True
+
     # `dynamic` toggles the bulk balance between differential storage (with
     # `der_m`/`der_U` states + EoS closures) and a purely algebraic mixer, so
     # the equation structure is NOT determined by the class alone.  Keying the
@@ -1638,7 +1749,7 @@ class MixingJunction(Model):
                     default=2)],
         V: Annotated[float | None, ParamSpec("Control volume (required for "
                     "dynamic=True storage; None for the algebraic mixer).",
-                    unit="m^3")] = None,
+                    unit="m^3", default=1e-3)] = None,
         p_init: Annotated[float, ParamSpec("Initial junction pressure.",
                          unit="Pa")] = 101325.0,
         T_init: Annotated[float, ParamSpec("Initial junction temperature.",
@@ -1718,6 +1829,25 @@ class MixingJunction(Model):
             self.add_component(f'h_{k}',     Variable(self.h_init, "J/kg"))
             self.add_component(f'h_set_{k}', Variable(self.h_init, "J/kg"))
             self.add_component(f'm_dot_{k}', Variable(0.0, "kg/s"))
+
+        # Publish each port as a standard FluidPort_phm so the junction wires
+        # like every other thermofluid component (UI palette + Model.connect),
+        # instead of requiring callers to hand-wire the `p_k`/`h_set_k`/`m_dot_k`
+        # triple.  The across `h` channel binds to the per-port STREAM-IN
+        # `h_set_k`: a connected upstream supplies its enthalpy there, which the
+        # smooth donor-cell closure consumes to dictate the carrier `h_k`.  The
+        # flow `m_dot_k` uses the junction-centric "into me" orientation shared
+        # by every port in the package.
+        if self._AUTO_FLUID_PORTS:
+            for k in range(self.N):
+                self.add_port(f'port_{k}', FluidPort_phm(
+                    self,
+                    channels={'p': self[f'p_{k}'],
+                              'h': self[f'h_set_{k}'],
+                              'm_dot': self[f'm_dot_{k}']},
+                    flow_orientation='in',
+                    medium=self.medium,
+                ))
 
     def declare_equations(self):
         # No port-throttling: every port's pressure equals the well-mixed
@@ -1865,6 +1995,10 @@ class LoopBuffer(MixingJunction):
     directly and wire its `h_set_1` to the downstream's stream-in
     enthalpy.  All the inlet reversal physics, however, is exact.
     """
+
+    # LoopBuffer exposes its own directional `inlet`/`outlet` ports below, so it
+    # suppresses the inherited indexed `port_k` connectors to avoid duplicates.
+    _AUTO_FLUID_PORTS = False
 
     def __init__(self, medium: CoolPropMedium, V,
                  p_init=101325.0, T_init=293.15, m_dot_eps=1e-6):

@@ -28,8 +28,8 @@ next to the components that use them.
   is refused at connect-time (`PortMediumMismatchError`).
 - **`ThermalPort_TQ`** — heat transfer, `(T, Q_dot)`. No `medium`.
 - **`PermeationPort_pN`** — gas permeation leak, `(p_partial, m_dot_leak)`. No
-  `medium`. Exposed by both a leaky `flow.TwoPortSegment` and a leaky
-  `walls.CylindricalWall`.
+  `medium`. Exposed by both a leaky `flow.TwoPortSegment` and any leaky
+  `walls.TwoNodeWall` (`FlatWall` / `CylindricalWall` / `SphericalWall`).
 
 All flow channels (`m_dot`, `Q_dot`, `m_dot_leak`) are positive **into** the
 component ("flow into me"); `connect()` sums same-orientation flows to zero.
@@ -51,13 +51,19 @@ Per-segment ports are collected via `pipe.segment_wall_ports` /
 
 Boundaries (`FixedTemperature`, `FixedHeatFlow`, `ConvectiveBoundary`), the
 massless `ThermalConductor`, and the two-node conduction walls: `TwoNodeWall`
-(base) with `FlatWall` and `CylindricalWall` supplying the geometry.
+(base) with `FlatWall`, `CylindricalWall` and `SphericalWall` supplying the
+geometry (Cartesian / radial-cylindrical / radial-spherical capacity and
+conductance).
 
-`CylindricalWall(leaky=True, permeation_flux=...)` additionally permeates a
-gas radially, exposing two `PermeationPort_pN` surfaces (`leak_a` inner,
-`leak_b` outer) that mirror its two thermal ports. The wall stays
+`TwoNodeWall` also owns the (optional) gas-permeation plumbing, so **any** wall
+with `leaky=True, permeation_flux=...` additionally permeates a gas through its
+thickness, exposing two `PermeationPort_pN` surfaces (`leak_a` inner, `leak_b`
+outer) that mirror its two thermal ports. The wall stays
 permeation-physics-agnostic — the pressure-gradient → mass-flow correlation is
-the injected flux model.
+the injected, geometry-agnostic flux model, which reads the shape back from the
+wall via `_perm_geom_conductance()` / `_perm_shell_volumes(n)`. So a subclass
+only overrides the shape physics (thermal `_node_capacity` / `_conductance`
+plus the two permeation hooks); everything else is inherited.
 
 A leaky **flow volume** is just a flag, not a subclass:
 `PressureVessel(leaky=True)` and `StraightPipe(leaky=True)` /

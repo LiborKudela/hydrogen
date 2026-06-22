@@ -579,6 +579,9 @@ def _component_entry(obj: type) -> dict:
         "domain": domain_of(obj),
         "summary": _first_doc_line(obj),
         "needs_medium": needs_medium,
+        # UI symbol declared on the class as ``UI_ICON`` (filename in
+        # ``hydrogen/components/icons/``); ``None`` -> generic box rendering.
+        "icon": getattr(obj, "UI_ICON", None),
         "parameters": params,
         "literals": literals,
     }

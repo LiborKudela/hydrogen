@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- P&ID-style pressure source: a pressurised reservoir (circle marked "P")
+     feeding out to the right, with an arrow toward the outlet port. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <!-- reservoir -->
+  <circle cx="40" cy="30" r="20"/>
+  <text x="40" y="38" font-family="sans-serif" font-size="22" font-weight="bold"
+        text-anchor="middle" fill="#1b1b1b" stroke="none">P</text>
+  <!-- supply line + arrowhead toward the outlet (on the centreline) -->
+  <line x1="60" y1="30" x2="118" y2="30"/>
+  <polyline points="98,23 108,30 98,37"/>
+</svg>

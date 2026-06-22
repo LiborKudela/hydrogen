@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Control source: constant level (y = k). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <g stroke="#9aa0a6" stroke-width="1.6">
+    <line x1="34" y1="14" x2="34" y2="44"/>
+    <line x1="32" y1="42" x2="90" y2="42"/>
+  </g>
+  <line x1="38" y1="24" x2="86" y2="24"/>
+</svg>

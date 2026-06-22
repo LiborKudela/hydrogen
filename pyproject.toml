@@ -8,16 +8,23 @@ version = "0.1.0"
 description = "Symbolic DAE/ODE solver for fluid-system dynamics."
 requires-python = ">=3.10"
 dependencies = [
- "numpy>=1.24",
+    "numpy>=1.24",
     "CoolProp>=6.5",
     "numba>=0.58",
-"sympy>=1.12",
+    "scipy>=1.10",
+    "sympy>=1.12",
     "line_profiler",
     "plotly",
 ]
 
+[project.scripts]
+hydrogen-ui = "hydrogen.ui.app:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+examples = ["matplotlib>=3.7"]
+mpi = ["mpi4py>=3.1"]
+qt = ["PySide6>=6.5"]
 docs = [
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.25",
@@ -29,6 +36,9 @@ docs = [
 [tool.setuptools.packages.find]
 include = ["hydrogen*"]
 exclude = ["examples*", "tests*"]
+
+[tool.setuptools.package-data]
+"hydrogen.components.icons" = ["*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

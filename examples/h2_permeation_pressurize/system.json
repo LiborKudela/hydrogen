@@ -70,14 +70,14 @@
               "n_nodes": 8,
               "C_init": 0.0
             },
-            "dynamic": false
+            "dynamic": true
           }
         ],
         "multiphase": "single",
-        "outer_thermal": "fixed",
-        "h_ext": 10.0,
-        "T_ext": 293.15,
-        "T_outer": 423.15,
+        "outer_thermal": "convective",
+        "h_ext": 100000.0,
+        "T_ext": 423.15,
+        "T_outer": 293.15,
         "p_ext": 1.0,
         "T_wall_init": 423.15,
         "p_init": 100000.0

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Control maths: saturation / limiter (flat - rise - flat). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <g stroke="#9aa0a6" stroke-width="1.6">
+    <line x1="34" y1="14" x2="34" y2="44"/>
+    <line x1="32" y1="42" x2="90" y2="42"/>
+  </g>
+  <polyline points="38,40 52,40 70,20 86,20"/>
+</svg>

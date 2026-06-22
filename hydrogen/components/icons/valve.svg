@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- P&ID-style control valve: a "bow-tie" body seated on the flow centreline,
+     short connection stubs to the inlet/outlet, and an actuator stem + bar
+     rising from the seat (the control / opening input). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <!-- inlet / outlet connection stubs (on the centreline, like the ports) -->
+  <line x1="2" y1="30" x2="33" y2="30"/>
+  <line x1="87" y1="30" x2="118" y2="30"/>
+  <!-- bow-tie valve body (seat at the centre) -->
+  <path d="M33 18 L33 42 L60 30 Z"/>
+  <path d="M87 18 L87 42 L60 30 Z"/>
+  <!-- actuator stem + bar (the opening / control input) -->
+  <line x1="60" y1="30" x2="60" y2="9"/>
+  <line x1="46" y1="9" x2="74" y2="9"/>
+</svg>

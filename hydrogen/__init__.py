@@ -7,7 +7,7 @@ Public API:
         CoolPropMedium,                                          # medium
         AmbientInlet, AmbientOutlet, TwoPortSegment,             # fluid components
         AdiabaticPump, StraightPipe, LoopBuffer, MixingJunction,
-        FlatWall, CylindricalWall, FixedTemperature,             # thermal components
+        FlatWall, CylindricalWall, SphericalWall, FixedTemperature,  # thermal components
         FixedHeatFlow, ConvectiveBoundary, ThermalConductor,
         ConjugatePipe,                                           # power components
         Interpolation1D, Interpolation2D,                        # interpolation utilities
@@ -64,10 +64,12 @@ from .components import (
     RealSignal,
     Sine,
     Splitter,
+    SphericalWall,
     SteadyRichardson,
     Step,
     StraightPipe,
     Sum,
+    Tank,
     ThermalConductor,
     ThermalPort_TQ,
     TransientDiffusion,
@@ -156,8 +158,10 @@ __all__ = [
     "TwoNodeWall",
     "FlatWall",
     "CylindricalWall",
+    "SphericalWall",
     # composite assemblies
     "Pipe",
+    "Tank",
     "WallLayer",
     # power components
     "ConjugatePipe",

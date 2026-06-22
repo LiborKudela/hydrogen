@@ -57,7 +57,7 @@ def main():
 
         # drain compile logs
         for ev in system.poll_events():
-            if ev["type"] == "log":
+            if ev["type"] == "log" or ev["type"] == "error" or ev["type"] == "warning ":
                 print(f"  [host] {ev['message']}")
 
         system.initialise(n=1, tol=1e-6, max_iter=200)
@@ -96,7 +96,7 @@ def main():
         done = False
         while not done:
             for ev in system.poll_events():
-                if ev["type"] == "error":
+                if ev["type"] == "error" or ev["type"] == "warning":
                     print(f"  [host error] {ev.get('kind')}: {ev.get('message')}")
                     done = True
                 elif ev["type"] in ("done", "closed"):

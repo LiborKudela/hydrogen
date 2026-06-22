@@ -1,7 +1,8 @@
 """Gas-permeation materials, flux models, and boundaries of the `thermofluid` library.
 
 This module supplies the *species-specific* half of wall permeation; the wall
-itself (`walls.CylindricalWall(leaky=True)`) and the flowing-pipe leak
+itself (any `walls.TwoNodeWall` subclass -- `FlatWall` / `CylindricalWall` /
+`SphericalWall` -- with `leaky=True`) and the flowing-pipe leak
 (`flow.TwoPortSegment(leaky=True)` / `flow.StraightPipe(leaky=True)` /
 `flow.PressureVessel(leaky=True)`) are permeation-agnostic plumbing that only
 own ports, surface partial pressures, and leak mass-flows.  What actually makes
@@ -13,8 +14,9 @@ a leak a *hydrogen* (or helium, or nitrogen) leak lives here:
     material: permeability `Phi(T)`, diffusivity `D(T)`, solubility
     `S(T) = Phi/D`.  Presets: `H2_IN_AUSTENITIC`.
   * `PermeationFlux` (+ `SteadyRichardson`, `TransientDiffusion`) -- the
-    pressure-gradient -> mass-flow correlation injected into a leaky
-    `walls.CylindricalWall` (`leaky=True, permeation_flux=...`).
+    geometry-agnostic pressure-gradient -> mass-flow correlation injected into
+    any leaky wall (`leaky=True, permeation_flux=...`); it reads the wall's
+    shape via `_perm_geom_conductance()` / `_perm_shell_volumes(n)`.
   * `FixedPartialPressure` -- a boundary that pins a permeation port's partial
     pressure (the permeation analogue of `walls.FixedTemperature`), e.g. for the
     outer (environment) surface of a wall.
@@ -31,25 +33,27 @@ surface follows `C = S(T) * p ** (1/n)`:
 The exponent is carried by the `Permeant`, so the same flux models cover every
 species; only the permeant (and its `TransportFit`) changes.
 
-Permeation physics (diffusion-limited / Richardson regime, cylindrical wall):
+Permeation physics (diffusion-limited / Richardson regime, any wall shape):
 
-    N_dot = 2*pi*Phi(T)*L / ln(r_out/r_in) * (p_in**(1/n) - p_out**(1/n))  [mol/s]
+    N_dot = Phi(T) * K * (p_in**(1/n) - p_out**(1/n))      [mol/s]
     m_dot = M * N_dot                                       mass leak [kg/s]
 
-`Phi`, `D`, `S = Phi/D` are Arrhenius and come from a `TransportFit`.  `T_film =
-(T_a + T_b)/2` (the mean of the two wall-surface temperatures) sets `Phi(T)`,
-`D(T)`.
+where `K` is the shape's geometric permeation conductance [m], supplied by the
+wall (`A/L` flat, `2*pi*L/ln(r_out/r_in)` cylindrical,
+`4*pi*r_in*r_out/(r_out-r_in)` spherical).  `Phi`, `D`, `S = Phi/D` are
+Arrhenius and come from a `TransportFit`.  `T_film = (T_a + T_b)/2` (the mean of
+the two wall-surface temperatures) sets `Phi(T)`, `D(T)`.
 
 Two flux models are provided:
 
   * `SteadyRichardson`   -- the algebraic flux above (needs only `Phi`); inner
     uptake == outer venting.
-  * `TransientDiffusion` -- a finite-volume radial diffusion chain of `n_nodes`
+  * `TransientDiffusion` -- a finite-volume diffusion chain of `n_nodes`
     dissolved-concentration states with surface-law boundary concentrations;
-    captures the wall charge-up / time-lag (needs `D`).  By construction (equal
-    `ln` shell spacing, `n+1` series conductances that telescope to
-    `2*pi*D*L/ln(r_out/r_in)`) its steady limit reproduces `SteadyRichardson`
-    exactly, for any `n_nodes`.
+    captures the wall charge-up / time-lag (needs `D`).  By construction (the
+    shape's equal-conductance shell spacing, `n+1` series conductances that
+    telescope to `1/(D*K)`) its steady limit reproduces `SteadyRichardson`
+    exactly, for any `n_nodes` and any shape.
 
 Single-species assumption.  Each permeation network models one permeant.  The
 inner partial pressure is supplied by the leak port -- for a pure gas the leaky
@@ -268,14 +272,17 @@ TransportFit.PRESETS = {
 
 
 class PermeationFlux:
-    """Base class for the pressure-gradient -> mass-flow correlation injected
-    into a leaky `walls.CylindricalWall` (`leaky=True, permeation_flux=...`).
+    """Base class for the geometry-agnostic pressure-gradient -> mass-flow
+    correlation injected into any leaky wall (`leaky=True, permeation_flux=...`).
 
     A flux model carries the `TransportFit` (and thus the permeant + all the
     transport physics); the wall stays permeation-agnostic and only provides the
-    geometry, surface temperatures `T_a`/`T_b`, surface partial pressures
-    `p_partial_a`/`p_partial_b`, and the two leak mass-flows `m_dot_a_leak`
-    (inner) / `m_dot_b_leak` (outer).  Subclasses implement the two hooks below.
+    surface temperatures `T_a`/`T_b`, surface partial pressures
+    `p_partial_a`/`p_partial_b`, the two leak mass-flows `m_dot_a_leak`
+    (inner) / `m_dot_b_leak` (outer), and -- via `_perm_geom_conductance()` /
+    `_perm_shell_volumes(n)` -- the shape-dependent geometry terms (so the same
+    flux model drives a flat, cylindrical or spherical wall).  Subclasses
+    implement the two hooks below.
 
     `T_film = (T_a + T_b)/2` is the temperature used for the Arrhenius
     `Phi(T)`, `D(T)`, `S = Phi/D`.  The surface concentration uses the
@@ -335,11 +342,15 @@ class PermeationFlux:
 
 
 class SteadyRichardson(PermeationFlux):
-    """Algebraic radial permeation flux (the cylindrical analogue of
-    `Phi/t * (p_in**(1/n) - p_out**(1/n))`).  Inner uptake == outer venting:
+    """Algebraic, geometry-agnostic permeation flux (the diffusion-limited
+    analogue of `Phi/t * (p_in**(1/n) - p_out**(1/n))`).  Inner uptake == outer
+    venting:
 
-        N_dot = 2*pi*Phi(T)*L / ln(r_out/r_in)
-                  * (p_partial_a**(1/n) - p_partial_b**(1/n))
+        N_dot = Phi(T) * K * (p_partial_a**(1/n) - p_partial_b**(1/n))
+
+    where `K = wall._perm_geom_conductance()` is the shape-dependent geometric
+    permeation conductance [m] (e.g. `A/L` flat, `2*pi*L/ln(r_out/r_in)`
+    cylindrical, `4*pi*r_in*r_out/(r_out-r_in)` spherical).
     """
 
     def __init__(self, transport_fit: Annotated[TransportFit, ParamSpec(
@@ -359,12 +370,10 @@ class SteadyRichardson(PermeationFlux):
 
     def equations(self, wall):
         Phi = self._phi(wall)
-        r_in = wall['r_in'].symbol
-        r_out = wall['r_out'].symbol
-        L = wall['length'].symbol
+        K = wall._perm_geom_conductance()
         c_a = self._p_pow(wall['p_partial_a'].symbol)
         c_b = self._p_pow(wall['p_partial_b'].symbol)
-        N_dot = 2 * sp.pi * Phi * L / sp.log(r_out / r_in) * (c_a - c_b)
+        N_dot = Phi * K * (c_a - c_b)
         M = self.permeant.M
         # Inner surface takes up `+M*N_dot`; the outer surface vents the same,
         # i.e. `-M*N_dot` flows INTO the wall there (it leaves).
@@ -375,13 +384,17 @@ class SteadyRichardson(PermeationFlux):
 
 
 class TransientDiffusion(PermeationFlux):
-    """Finite-volume radial diffusion chain of `n_nodes` dissolved-gas states.
+    """Finite-volume, geometry-agnostic diffusion chain of `n_nodes`
+    dissolved-gas states.
 
-    Nodes 1..n sit at equal-`ln` radii; the `n+1` inter-node/boundary
-    conductances are all equal and their series resistance telescopes to
-    `ln(r_out/r_in)/(2*pi*D*L)`, so the steady limit recovers the exact
-    `SteadyRichardson` flux for any `n_nodes`.  Captures the wall charge-up /
-    time lag.
+    Nodes 1..n sit on the shape's equal-conductance spacing (equal-`x` flat,
+    equal-`ln r` cylindrical, equal-`1/r` spherical), so the `n+1`
+    inter-node/boundary conductances are all equal -- a uniform
+    `g = (n+1) * D(T) * K`, with `K = wall._perm_geom_conductance()` -- and
+    their series resistance telescopes to `1/(D*K)`.  The steady limit thus
+    recovers the exact `SteadyRichardson` flux for any `n_nodes` and any shape.
+    The per-node control volumes come from `wall._perm_shell_volumes(n)`.
+    Captures the wall charge-up / time lag.
     """
 
     def __init__(
@@ -420,16 +433,15 @@ class TransientDiffusion(PermeationFlux):
         D = self._diffusivity(wall)
         S = Phi / D  # solubility constant
 
-        r_in = wall['r_in'].symbol
-        r_out = wall['r_out'].symbol
-        L = wall['length'].symbol
-        ln_ratio = sp.log(r_out / r_in)
+        K = wall._perm_geom_conductance()
         c_a = self._p_pow(wall['p_partial_a'].symbol)
         c_b = self._p_pow(wall['p_partial_b'].symbol)
 
         n = self.n_nodes
-        Delta = ln_ratio / (n + 1)
-        g = 2 * sp.pi * D * L / Delta                 # uniform conductance [m^3/s]
+        # Equal-conductance node spacing => uniform series conductance; for any
+        # shape the n+1 conductances telescope to the steady resistance 1/(D*K).
+        g = (n + 1) * D * K                             # uniform conductance [m^3/s]
+        V = wall._perm_shell_volumes(n)                 # per-node control volumes [m^3]
         C_in_surf = S * c_a                             # surface-law boundary (inner)
         C_out_surf = S * c_b                            # surface-law boundary (outer)
 
@@ -443,15 +455,11 @@ class TransientDiffusion(PermeationFlux):
                 return C_out_surf
             return C[j]
 
-        def r_at(x):  # radius at fractional shell index (equal-ln spacing)
-            return r_in * sp.exp(x * Delta)
-
         eqs = []
         for j in range(1, n + 1):
-            V_j = sp.pi * (r_at(j + 0.5) ** 2 - r_at(j - 0.5) ** 2) * L
             flux_in = g * (C_at(j - 1) - C[j])
             flux_out = g * (C[j] - C_at(j + 1))
-            eqs.append(V_j * der[j] - (flux_in - flux_out))
+            eqs.append(V[j - 1] * der[j] - (flux_in - flux_out))
 
         # Inner uptake = inner-surface molar flux INTO the wall (`+`); outer
         # venting = outer-surface flux leaving the wall, so `-M*N_out` flows

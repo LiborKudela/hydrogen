@@ -112,6 +112,8 @@ class Block(Model):
 class Constant(Block):
     """Constant signal: ``y = k``."""
 
+    UI_ICON = "constant.svg"
+
     def __init__(self, k: Annotated[float, ParamSpec("Constant output value.")] = 0.0,
                  unit=None):
         self.k = k
@@ -152,6 +154,8 @@ class _TimeSource(Block):
 class Step(_TimeSource):
     """Step signal: ``y = offset`` for ``t < start_time`` then ``offset + height``."""
 
+    UI_ICON = "step.svg"
+
     def __init__(
         self,
         height: Annotated[float, ParamSpec("Size of the step (added to the "
@@ -174,6 +178,8 @@ class Step(_TimeSource):
 
 class Ramp(_TimeSource):
     """Ramp signal: flat ``offset``, linear rise of ``height`` over ``duration``, then flat."""
+
+    UI_ICON = "ramp.svg"
 
     def __init__(
         self,
@@ -205,6 +211,8 @@ class Ramp(_TimeSource):
 
 class Sine(_TimeSource):
     """Sine signal: ``y = offset + amplitude * sin(2*pi*freq*t + phase)`` for ``t >= start_time``."""
+
+    UI_ICON = "sine.svg"
 
     def __init__(
         self,
@@ -241,6 +249,8 @@ class Sine(_TimeSource):
 class Gain(Block):
     """Scalar gain: ``y = k * u``."""
 
+    UI_ICON = "gain.svg"
+
     def __init__(self, k: Annotated[float, ParamSpec("Gain factor applied to "
                 "the input.")] = 1.0, unit=None):
         self.k = k
@@ -258,6 +268,8 @@ class Gain(Block):
 
 class Add(Block):
     """Weighted sum of two inputs: ``y = k1*u1 + k2*u2``."""
+
+    UI_ICON = "add.svg"
 
     def __init__(
         self,
@@ -286,6 +298,8 @@ class Add(Block):
 class Feedback(Block):
     """Difference junction: ``y = u1 - u2`` (setpoint minus measurement)."""
 
+    UI_ICON = "feedback.svg"
+
     def __init__(self, unit=None):
         self.unit = unit
         super().__init__()
@@ -301,6 +315,8 @@ class Feedback(Block):
 
 class Sum(Block):
     """N-input weighted sum: ``y = sum_i k_i * u_i``."""
+
+    UI_ICON = "sum.svg"
 
     def __init__(
         self,
@@ -335,6 +351,8 @@ class Sum(Block):
 class Product(Block):
     """Multiply two inputs: ``y = u1 * u2``."""
 
+    UI_ICON = "product.svg"
+
     def __init__(self, unit=None):
         self.unit = unit
         super().__init__()
@@ -358,6 +376,8 @@ class Limiter(Block):
     small relative to the signal range (default ``1e-3``).  Ideal for clamping
     a valve opening to ``[0, 1]``.
     """
+
+    UI_ICON = "limiter.svg"
 
     def __init__(
         self,
@@ -406,6 +426,8 @@ class Limiter(Block):
 class Integrator(Block):
     """Time integrator: ``der(y) = k * u``, ``y(0) = y_start``."""
 
+    UI_ICON = "integrator.svg"
+
     def __init__(
         self,
         k: Annotated[float, ParamSpec("Integral gain on the input.")] = 1.0,
@@ -430,6 +452,8 @@ class Integrator(Block):
 
 class FirstOrder(Block):
     """First-order lag: ``T*der(y) + y = k*u`` (time constant ``T``, gain ``k``)."""
+
+    UI_ICON = "first_order.svg"
 
     def __init__(
         self,
@@ -475,6 +499,8 @@ class PID(Block):
     (e.g. a ``[0, 1]`` valve opening); integrator anti-windup is a planned
     enhancement.
     """
+
+    UI_ICON = "pid.svg"
 
     def __init__(
         self,

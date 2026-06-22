@@ -72,8 +72,10 @@ from .thermofluid import (
     PressureSource,
     PressureVessel,
     Splitter,
+    SphericalWall,
     SteadyRichardson,
     StraightPipe,
+    Tank,
     ThermalConductor,
     ThermalPort_TQ,
     TransientDiffusion,
@@ -113,8 +115,10 @@ __all__ = [
     "TwoNodeWall",
     "FlatWall",
     "CylindricalWall",
+    "SphericalWall",
     # composite assemblies
     "Pipe",
+    "Tank",
     "WallLayer",
     # power components
     "ConjugatePipe",

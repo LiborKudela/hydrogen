@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- P&ID-style flanged pipe spool: a tube body with a flange at each end and
+     short connection stubs reaching the inlet/outlet ports. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <!-- inlet / outlet connection stubs -->
+  <line x1="2" y1="30" x2="18" y2="30"/>
+  <line x1="102" y1="30" x2="118" y2="30"/>
+  <!-- end flanges -->
+  <line x1="18" y1="13" x2="18" y2="47"/>
+  <line x1="102" y1="13" x2="102" y2="47"/>
+  <!-- tube body -->
+  <line x1="18" y1="18" x2="102" y2="18"/>
+  <line x1="18" y1="42" x2="102" y2="42"/>
+</svg>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Control maths: weighted sum of two inputs (summing junction, +). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <circle cx="60" cy="30" r="18"/>
+  <line x1="60" y1="21" x2="60" y2="39"/>
+  <line x1="51" y1="30" x2="69" y2="30"/>
+</svg>

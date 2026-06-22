@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Control maths: difference junction (y = u1 - u2): + on the upper inlet,
+     - on the lower inlet. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <circle cx="60" cy="30" r="18"/>
+  <!-- plus (upper) -->
+  <line x1="54" y1="20" x2="54" y2="28"/>
+  <line x1="50" y1="24" x2="58" y2="24"/>
+  <!-- minus (lower) -->
+  <line x1="62" y1="38" x2="70" y2="38"/>
+</svg>
