@@ -1,25 +1,25 @@
-"""Reusable heat-transfer components built on top of `hydrogen.model`.
+"""Wall heat-transfer components of the `thermofluid` library, built on
+`hydrogen.model`.
 
-Module layout (mirrors the fluid library so each physics domain is
-self-contained and readable top-to-bottom):
+Module layout:
 
-  1. `ThermalPort_TQ` -- the typed port this library exposes on every
-     component.  It lives at the top of the module rather than in the
-     generic `hydrogen.ports` so the heat-transfer domain owns its own
-     connector kind; `hydrogen.ports` only defines the generic `Port`
-     base class and the shared error hierarchy.
-  2. Boundary conditions -- `FixedTemperature`, `FixedHeatFlow`,
+  1. Boundary conditions -- `FixedTemperature`, `FixedHeatFlow`,
      `ConvectiveBoundary`.  Small single-port models used to drive a
      thermal network for testing and for the worked examples.
-  3. Passive elements -- `ThermalConductor`: a massless conductance used
+  2. Passive elements -- `ThermalConductor`: a massless conductance used
      to wire a prescribed-temperature source onto a capacitive node
      (driving a heat capacity through a conductance is well-posed; wiring
      a temperature straight onto it is a high-index constraint).
-  4. Components -- `TwoNodeWall` is the shared base: a wall lumped into two
+  3. Components -- `TwoNodeWall` is the shared base: a wall lumped into two
      surface heat-capacity nodes with conduction between them.  `FlatWall`
      (plane slab) and `CylindricalWall` (hollow tube) subclass it and
      supply only the geometry-specific node capacity and conductance
-     (Cartesian vs radial).
+     (Cartesian vs radial).  `CylindricalWall(leaky=True)` additionally
+     permeates a gas radially, exposing two `PermeationPort_pN` surfaces (see
+     the sibling `permeation` module for the injected flux models).
+
+The typed connectors (`ThermalPort_TQ`, `PermeationPort_pN`, ...) live in the
+sibling `ports` module.
 
 Sign convention -- Modelica "flow into me":
     Every port's `Q_dot` is positive when heat flows INTO the component
@@ -32,38 +32,13 @@ Sign convention -- Modelica "flow into me":
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import sympy as sp
 
 from ...model import DifferentialVariable, Model, Parameter, Variable
-from ...ports import Port
-
-
-# ---------------------------------------------------------------------------
-# Thermal port -- (T, Q_dot) interface used by every component below
-# ---------------------------------------------------------------------------
-
-
-class ThermalPort_TQ(Port):
-    """Heat-transfer interface carrying `(T, Q_dot)`.
-
-    * `T`       - port temperature                [K]   (across)
-    * `Q_dot`   - heat flow rate                   [W]   (THROUGH;
-                  positive = "INTO me" under the Modelica
-                  "flow into me" convention used package-wide)
-
-    Both faces of every component here use `flow_orientation='in'`
-    (positive `Q_dot` enters the component), so `Model.connect()` emits a
-    sum-to-zero on the flow channel when two same-orientation ports are
-    wired -- the heat-conduction analogue of the Kirchhoff / Modelica
-    connector convention.
-
-    The thermal domain carries no `medium`, so two `ThermalPort_TQ` of
-    any owners may be connected as long as their `kind` matches.
-    """
-
-    kind = "thermal_TQ"
-    required_channels = ("T", "Q_dot")
-    flow_channels = ("Q_dot",)
+from ...paramspec import ParamSpec, merged_param_specs
+from .ports import PermeationPort_pN, ThermalPort_TQ
 
 
 # ---------------------------------------------------------------------------
@@ -86,12 +61,14 @@ class FixedTemperature(Model):
         T_port - T_set == 0
     """
 
-    def __init__(self, T_set=293.15):
+    def __init__(self, T_set: Annotated[float, ParamSpec("Boundary "
+                "temperature held at the port.", unit="K")] = 293.15):
         self.T_set = T_set
         super().__init__()
 
     def declare_components(self):
-        self.add_component('T_set', Parameter(self.T_set, "K"))
+        self.add_component('T_set', Parameter(self.T_set,
+                                              **merged_param_specs(type(self))['T_set'].param_kwargs()))
         self.add_component('T_port', Variable(self.T_set, "K"))
         self.add_component('Q_dot_port', Variable(0.0, "W"))
         self.add_port('heat', ThermalPort_TQ(
@@ -124,13 +101,21 @@ class FixedHeatFlow(Model):
         Q_dot_port + Q_flow == 0
     """
 
-    def __init__(self, Q_flow=0.0, T_init=293.15):
+    def __init__(
+        self,
+        Q_flow: Annotated[float, ParamSpec("Heat rate delivered into the "
+                         "connected component (positive = heating); 0 = "
+                         "adiabatic.", unit="W")] = 0.0,
+        T_init: Annotated[float, ParamSpec("Initial port temperature guess "
+                         "(floats freely).", unit="K")] = 293.15,
+    ):
         self.Q_flow = Q_flow
         self.T_init = T_init
         super().__init__()
 
     def declare_components(self):
-        self.add_component('Q_flow', Parameter(self.Q_flow, "W"))
+        self.add_component('Q_flow', Parameter(self.Q_flow,
+                                               **merged_param_specs(type(self))['Q_flow'].param_kwargs()))
         self.add_component('T_port', Variable(self.T_init, "K"))
         self.add_component('Q_dot_port', Variable(-self.Q_flow, "W"))
         self.add_port('heat', ThermalPort_TQ(
@@ -163,16 +148,25 @@ class ConvectiveBoundary(Model):
         Q_dot_port - h * A * (T_port - T_inf) == 0
     """
 
-    def __init__(self, h, A, T_inf=293.15):
+    def __init__(
+        self,
+        h: Annotated[float, ParamSpec("Convective film (heat-transfer) "
+                    "coefficient.", unit="W/m^2/K", default=10.0)],
+        A: Annotated[float, ParamSpec("Convective exchange area.", unit="m^2",
+                    default=1.0)],
+        T_inf: Annotated[float, ParamSpec("Far-field fluid temperature.",
+                        unit="K")] = 293.15,
+    ):
         self.h = h
         self.A = A
         self.T_inf = T_inf
         super().__init__()
 
     def declare_components(self):
-        self.add_component('h', Parameter(self.h, "W/m^2/K"))
-        self.add_component('A', Parameter(self.A, "m^2"))
-        self.add_component('T_inf', Parameter(self.T_inf, "K"))
+        spec = merged_param_specs(type(self))
+        self.add_component('h', Parameter(self.h, **spec['h'].param_kwargs()))
+        self.add_component('A', Parameter(self.A, **spec['A'].param_kwargs()))
+        self.add_component('T_inf', Parameter(self.T_inf, **spec['T_inf'].param_kwargs()))
         self.add_component('T_port', Variable(self.T_inf, "K"))
         self.add_component('Q_dot_port', Variable(0.0, "W"))
         self.add_port('heat', ThermalPort_TQ(
@@ -220,13 +214,20 @@ class ThermalConductor(Model):
         Q_dot_a + Q_dot_b        == 0       (no storage)
     """
 
-    def __init__(self, G, T_init=293.15):
+    def __init__(
+        self,
+        G: Annotated[float, ParamSpec("Thermal conductance (G = k*A/L, or 1/R "
+                    "for a contact resistance).", unit="W/K", default=1.0)],
+        T_init: Annotated[float, ParamSpec("Initial face-temperature guess.",
+                         unit="K")] = 293.15,
+    ):
         self.G = G
         self.T_init = T_init
         super().__init__()
 
     def declare_components(self):
-        self.add_component('G', Parameter(self.G, "W/K"))
+        self.add_component('G', Parameter(self.G,
+                                          **merged_param_specs(type(self))['G'].param_kwargs()))
         self.add_component('T_a', Variable(self.T_init, "K"))
         self.add_component('T_b', Variable(self.T_init, "K"))
         self.add_component('Q_dot_a', Variable(0.0, "W"))
@@ -322,19 +323,33 @@ class TwoNodeWall(Model):
         `Parameter`/`ParameterAlias` to share a parent's symbol.
     """
 
-    # The `dynamic` flag toggles `declare_equations` between an ODE form (with
-    # `der_*` states) and an algebraic form, so the equation structure is NOT
-    # determined by the class alone.  Declaring it here makes the per-class
-    # equation template cache key on `(class, dynamic)`, so a model mixing
-    # dynamic and quasi-static walls of the same geometry caches each variant
-    # correctly instead of replaying one onto the other.
-    _cache_key_flags = ("dynamic",)
+    #: Single-source metadata for the shared material params (see
+    #: `hydrogen.paramspec`): read both by the component catalog and by
+    #: `declare_components` below, so the units live in exactly one place.
+    #: These args have no shared `__init__` to annotate (subclasses define
+    #: their own constructor), so the specs stay here.  `dynamic` is marked
+    #: ``structural`` so `cache_key_flag_names()` keys the equation-template
+    #: cache on it (it toggles the ODE vs algebraic form).
+    PARAMS = {
+        "rho": ParamSpec("Density of the wall material.", unit="kg/m^3"),
+        "cp": ParamSpec("Specific heat capacity of the wall material.",
+                        unit="J/(kg*K)"),
+        "k": ParamSpec("Thermal conductivity of the wall material.",
+                       unit="W/(m*K)"),
+        "T_init": ParamSpec("Initial wall temperature.", unit="K"),
+        "dynamic": ParamSpec(
+            "If true the wall has thermal mass (heat-up transient); if false "
+            "it conducts quasi-statically with no capacity.", structural=True),
+    }
 
     def declare_components(self):
-        # Shared material parameters; subclasses add geometry on top.
-        self.add_component('rho', Parameter(self.rho, "kg/m^3"))
-        self.add_component('cp', Parameter(self.cp, "J/kg/K"))
-        self.add_component('k', Parameter(self.k, "W/m/K"))
+        # Shared material parameters; subclasses add geometry on top.  Units /
+        # descriptions are pulled straight from `PARAMS` so they are authored
+        # once (here) and reused by the catalog without instantiating.
+        spec = merged_param_specs(type(self))
+        self.add_component('rho', Parameter(self.rho, **spec['rho'].param_kwargs()))
+        self.add_component('cp', Parameter(self.cp, **spec['cp'].param_kwargs()))
+        self.add_component('k', Parameter(self.k, **spec['k'].param_kwargs()))
         self._declare_geometry()
 
         # Surface-node temperatures.  Dynamic -> DifferentialVariable (carries
@@ -417,7 +432,14 @@ class FlatWall(TwoNodeWall):
     `TwoNodeWall`.
     """
 
-    def __init__(self, rho, cp, k, A, L, T_init=293.15, dynamic=True):
+    def __init__(
+        self, rho, cp, k,
+        A: Annotated[float, ParamSpec("Heat-transfer (conduction) area of the "
+                    "slab.", unit="m^2")],
+        L: Annotated[float, ParamSpec("Slab thickness (the conduction "
+                    "length).", unit="m")],
+        T_init=293.15, dynamic=True,
+    ):
         self.rho = rho
         self.cp = cp
         self.k = k
@@ -428,8 +450,9 @@ class FlatWall(TwoNodeWall):
         super().__init__()
 
     def _declare_geometry(self):
-        self.add_component('A', Parameter(self.A, "m^2"))
-        self.add_component('L', Parameter(self.L, "m"))
+        spec = merged_param_specs(type(self))
+        self.add_component('A', Parameter(self.A, **spec['A'].param_kwargs()))
+        self.add_component('L', Parameter(self.L, **spec['L'].param_kwargs()))
 
     def _node_capacity(self):
         # Half the slab's thermal mass per surface node.
@@ -462,13 +485,84 @@ class CylindricalWall(TwoNodeWall):
     `rho`, `cp`, `k`, `r_in`, `r_out`, `length` are all parameters.
     Requires `r_out > r_in > 0`.  `dynamic` toggles between the transient
     (capacitive) and quasi-static (massless) modes -- see `TwoNodeWall`.
+
+    Gas permeation (`leaky=True`)
+    -----------------------------
+    Set `leaky=True` and inject a `permeation_flux` strategy to make the wall
+    ALSO conduct a gas radially, exposing two `PermeationPort_pN`s -- one per
+    surface, mirroring the two thermal ports:
+
+        leak_a  - inner surface: p_partial = p_partial_a, m_dot = m_dot_a_leak (into wall)
+        leak_b  - outer surface: p_partial = p_partial_b, m_dot = m_dot_b_leak (into wall)
+
+    The wall stays permeation-physics-agnostic: it owns the ports, the two
+    surface partial-pressure variables, and the two leak mass-flows, but the
+    pressure-gradient -> mass-flow CORRELATION is supplied by the injected
+    `permeation_flux` object (e.g. a steady Richardson flux or a transient
+    diffusion chain from the `permeation` module).  That object carries the
+    permeant + `TransportFit` and must provide:
+
+        * `cache_key`        - a hashable identity for its equation structure
+                               (keyed into the wall's `_cache_key_flags` so the
+                               equation cache stays correct across flux models).
+        * `declare(wall)`    - register any extra components it needs (Arrhenius
+                               `Parameter`s, transient state vars).
+        * `equations(wall)`  - return the residual equations, binding
+                               `m_dot_a_leak` / `m_dot_b_leak` to the computed
+                               fluxes (reads geometry, `T_a`/`T_b`, `p_partial_a`/
+                               `p_partial_b` off the wall).
+
+    `p_in_init` / `p_out_init` seed the two surface partial pressures (only used
+    when `leaky=True`).
     """
 
-    def __init__(self, rho, cp, k, r_in, r_out, length, T_init=293.15, dynamic=True):
+    #: Adds the permeation toggle + the injected flux model's structural identity
+    #: to the thermal `dynamic` key, so a model mixing plain / leaky / steady /
+    #: transient walls caches each equation variant correctly.
+    #: `dynamic` (inherited, structural) and `leaky` (structural, below) are
+    #: derived automatically; `_perm_key` is the computed structural identity
+    #: of the injected flux model and is not a constructor argument.
+    _cache_key_flags = ("_perm_key",)
+
+    #: The injected flux model can't carry a scalar type annotation, so its
+    #: metadata stays here (merged with the Annotated specs below).
+    PARAMS = {
+        "permeation_flux": ParamSpec(
+            "Permeation flux model (SteadyRichardson / TransientDiffusion) "
+            "supplying the pressure-gradient -> mass-flow law; required when "
+            "leaky.", relevant_when={"leaky": True}),
+    }
+
+    def __init__(
+        self, rho, cp, k,
+        r_in: Annotated[float, ParamSpec("Inner radius of the tube wall (bore "
+                       "side).", unit="m")],
+        r_out: Annotated[float, ParamSpec("Outer radius of the tube wall.",
+                        unit="m")],
+        length: Annotated[float, ParamSpec("Axial length of the wall "
+                         "segment.", unit="m")],
+        T_init=293.15,
+        dynamic=True,
+        leaky: Annotated[bool, ParamSpec("Enable radial gas permeation "
+                        "(requires a `permeation_flux`).",
+                        structural=True)] = False,
+        permeation_flux=None,
+        p_in_init: Annotated[float, ParamSpec("Initial inner-surface partial "
+                            "pressure (only used when leaky).", unit="Pa")]
+                   = 101325.0,
+        p_out_init: Annotated[float, ParamSpec("Initial outer-surface partial "
+                             "pressure (only used when leaky).", unit="Pa")]
+                    = 101325.0,
+    ):
         if not (r_out > r_in > 0):
             raise ValueError(
                 f"CylindricalWall requires r_out > r_in > 0; got "
                 f"r_in={r_in}, r_out={r_out}"
+            )
+        if leaky and permeation_flux is None:
+            raise ValueError(
+                "CylindricalWall(leaky=True) requires a `permeation_flux` model "
+                "(e.g. SteadyRichardson(material) or TransientDiffusion(material))."
             )
         self.rho = rho
         self.cp = cp
@@ -478,12 +572,52 @@ class CylindricalWall(TwoNodeWall):
         self.length = length
         self.T_init = T_init
         self.dynamic = dynamic
+        self.leaky = bool(leaky)
+        self.permeation_flux = permeation_flux if self.leaky else None
+        self.p_in_init = p_in_init
+        self.p_out_init = p_out_init
+        # Structural cache-key contribution from the injected flux model (its
+        # equations change the system, so two walls with different flux models
+        # must not replay each other's cached template).  `None` when not leaky.
+        self._perm_key = self.permeation_flux.cache_key if self.leaky else None
         super().__init__()
 
+    def declare_components(self):
+        super().declare_components()  # thermal: material, geometry, T_a/T_b, ports
+        if not self.leaky:
+            return
+        # Two surface H2 partial pressures + two leak mass-flows (into the wall),
+        # one per surface.  The flux model reads/binds these.
+        self.add_component('p_partial_a', Variable(self.p_in_init, "Pa"))
+        self.add_component('p_partial_b', Variable(self.p_out_init, "Pa"))
+        self.add_component('m_dot_a_leak', Variable(0.0, "kg/s"))
+        self.add_component('m_dot_b_leak', Variable(0.0, "kg/s"))
+        # Let the injected correlation register its own parameters / states.
+        self.permeation_flux.declare(self)
+        self.add_port('leak_a', PermeationPort_pN(
+            self,
+            channels={'p_partial': self['p_partial_a'], 'm_dot_leak': self['m_dot_a_leak']},
+            flow_orientation='in',
+            require_connection=True,
+        ))
+        self.add_port('leak_b', PermeationPort_pN(
+            self,
+            channels={'p_partial': self['p_partial_b'], 'm_dot_leak': self['m_dot_b_leak']},
+            flow_orientation='in',
+            require_connection=True,
+        ))
+
+    def declare_equations(self):
+        eqs = list(super().declare_equations())
+        if self.leaky:
+            eqs += list(self.permeation_flux.equations(self))
+        return eqs
+
     def _declare_geometry(self):
-        self.add_component('r_in', Parameter(self.r_in, "m"))
-        self.add_component('r_out', Parameter(self.r_out, "m"))
-        self.add_component('length', Parameter(self.length, "m"))
+        spec = merged_param_specs(type(self))
+        self.add_component('r_in', Parameter(self.r_in, **spec['r_in'].param_kwargs()))
+        self.add_component('r_out', Parameter(self.r_out, **spec['r_out'].param_kwargs()))
+        self.add_component('length', Parameter(self.length, **spec['length'].param_kwargs()))
 
     def _node_capacity(self):
         # Annular thermal mass split across the two surface nodes.

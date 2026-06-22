@@ -92,10 +92,33 @@ class CoolPropMedium:
         "eval_k_ph",   "eval_dk_ph_dp",   "eval_dk_ph_dh",
     )
 
+    # Smooth-HEM property variants (`*_ph_hem`) reuse the single-phase CoolProp
+    # VALUE -- which already returns the homogeneous-equilibrium mixture inside
+    # the saturation dome and the true single-phase value outside -- but replace
+    # the analytic partials with central finite differences.  CoolProp's own
+    # two-phase analytic derivatives are inconsistent (they report ~0 while the
+    # value moves) and discontinuous at the saturation lines, which is exactly
+    # what makes a single-phase Newton solve stall at the dome.  An FD step a bit
+    # WIDER than the saturation cliff turns that discontinuous slope jump into a
+    # smooth transition, giving a consistent, continuous Jacobian.  The default
+    # steps below are tuned for water-scale enthalpies/pressures; override per
+    # instance if a medium needs a different smoothing band.
+    _HEM_EVAL_NAMES = (
+        "eval_drho_ph_hem_dp", "eval_drho_ph_hem_dh",
+        "eval_dT_ph_hem_dp",   "eval_dT_ph_hem_dh",
+        "eval_dmu_ph_hem_dp",  "eval_dmu_ph_hem_dh",
+        "eval_dk_ph_hem_dp",   "eval_dk_ph_hem_dh",
+    )
+
     def __init__(self, medium, p=101325, T=293.15, disable_warnings=False,
-                 backend="HEOS", scalar_cache_maxsize=None):
+                 backend="HEOS", scalar_cache_maxsize=None,
+                 hem_fd_dh=5000.0, hem_fd_dp=5000.0):
         self.medium = medium
         self.backend = backend
+        # Finite-difference smoothing bands for the HEM property partials
+        # (J/kg and Pa respectively).  See `_HEM_EVAL_NAMES` note above.
+        self.hem_fd_dh = float(hem_fd_dh)
+        self.hem_fd_dp = float(hem_fd_dp)
         self.abstarct_state_ph = CP.AbstractState(backend, self.medium)
         self.abstarct_state_pT = CP.AbstractState(backend, self.medium)
         self.abstarct_state_ps = CP.AbstractState(backend, self.medium)
@@ -110,7 +133,7 @@ class CoolPropMedium:
         # instance attributes shadow class-level methods.
         if scalar_cache_maxsize is not None:
             self.scalar_cache_maxsize = scalar_cache_maxsize
-        for _name in self._SCALAR_EVAL_NAMES:
+        for _name in self._SCALAR_EVAL_NAMES + self._HEM_EVAL_NAMES:
             _bound = getattr(self, _name)
             setattr(self, _name,
                     functools.lru_cache(maxsize=self.scalar_cache_maxsize)(_bound))
@@ -136,6 +159,16 @@ class CoolPropMedium:
         self.s_ph = get_symbolic_property_function(self.eval_s_ph,    {1: self.eval_ds_ph_dp,   2: self.eval_ds_ph_dh},   ["p", "h"], medium, "s_ph")
         self.k_ph = get_symbolic_property_function(self.eval_k_ph,    {1: self.eval_dk_ph_dp,   2: self.eval_dk_ph_dh},   ["p", "h"], medium, "k_ph")
 
+        # Smooth-HEM variants: SAME value evaluator as single-phase (CoolProp's
+        # (p, h) flash already gives the HEM mixture inside the dome), but with
+        # the smoothed finite-difference partials so the Jacobian stays
+        # consistent and continuous through the saturation lines.  Used by
+        # fluid components built with `multiphase="HEM"`.
+        self.rho_ph_hem = get_symbolic_property_function(self.eval_rho_ph, {1: self.eval_drho_ph_hem_dp, 2: self.eval_drho_ph_hem_dh}, ["p", "h"], medium, "rho_ph_hem")
+        self.T_ph_hem   = get_symbolic_property_function(self.eval_T_ph,   {1: self.eval_dT_ph_hem_dp,   2: self.eval_dT_ph_hem_dh},   ["p", "h"], medium, "T_ph_hem")
+        self.mu_ph_hem  = get_symbolic_property_function(self.eval_mu_ph,  {1: self.eval_dmu_ph_hem_dp,  2: self.eval_dmu_ph_hem_dh},  ["p", "h"], medium, "mu_ph_hem")
+        self.k_ph_hem   = get_symbolic_property_function(self.eval_k_ph,   {1: self.eval_dk_ph_hem_dp,   2: self.eval_dk_ph_hem_dh},   ["p", "h"], medium, "k_ph_hem")
+
         self.default_vars = {'p': p, 'T': T, 'h': self.h_pT(p, T)}
         # `self.modules` exposes the SCALAR `eval_*_ph` functions to
         # `sympy.lambdify`.  Each scalar evaluator carries an
@@ -157,6 +190,12 @@ class CoolPropMedium:
             {f"{medium}_T_ph":   self.eval_T_ph},   {f"{medium}_dT_ph_dp":   self.eval_dT_ph_dp},   {f"{medium}_dT_ph_dh":   self.eval_dT_ph_dh},
             {f"{medium}_s_ph":   self.eval_s_ph},   {f"{medium}_ds_ph_dp":   self.eval_ds_ph_dp},   {f"{medium}_ds_ph_dh":   self.eval_ds_ph_dh},
             {f"{medium}_k_ph":   self.eval_k_ph},   {f"{medium}_dk_ph_dp":   self.eval_dk_ph_dp},   {f"{medium}_dk_ph_dh":   self.eval_dk_ph_dh},
+            # HEM variants: value reuses the single-phase evaluator; partials are
+            # the smoothed finite-difference ones registered below.
+            {f"{medium}_rho_ph_hem": self.eval_rho_ph}, {f"{medium}_drho_ph_hem_dp": self.eval_drho_ph_hem_dp}, {f"{medium}_drho_ph_hem_dh": self.eval_drho_ph_hem_dh},
+            {f"{medium}_T_ph_hem":   self.eval_T_ph},   {f"{medium}_dT_ph_hem_dp":   self.eval_dT_ph_hem_dp},   {f"{medium}_dT_ph_hem_dh":   self.eval_dT_ph_hem_dh},
+            {f"{medium}_mu_ph_hem":  self.eval_mu_ph},  {f"{medium}_dmu_ph_hem_dp":  self.eval_dmu_ph_hem_dp},  {f"{medium}_dmu_ph_hem_dh":  self.eval_dmu_ph_hem_dh},
+            {f"{medium}_k_ph_hem":   self.eval_k_ph},   {f"{medium}_dk_ph_hem_dp":   self.eval_dk_ph_hem_dp},   {f"{medium}_dk_ph_hem_dh":   self.eval_dk_ph_hem_dh},
         ]
         # `self.batch_modules` exposes the batch-aware (`numpy-array`-friendly)
         # variants for users who manually build models that benefit from
@@ -170,6 +209,12 @@ class CoolPropMedium:
             {f"{medium}_T_ph":   self.eval_T_ph_batch},   {f"{medium}_dT_ph_dp":   self.eval_dT_ph_dp_batch},   {f"{medium}_dT_ph_dh":   self.eval_dT_ph_dh_batch},
             {f"{medium}_s_ph":   self.eval_s_ph_batch},   {f"{medium}_ds_ph_dp":   self.eval_ds_ph_dp_batch},   {f"{medium}_ds_ph_dh":   self.eval_ds_ph_dh_batch},
             {f"{medium}_k_ph":   self.eval_k_ph_batch},   {f"{medium}_dk_ph_dp":   self.eval_dk_ph_dp_batch},   {f"{medium}_dk_ph_dh":   self.eval_dk_ph_dh_batch},
+            # HEM variants (batch): value reuses the single-phase batch evaluator,
+            # partials are the smoothed central differences driven through it.
+            {f"{medium}_rho_ph_hem": self.eval_rho_ph_batch}, {f"{medium}_drho_ph_hem_dp": self.eval_drho_ph_hem_dp_batch}, {f"{medium}_drho_ph_hem_dh": self.eval_drho_ph_hem_dh_batch},
+            {f"{medium}_T_ph_hem":   self.eval_T_ph_batch},   {f"{medium}_dT_ph_hem_dp":   self.eval_dT_ph_hem_dp_batch},   {f"{medium}_dT_ph_hem_dh":   self.eval_dT_ph_hem_dh_batch},
+            {f"{medium}_mu_ph_hem":  self.eval_mu_ph_batch},  {f"{medium}_dmu_ph_hem_dp":  self.eval_dmu_ph_hem_dp_batch},  {f"{medium}_dmu_ph_hem_dh":  self.eval_dmu_ph_hem_dh_batch},
+            {f"{medium}_k_ph_hem":   self.eval_k_ph_batch},   {f"{medium}_dk_ph_hem_dp":   self.eval_dk_ph_hem_dp_batch},   {f"{medium}_dk_ph_hem_dh":   self.eval_dk_ph_hem_dh_batch},
         ]
 
     @functools.lru_cache(maxsize=1)
@@ -392,6 +437,80 @@ class CoolPropMedium:
             dk_dh = (self.eval_k_ph(p, h + eps) - self.eval_k_ph(p, h - eps)) / (2 * eps)
         return dk_dh
 
+    # --- smooth-HEM partials (central finite differences) -----------------------------
+    #
+    # These back the `*_ph_hem` symbolic property functions.  Each is a central
+    # difference of the SINGLE-PHASE value evaluator with a step (`hem_fd_dh` /
+    # `hem_fd_dp`) deliberately a little wider than the saturation cliff, so the
+    # otherwise-discontinuous slope at the phase boundary is smeared into a
+    # smooth, consistent transition.  Inside the dome the central difference
+    # recovers the genuine HEM slope (e.g. drho/dh = -rho^2 (vg-vf)/(hg-hf));
+    # outside it recovers the single-phase slope.  Pressures are floored to keep
+    # `p - dp` inside the EOS's valid domain.
+
+    def _fd_dh(self, eval_func, p, h):
+        e = self.hem_fd_dh
+        return (eval_func(p, h + e) - eval_func(p, h - e)) / (2.0 * e)
+
+    def _fd_dp(self, eval_func, p, h):
+        e = self.hem_fd_dp
+        p_hi = p + e
+        # Keep the low sample strictly positive; `np.maximum` so the same
+        # helper serves both the scalar and the array (batch) callers.
+        p_lo = np.maximum(p - e, e)
+        return (eval_func(p_hi, h) - eval_func(p_lo, h)) / (p_hi - p_lo)
+
+    def eval_drho_ph_hem_dp(self, p, h):
+        return self._fd_dp(self.eval_rho_ph, p, h)
+
+    def eval_drho_ph_hem_dh(self, p, h):
+        return self._fd_dh(self.eval_rho_ph, p, h)
+
+    def eval_dT_ph_hem_dp(self, p, h):
+        return self._fd_dp(self.eval_T_ph, p, h)
+
+    def eval_dT_ph_hem_dh(self, p, h):
+        return self._fd_dh(self.eval_T_ph, p, h)
+
+    def eval_dmu_ph_hem_dp(self, p, h):
+        return self._fd_dp(self.eval_mu_ph, p, h)
+
+    def eval_dmu_ph_hem_dh(self, p, h):
+        return self._fd_dh(self.eval_mu_ph, p, h)
+
+    def eval_dk_ph_hem_dp(self, p, h):
+        return self._fd_dp(self.eval_k_ph, p, h)
+
+    def eval_dk_ph_hem_dh(self, p, h):
+        return self._fd_dh(self.eval_k_ph, p, h)
+
+    # Batch (array-aware) counterparts: the value reuses `eval_*_ph_batch`
+    # (already vectorised), and the partial is the same central difference but
+    # driven through the batch value evaluator so `(p, h)` arrays work.
+    def eval_drho_ph_hem_dp_batch(self, p, h):
+        return self._fd_dp(self.eval_rho_ph_batch, p, h)
+
+    def eval_drho_ph_hem_dh_batch(self, p, h):
+        return self._fd_dh(self.eval_rho_ph_batch, p, h)
+
+    def eval_dT_ph_hem_dp_batch(self, p, h):
+        return self._fd_dp(self.eval_T_ph_batch, p, h)
+
+    def eval_dT_ph_hem_dh_batch(self, p, h):
+        return self._fd_dh(self.eval_T_ph_batch, p, h)
+
+    def eval_dmu_ph_hem_dp_batch(self, p, h):
+        return self._fd_dp(self.eval_mu_ph_batch, p, h)
+
+    def eval_dmu_ph_hem_dh_batch(self, p, h):
+        return self._fd_dh(self.eval_mu_ph_batch, p, h)
+
+    def eval_dk_ph_hem_dp_batch(self, p, h):
+        return self._fd_dp(self.eval_k_ph_batch, p, h)
+
+    def eval_dk_ph_hem_dh_batch(self, p, h):
+        return self._fd_dh(self.eval_k_ph_batch, p, h)
+
     # --- batch (array-aware) variants -------------------------------------------------
     #
     # Each `eval_*_batch` accepts EITHER scalar `(p, h)` (delegates to the
@@ -540,7 +659,7 @@ class CoolPropMedium:
         self.set_state_pT.cache_clear()
         self.set_state_ps.cache_clear()
         # Per-property `lru_cache`s (set up per-instance in `__init__`).
-        for _name in self._SCALAR_EVAL_NAMES:
+        for _name in self._SCALAR_EVAL_NAMES + self._HEM_EVAL_NAMES:
             getattr(self, _name).cache_clear()
         # Batch-evaluator state pool.
         self._batch_state_cache_ph.clear()
@@ -558,6 +677,10 @@ for _name in (
     "eval_T_ph_batch", "eval_dT_ph_dp_batch", "eval_dT_ph_dh_batch",
     "eval_s_ph_batch", "eval_ds_ph_dp_batch", "eval_ds_ph_dh_batch",
     "eval_k_ph_batch", "eval_dk_ph_dp_batch", "eval_dk_ph_dh_batch",
+    "eval_drho_ph_hem_dp_batch", "eval_drho_ph_hem_dh_batch",
+    "eval_dT_ph_hem_dp_batch", "eval_dT_ph_hem_dh_batch",
+    "eval_dmu_ph_hem_dp_batch", "eval_dmu_ph_hem_dh_batch",
+    "eval_dk_ph_hem_dp_batch", "eval_dk_ph_hem_dh_batch",
 ):
     getattr(CoolPropMedium, _name)._hydrogen_vectorised = True
 del _name

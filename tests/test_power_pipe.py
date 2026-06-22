@@ -28,7 +28,7 @@ from hydrogen import (
     Model,
     StraightPipe,
 )
-from hydrogen.components.thermal import ThermalPort_TQ
+from hydrogen.components.thermofluid import ThermalPort_TQ
 from hydrogen.ports import PortNotConnectedWarning
 
 # One shared medium for the whole module (CoolProp table build is expensive).
@@ -176,7 +176,7 @@ def test_conjugate_pipe_energy_conservation_and_cooling():
     assert h_out < h_in
     assert fluid_power < 0.0
     for i in range(n):
-        T_a = _trace(rec, f'.wall_{i}.T_a')[-1]
+        T_a = _trace(rec, f'.wall_{i}_0.T_a')[-1]
         assert T_a > 293.15 + 1.0, f"wall_{i} did not heat up"
 
 

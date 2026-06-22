@@ -38,8 +38,8 @@ class _ThermalPort_TQ_Stub(Port):
     """Local thermal-port subclass for the kind-mismatch test.
 
     The framework no longer ships any built-in thermal / electrical port
-    type -- domain libraries declare their own port kinds at the top of
-    their module (see `hydrogen.components.fluid.FluidPort_phm`).
+    type -- domain libraries declare their own port kinds alongside their
+    components (see `hydrogen.components.thermofluid.ports.FluidPort_phm`).
     This stub stands in here purely to exercise the `kind` guard in
     `Model.connect()`.
     """

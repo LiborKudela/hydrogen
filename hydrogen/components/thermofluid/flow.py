@@ -1,20 +1,18 @@
-"""Reusable fluid-system components built on top of `hydrogen.model`.
+"""Fluid-flow components of the `thermofluid` library, built on `hydrogen.model`.
 
-Module layout:
+Components: AmbientInlet, AmbientOutlet, TwoPortSegment, AdiabaticPump,
+PressureOutlet, Splitter, PressureSource, PressureVessel, MixingJunction,
+LoopBuffer, StraightPipe.
 
-  1. `FluidPort_phm` -- the typed port that this library exposes on every
-     component.  Lives at the top of the module (rather than in the
-     generic `hydrogen.ports`) so that each physics-domain library owns its
-     own port kinds; `hydrogen.ports` only defines the generic `Port`
-     base class and the shared error hierarchy.
-  2. Components -- AmbientInlet, AmbientOutlet, TwoPortSegment,
-     AdiabaticPump, PressureOutlet, Splitter, PressureSource,
-     PressureVessel, MixingJunction, LoopBuffer, StraightPipe.
+The typed connectors (`FluidPort_phm`, `ThermalPort_TQ`, `PermeationPort_pN`)
+live in the sibling `ports` module; the leaky `TwoPortSegment` exposes a heat
+port and a permeation leak port, so they are shared across this package.
 """
 
 from __future__ import annotations
 
 import warnings
+from typing import Annotated
 
 import numpy as np
 import sympy as sp
@@ -22,41 +20,31 @@ import sympy as sp
 from ...medium import CoolPropMedium
 from ...model import DifferentialVariable, Model, Parameter, Variable
 from ...numerics import G_const
-from ...ports import Port
+from ...paramspec import ParamSpec, merged_param_specs
 from ..control.control_components import RealSignal
-from ..thermal.thermal_components import ThermalPort_TQ
-
+from .ports import FluidPort_phm, PermeationPort_pN, ThermalPort_TQ
 
 # ---------------------------------------------------------------------------
-# Fluid port -- (p, h, m_dot) interface used by every component below
+# Shared parameter metadata reused across several flow components (single
+# source of truth consumed by both `declare_components` and the catalog).
 # ---------------------------------------------------------------------------
-
-
-class FluidPort_phm(Port):
-    """Compressible-fluid interface carrying `(p, h, m_dot)`.
-
-    * `p`       - port pressure                   [Pa]   (across)
-    * `h`       - port specific enthalpy          [J/kg] (across)
-    * `m_dot`   - port mass flow rate             [kg/s] (THROUGH;
-                  positive = "INTO me" under the Modelica
-                  "flow into me" convention used package-wide)
-
-    All standard fluid components in this module declare either an
-    `outlet` or an `inlet` port of this kind.  Both faces use
-    `flow_orientation='in'` (positive m_dot enters the component),
-    so `Model.connect()` emits a sum-to-zero on the flow channel
-    when two same-orientation ports are wired -- the Kirchhoff /
-    Modelica connector convention.
-
-    Two FluidPort_phm of different `medium` are refused at
-    connect-time (`PortMediumMismatchError`) to catch air<->hydrogen
-    cross-wiring before it produces a confusing CoolProp NameError
-    in the lambdified residual.
-    """
-
-    kind = "fluid_phm"
-    required_channels = ("p", "h", "m_dot")
-    flow_channels = ("m_dot",)
+_SPEC_MULTIPHASE = ParamSpec(
+    "Thermodynamic-property mode: 'single' (single-phase, faster) or 'HEM' "
+    "(homogeneous equilibrium, handles boiling / flashing).",
+    choices=("single", "HEM"), structural=True)
+_SPEC_HEAT_PORT = ParamSpec(
+    "If true, expose a thermal `wall` port for conjugate heat transfer; if "
+    "false the segment is adiabatic (q = 0).", structural=True)
+_SPEC_LEAKY = ParamSpec(
+    "If true, expose a permeation `leak` port whose mass-flow is subtracted "
+    "from the continuity balance; if false the wall is sealed.", structural=True)
+_SPEC_Z_IN = ParamSpec("Elevation of the inlet face (gravity head).",
+                       unit="m", default=0.0)
+_SPEC_Z_OUT = ParamSpec("Elevation of the outlet face (gravity head).",
+                        unit="m", default=0.0)
+_SPEC_EPSILON = ParamSpec("Absolute wall roughness (friction).", unit="m",
+                          default=1e-6)
+_SPEC_L = ParamSpec("Flow length.", unit="m", default=1.0)
 
 
 class AmbientInlet(Model):
@@ -74,7 +62,18 @@ class AmbientInlet(Model):
     by the `m_flow` parameter and propagates through `m_dot_out`.
     """
 
-    def __init__(self, medium: CoolPropMedium, p_ambient=101325, T_ambient=293.15, m_flow=0.1, D=0.07):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        p_ambient: Annotated[float, ParamSpec("Ambient (reservoir) pressure.",
+                            unit="Pa")] = 101325,
+        T_ambient: Annotated[float, ParamSpec("Ambient (reservoir) "
+                            "temperature.", unit="K")] = 293.15,
+        m_flow: Annotated[float, ParamSpec("Imposed mass flow rate delivered "
+                         "to the outlet.", unit="kg/s")] = 0.1,
+        D: Annotated[float, ParamSpec("Port (throat) diameter setting the "
+                    "kinetic-energy correction area.", unit="m")] = 0.07,
+    ):
         self.medium = medium
         self.p_ambient = p_ambient
         self.T_ambient = T_ambient
@@ -83,24 +82,20 @@ class AmbientInlet(Model):
         super().__init__()
 
     def declare_components(self):
-        self.add_component('p_ambient', Parameter(self.p_ambient, "Pa"))
+        # Constructor-arg Parameters pull their unit/description from this
+        # class's ParamSpec (authored once in the __init__ annotation);
+        # computed Parameters/Variables below keep their explicit unit.
+        spec = merged_param_specs(type(self))
+        self.add_component('p_ambient', Parameter(self.p_ambient, **spec['p_ambient'].param_kwargs()))
         self.add_component('T_ambient', Variable(self.T_ambient, "K"))
-        # Setpoint the `T_ambient` Variable is pinned to.  Held as a Parameter
-        # (not a baked literal in `eq4`) so the per-class equation template is
-        # instance-invariant: two `AmbientInlet`s with different ambient
-        # temperatures share the cached template and only their parameter
-        # VALUES differ at runtime.
-        self.add_component('T_ambient_set', Parameter(self.T_ambient, "K"))
+        self.add_component('T_ambient_set', Parameter(self.T_ambient, **spec['T_ambient'].param_kwargs()))
         self.add_component('h_ambient', Parameter(self.medium.h_pT(self['p_ambient'].value, self['T_ambient'].value), "J/kg"))
         self.add_component('s_ambient', Parameter(self.medium.s_ph(self['p_ambient'].value, self['h_ambient'].value), "J/kg/K"))
-        self.add_component('m_flow', Parameter(self.m_flow, "kg/s"))
-        self.add_component('D', Parameter(self.D, "m"))
+        self.add_component('m_flow', Parameter(self.m_flow, **spec['m_flow'].param_kwargs()))
+        self.add_component('D', Parameter(self.D, **spec['D'].param_kwargs()))
         self.add_component('p_out', Variable(self.p_ambient * 0.99, "Pa"))
         self.add_component('h_out', Variable(self.medium.h_pT(self.p_ambient, self.T_ambient) * 0.99, "J/kg"))
         self.add_component('m_dot_out', Variable(self.m_flow, "kg/s"))
-        # Internal velocity Variable; kept as a leaf symbol so the isentropic
-        # energy balance below sees `w_out**2 / 2` as a 1-leaf expression
-        # rather than a nested `m_dot/(rho*A)` chain that bloats the Jacobian.
         self.add_component('w_out', Variable(0.2, "m/s"))
         self.add_port('outlet', FluidPort_phm(
             self,
@@ -111,18 +106,10 @@ class AmbientInlet(Model):
 
     def declare_equations(self):
         A = np.pi * self['D'].symbol ** 2 / 4
-        # Continuity (mass-flow imposed): under "flow into me", positive
-        # `m_dot_out` means fluid entering the inlet through its out-face
-        # (reverse flow).  The user-facing `m_flow` parameter still means
-        # "physical outflow rate" (positive forward), so we pin
-        # `m_dot_out = -m_flow`, i.e. `m_flow + m_dot_out == 0`.  Trivial
-        # and collapses to a Parameter substitution at instantiate time.
+        
+        # Continuity (mass-flow imposed):
         eq1 = self['m_flow'].symbol + self['m_dot_out'].symbol
 
-        # m_dot <-> w closure (nonlinear in rho, so the trivial reducer
-        # leaves it alone -- keeps `w_out` as a leaf symbol in eq3 below).
-        # Sign: `w_out` is axial forward, `m_dot_out` is "into me at the
-        # out-face" (axial backward), so they sum to zero.
         rho_out = self.medium.rho_ph(self['p_out'].symbol, self['h_out'].symbol)
         eq_w = self['m_dot_out'].symbol + rho_out * self['w_out'].symbol * A
 
@@ -142,7 +129,18 @@ class AmbientOutlet(Model):
     Same equations as `AmbientInlet` minus the `T_ambient` constraint.
     """
 
-    def __init__(self, medium: CoolPropMedium, p_ambient=101325, T_ambient=293.15, m_flow=0.1, D=0.07):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        p_ambient: Annotated[float, ParamSpec("Ambient (reservoir) pressure.",
+                            unit="Pa")] = 101325,
+        T_ambient: Annotated[float, ParamSpec("Ambient (reservoir) "
+                            "temperature.", unit="K")] = 293.15,
+        m_flow: Annotated[float, ParamSpec("Imposed mass flow rate drawn from "
+                         "the inlet.", unit="kg/s")] = 0.1,
+        D: Annotated[float, ParamSpec("Port (throat) diameter setting the "
+                    "kinetic-energy correction area.", unit="m")] = 0.07,
+    ):
         self.medium = medium
         self.p_ambient = p_ambient
         self.T_ambient = T_ambient
@@ -151,12 +149,13 @@ class AmbientOutlet(Model):
         super().__init__()
 
     def declare_components(self):
-        self.add_component('p_ambient', Parameter(self.p_ambient, "Pa"))
-        self.add_component('T_ambient', Parameter(self.T_ambient, "K"))
+        spec = merged_param_specs(type(self))
+        self.add_component('p_ambient', Parameter(self.p_ambient, **spec['p_ambient'].param_kwargs()))
+        self.add_component('T_ambient', Parameter(self.T_ambient, **spec['T_ambient'].param_kwargs()))
         self.add_component('h_ambient', Parameter(self.medium.h_pT(self['p_ambient'].value, self['T_ambient'].value), "J/kg"))
         self.add_component('s_ambient', Parameter(self.medium.s_ph(self['p_ambient'].value, self['h_ambient'].value), "J/kg/K"))
-        self.add_component('m_flow', Parameter(self.m_flow, "kg/s"))
-        self.add_component('D', Parameter(self.D, "m"))
+        self.add_component('m_flow', Parameter(self.m_flow, **spec['m_flow'].param_kwargs()))
+        self.add_component('D', Parameter(self.D, **spec['D'].param_kwargs()))
         self.add_component('p_out', Variable(self.p_ambient * 0.99, "Pa"))
         self.add_component('h_out', Variable(self.medium.h_pT(self.p_ambient, self.T_ambient) * 0.99, "J/kg"))
         self.add_component('m_dot_out', Variable(self.m_flow, "kg/s"))
@@ -169,10 +168,6 @@ class AmbientOutlet(Model):
         ))
 
     def declare_equations(self):
-        # "Flow into me" sign convention: `m_dot_out` is positive when fluid
-        # enters through the boundary's out-face.  The user-facing `m_flow`
-        # remains "physical outflow rate" (positive forward), hence the `+`
-        # in both continuity and the m_dot<->w closure (see `AmbientInlet`).
         A = np.pi * self['D'].symbol ** 2 / 4
         eq1 = self['m_flow'].symbol + self['m_dot_out'].symbol
 
@@ -186,6 +181,47 @@ class AmbientOutlet(Model):
         eq3 = h_in - (self['h_out'].symbol + self['w_out'].symbol ** 2 / 2)
 
         return [eq1, eq_w, eq2, eq3]
+
+
+class ClosedEnd(Model):
+    """Dead-end / capped boundary: zero mass flow, pressure & enthalpy free.
+
+    Terminates a duct with a solid cap.  Imposes only `m_dot = 0` at the
+    boundary plane and lets the upstream component's momentum / energy balance
+    determine `(p, h)` there.  Use it to seal one end of a pressurised line so
+    the only mass leaving is whatever exits through other ports.
+
+    Port (the standard `(p, h, m_dot)` triple):
+        p_in, h_in, m_dot_in    - the capped face (m_dot pinned to zero)
+    """
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        p_init: Annotated[float, ParamSpec("Initial pressure guess at the "
+                         "capped face.", unit="Pa")] = 101325.0,
+        T_init: Annotated[float, ParamSpec("Initial temperature guess at the "
+                         "capped face.", unit="K")] = 293.15,
+    ):
+        self.medium = medium
+        self.p_init = p_init
+        self.T_init = T_init
+        self._h_init = float(medium.eval_h_pT(p_init, T_init))
+        super().__init__()
+
+    def declare_components(self):
+        self.add_component('p_in', Variable(self.p_init, "Pa"))
+        self.add_component('h_in', Variable(self._h_init, "J/kg"))
+        self.add_component('m_dot_in', Variable(0.0, "kg/s"))
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+
+    def declare_equations(self):
+        return [self['m_dot_in'].symbol] # m_dot_in = 0
 
 
 class TwoPortSegment(Model):
@@ -207,59 +243,83 @@ class TwoPortSegment(Model):
     velocities so the friction, momentum, kinetic-energy, and heat-transfer
     expressions can reference them as leaf SymPy symbols (lean lambdified
     code).  The link between them is a pair of closures
-    `m_dot = rho * w * A` per face, which the trivial-equation reducer
-    can NOT collapse (rho is a nonlinear function of `(p, h)`), so the
-    `w_in` / `w_out` symbols stay leaf-shaped through code generation.
-
-    Why both?  Putting `m_dot` on the port unifies mass-flow across joints
-    regardless of cross-sectional-area mismatch (`add_connection` of
-    velocities silently breaks mass conservation when areas differ).
-    Keeping `w` as a Variable (instead of a derived expression
-    `m_dot / (rho * A)` substituted everywhere) keeps the per-equation
-    expression tree shallow -- otherwise every `w` reference inflates to a
-    nested `m_dot / (rho_ph(p, h) * A)` chain, which both slows the trivial
-    reducer (chained substitutions through hundreds of equations) and
-    bloats the lambdified Jacobian (more CoolProp evaluations per non-zero).
+    `m_dot = rho * w * A` per face.
 
     `f_factor_func(Re, epsilon, Dh)` returns the friction factor symbolically.
+
     `q_inflow_func(w, p, h, rho, T, mu, k, fr, T_wall, Dh, area)` returns the
-    heat input rate.  The two trailing geometry arguments -- the hydraulic
-    diameter `Dh` and the convective surface area `area` of THIS segment -- are
-    passed in as SymPy expressions built from the segment's own geometry
-    `Parameter` symbols (NOT as Python floats from the parent).  This keeps the
-    heat term free of baked-in numeric literals, so the per-class
-    `declare_equations` template stays instance-invariant and cache-safe even
-    across pipes of different diameter / length.
+    heat input rate.
 
     Each of the seven geometry slots (`A_in`, `A_out`, `P_in`, `P_out`, `z_in`,
     `z_out`, `L`) may be passed either as a plain Python scalar OR as an
-    existing `Parameter` instance owned by a parent `Model`.  The
-    `Parameter(...)` constructor itself handles the dispatch (see
-    `Parameter.__new__`): a scalar produces a fresh local Parameter, an
-    existing Parameter produces a transparent `ParameterAlias` so two
-    sibling segments end up with the SAME SymPy symbol in their equations.
-    This is what lets `Model.remove_duplicate_equations` collapse the per-
-    face `m_dot = rho*A*w` closures across internal interfaces of a uniform
-    `StraightPipe`.
+    existing `Parameter` instance owned by a parent `Model`.
 
     Face thermodynamic properties (`T`, `rho`, `mu`, `k` at the in/out faces)
     are exposed as explicit algebraic Variables with closure equations
-    `rho_in - rho_ph(p_in, h_in) == 0` (etc.).  Materialising them as leaf
-    symbols serves two purposes:
-      1. The downstream momentum / energy / friction expressions reference
-         the leaves directly, so CoolProp calls appear in the residual
-         exactly four times per face (rho, T, mu, k) -- not once per use.
-      2. After `add_connection` unifies the upstream-face `(p, h)` of segment
-         k+1 with the downstream-face of segment k, the two segments' face
-         closures become structurally identical.  The iterated
-         `Model.remove_duplicate_equations` pass collapses them, leaving
-         one closure per *physical* interface rather than per *segment side*,
-         and likewise unifies the face Variables.  For a uniform N-segment
-         pipe that removes ~4*(N-1) CoolProp evaluations per Newton iteration.
+    `rho_in - rho_ph(p_in, h_in) == 0` (etc.).
+
+    There are three orthogonal (not affecting each other) interface toggles:
+    Switching these toggles invalidates the cached template equations.
+    `multiphase`:
+       - `single`: single-phase (rho, mu, k are functions of p and h).
+          Deals faster with single-phase flow. Does not handle boiling or flashing well.
+
+      - 'HEM': homogeneous equilibrium model (rho, mu, k are functions of p, h, and quality).
+        Handles boiling and flashing well. Leans on the line serach of Newton
+        solver to get the fast and reliable marching within dome region.
+     
+    `heat_port`:
+        - `True`: a `wall` `ThermalPort_TQ` is exposed, and the wall-temperature
+          is closed by the connected boundary which must be connected otherwize the system
+          is underdetermined and singular.
+        - `False`: adiabatic (T_wall = T_avg, q = 0).
+           The `ThermalPort_TQ` is removed and the segment is adiabatic.
+    `leaky`:
+        - `True`: a permeation `leak` port is exposed, and the leak mass-flow
+          is subtracted from continuity.
+        - `False`: the permeation `leak` port is removed and the segment is not leaky.
     """
 
-    def __init__(self, medium: CoolPropMedium, A_in, A_out, P_in, P_out, z_in, z_out, L, epsilon, f_factor_func, q_inflow_func):
+    #: Allowed values for the `multiphase` flag.
+    _MULTIPHASE_MODES = ("single", "HEM")
+
+    #: The two callables can't carry a meaningful scalar type annotation, so
+    #: their metadata stays here (merged with the Annotated specs below).
+    PARAMS = {
+        "f_factor_func": ParamSpec("Callable f(Re, epsilon, Dh) returning the "
+                                  "Darcy friction factor symbolically."),
+        "q_inflow_func": ParamSpec("Callable returning the radial heat input "
+                                  "rate symbolically."),
+    }
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        A_in: Annotated[float, ParamSpec("Inlet-face flow area.", unit="m^2",
+                       default=1e-3)],
+        A_out: Annotated[float, ParamSpec("Outlet-face flow area.", unit="m^2",
+                        default=1e-3)],
+        P_in: Annotated[float, ParamSpec("Inlet-face wetted perimeter "
+                       "(hydraulic diameter).", unit="m", default=0.1)],
+        P_out: Annotated[float, ParamSpec("Outlet-face wetted perimeter "
+                        "(hydraulic diameter).", unit="m", default=0.1)],
+        z_in: Annotated[float, _SPEC_Z_IN],
+        z_out: Annotated[float, _SPEC_Z_OUT],
+        L: Annotated[float, _SPEC_L],
+        epsilon: Annotated[float, _SPEC_EPSILON],
+        f_factor_func,
+        q_inflow_func,
+        multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
+        heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+    ):
         self.medium = medium
+        if multiphase not in self._MULTIPHASE_MODES:
+            raise ValueError(
+                f"multiphase must be one of {self._MULTIPHASE_MODES}, got {multiphase!r}")
+        self.multiphase = multiphase
+        self.heat_port = bool(heat_port)  # adds radial heat transfer term
+        self.leaky = bool(leaky)          # adds radial permeation mass-flow term
         self.A_in = A_in
         self.A_out = A_out
         self.P_in = P_in
@@ -270,13 +330,6 @@ class TwoPortSegment(Model):
         self.epsilon = epsilon
         self.f_factor_func = f_factor_func
         self.q_inflow_func = q_inflow_func
-        # Cache the standard-state property values used as initial guesses
-        # for the face-property Variables.  Computed once per segment via
-        # the medium's scalar `eval_*_ph` callbacks so each Variable starts
-        # the Newton solve at a physically reasonable order of magnitude
-        # (otherwise the very first `eval_residual` would see e.g. mu=1
-        # while the actual value is ~1e-5 -- enough to push the line-
-        # search step into ridiculous regions).
         h_std = float(medium.eval_h_pT(101325.0, 293.15))
         self._h_std = h_std
         self._rho_std = float(medium.eval_rho_ph(101325.0, h_std))
@@ -285,6 +338,7 @@ class TwoPortSegment(Model):
         super().__init__()
 
     def declare_components(self):
+        spec = merged_param_specs(type(self))
         self.add_component('p_in', Variable(101325, "Pa"))
         self.add_component('h_in', Variable(self._h_std, "J/kg"))
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
@@ -293,10 +347,6 @@ class TwoPortSegment(Model):
         self.add_component('h_out', Variable(self._h_std, "J/kg"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
         self.add_component('w_out', Variable(0.1, "m/s"))
-        # Face thermodynamic properties as leaf Variables.  See class
-        # docstring for the rationale; closure equations are declared in
-        # `declare_equations` and the iterated duplicate-equation pass
-        # collapses them across shared interfaces of adjacent segments.
         self.add_component('T_in',   Variable(293.15,         "K"))
         self.add_component('T_out',  Variable(293.15,         "K"))
         self.add_component('rho_in', Variable(self._rho_std,  "kg/m^3"))
@@ -305,31 +355,34 @@ class TwoPortSegment(Model):
         self.add_component('mu_out', Variable(self._mu_std,   "Pa*s"))
         self.add_component('k_in',   Variable(self._k_std,    "W/m/K"))
         self.add_component('k_out',  Variable(self._k_std,    "W/m/K"))
-        self.add_component('A_in', Parameter(self.A_in, "m^2"))
-        self.add_component('A_out', Parameter(self.A_out, "m^2"))
-        self.add_component('P_in', Parameter(self.P_in, "m"))
-        self.add_component('P_out', Parameter(self.P_out, "m"))
-        self.add_component('z_in', Parameter(self.z_in, "m"))
-        self.add_component('z_out', Parameter(self.z_out, "m"))
-        self.add_component('L', Parameter(self.L, "m"))
-        # Wall temperature seen by the convective heat term.  Always an
-        # algebraic Variable (not a fixed Parameter): in the base/adiabatic
-        # segment it is closed by the identity `T_wall = T_avg` (see
-        # `_wall_closure`), driving the convective delta-T -- and hence the
-        # heat -- to zero.  A `HeatedSegment` instead exposes a thermal port
-        # and lets an external wall/boundary set it (see `_declare_wall_interface`).
+        self.add_component('A_in', Parameter(self.A_in, **spec['A_in'].param_kwargs()))
+        self.add_component('A_out', Parameter(self.A_out, **spec['A_out'].param_kwargs()))
+        self.add_component('P_in', Parameter(self.P_in, **spec['P_in'].param_kwargs()))
+        self.add_component('P_out', Parameter(self.P_out, **spec['P_out'].param_kwargs()))
+        self.add_component('z_in', Parameter(self.z_in, **spec['z_in'].param_kwargs()))
+        self.add_component('z_out', Parameter(self.z_out, **spec['z_out'].param_kwargs()))
+        self.add_component('L', Parameter(self.L, **spec['L'].param_kwargs()))
         self.add_component('T_wall', Variable(293.15, "K"))
         self.add_component('q_inflow', Variable(0.0, "W"))
-        # Subclass hook: attach a thermal `wall` port (HeatedSegment) or do
-        # nothing (base = adiabatic).  Called here so the port binds to the
-        # `T_wall` / `q_inflow` Variables declared just above.
-        self._declare_wall_interface()
-        # Directional fluid ports.  BOTH faces use the Modelica "flow into
-        # me" convention -- positive m_dot means fluid entering the segment
-        # through that face -- so `flow_orientation='in'` on both, and the
-        # continuity equation `m_dot_in + m_dot_out == 0` (Kirchhoff on the
-        # CV) replaces the old axial-positive `m_dot_in - m_dot_out == 0`.
-        # See class docstring.
+
+        if self.heat_port: # expose port for radial heat transfer
+            self.add_port('wall', ThermalPort_TQ(
+                self,
+                channels={'T': self['T_wall'], 'Q_dot': self['q_inflow']},
+                flow_orientation='in',
+                require_connection=True,
+            ))
+
+        if self.leaky: # expose port for radial leak (e.g. permeation) mass-flow
+            self.add_component('m_dot_leak', Variable(0.0, "kg/s"))
+            self.add_port('leak', PermeationPort_pN(
+                self,
+                channels={'p_partial': self['p_in'], 'm_dot_leak': self['m_dot_leak']},
+                flow_orientation='in',
+                require_connection=True,
+            ))
+        
+        # Always expose both inlet and outlet ports.
         self.add_port('inlet', FluidPort_phm(
             self,
             channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
@@ -343,11 +396,30 @@ class TwoPortSegment(Model):
             medium=self.medium,
         ))
 
+    def _property_funcs(self):
+        """Return the `(T_ph, rho_ph, mu_ph, k_ph)` property callables for this
+        segment's `multiphase` mode.
+
+        * ``"single"`` -> the medium's plain CoolProp `(p, h)` properties.
+        * ``"HEM"``    -> the smooth homogeneous-equilibrium variants
+          (`*_ph_hem`): same values, but with smoothed, consistent partials so
+          the Jacobian stays well-conditioned through the saturation dome.
+        """
+        m = self.medium
+        if self.multiphase == "HEM":
+            try:
+                return m.T_ph_hem, m.rho_ph_hem, m.mu_ph_hem, m.k_ph_hem
+            except AttributeError as exc:
+                raise AttributeError(
+                    f"multiphase='HEM' requires a medium exposing *_ph_hem "
+                    f"property functions (e.g. CoolPropMedium); {type(m).__name__} "
+                    f"does not."
+                ) from exc
+        return m.T_ph, m.rho_ph, m.mu_ph, m.k_ph
+
     def declare_equations(self):
-        # Face properties as LEAF symbols.  Closure equations below bind
-        # each Variable to its CoolProp evaluation; everything downstream
-        # references the leaf so the residual / Jacobian see no CoolProp
-        # calls anywhere except in those 8 closures.
+        
+        # convenience local references for writing the equations:
         T_in    = self['T_in'].symbol
         T_out   = self['T_out'].symbol
         rho_in  = self['rho_in'].symbol
@@ -356,14 +428,12 @@ class TwoPortSegment(Model):
         mu_out  = self['mu_out'].symbol
         k_in    = self['k_in'].symbol
         k_out   = self['k_out'].symbol
-
-        # Local aliases -- leaf symbols only, so every reference below stays
-        # cheap to evaluate and cheap to differentiate.
         w_in = self['w_in'].symbol
         w_out = self['w_out'].symbol
         m_dot_in = self['m_dot_in'].symbol
         m_dot_out = self['m_dot_out'].symbol
 
+        # useful expressions for the equations:
         p_avg = (self['p_in'].symbol + self['p_out'].symbol) / 2
         h_avg = (self['h_in'].symbol + self['h_out'].symbol) / 2
         T_avg = (T_in + T_out) / 2
@@ -372,56 +442,27 @@ class TwoPortSegment(Model):
         k_avg = (k_in + k_out) / 2
         w_avg = (w_in + w_out) / 2
         A_avg = (self['A_in'].symbol + self['A_out'].symbol) / 2
-        # Axial-positive mass-flow average: under the "flow into me"
-        # convention `m_dot_out` measures fluid *entering* through the out-
-        # face (i.e. axially backward), so the forward-flow rate is
-        # `m_dot_in == -m_dot_out`.  After continuity collapses one of
-        # `{m_dot_in, m_dot_out}` via the trivial reducer (or via signed UF
-        # if the residual is routed through `add_connection`), this
-        # difference evaluates to the surviving leaf with axial orientation
-        # -- which is what every downstream momentum / energy term wants.
         m_dot_avg = (m_dot_in - m_dot_out) / 2
-
+        P_avg = (self['P_in'].symbol + self['P_out'].symbol) / 2
         Dh_in = 4 * self['A_in'].symbol / self['P_in'].symbol
         Dh_out = 4 * self['A_out'].symbol / self['P_out'].symbol
         Dh_avg = (Dh_in + Dh_out) / 2
-
         Re_avg = rho_avg * abs(w_avg) * Dh_avg / mu_avg
 
-        # Mass-flow continuity (Kirchhoff on the CV under "flow into me":
-        # net inflow sums to zero).  Linear in `m_dot_in, m_dot_out` with
-        # unit coefficients, so the trivial-equation reducer eliminates one
-        # leaf at instantiate time and the residual contributes nothing at
-        # runtime.
+        # Mass-flow continuity.
         eq_continuity = m_dot_in + m_dot_out
+        if self.leaky:
+            eq_continuity = eq_continuity + self['m_dot_leak'].symbol
 
-        # m_dot <-> w closures, one per face.  Nonlinear in (rho, w) so the
-        # trivial reducer leaves them alone -- which is exactly what we want
-        # so that `w_in` / `w_out` keep being leaf symbols in the heavy
-        # friction / momentum / energy expressions below.  When two sibling
-        # segments share their geometry Parameters (e.g. all segments of a
-        # `StraightPipe` referencing the same `A` symbol via
-        # `ParameterAlias`), the equation-deduplication pass run during
-        # `instantiate()` collapses `w_out(seg_k)` and `w_in(seg_{k+1})` to
-        # a single variable at every internal interface, dropping one
-        # equation per face.
-        #
-        # Sign of `w_out` term: `w_out` is the axial velocity (positive
-        # forward), but `m_dot_out` is "into me at out-face" (positive
-        # backward) -- opposite orientations.  So the closure carries a
-        # `+ rho*A*w_out` term (sum-to-zero), unlike the `- rho*A*w_in` on
-        # the inlet face where both quantities point inward.
+        # m_dot <-> w closures as equations 
+        # adds variables but these vars are used multiple times so it reduces
+        # complexity of many expresions -> simulations speeds up.
         eq_w_in = m_dot_in - rho_in * self['A_in'].symbol * w_in
         eq_w_out = m_dot_out + rho_out * self['A_out'].symbol * w_out
 
-        # Momentum.  `f_avg` is computed here (it also feeds the heat term
-        # below), but the actual pressure/flow RELATION is delegated to the
-        # `_momentum_eq` hook so subclasses can swap the physics without
-        # re-deriving continuity / energy / face closures.  The default hook
-        # is the distributed duct balance (friction + momentum flux +
-        # buoyancy); a `Valve` overrides it with a Kv flow law.  Splitting by
-        # CLASS (not an instance flag) keeps the per-class equation cache
-        # clean -- see the `_wall_closure` hook for the same pattern.
+        # Momentum conservation equation.
+        # Hook allows to resuse this class to implement different components
+        # (e.g. valves, pumps, etc.).
         f_avg = self.f_factor_func(Re_avg, self.epsilon, Dh_avg)
         eq_momentum = self._momentum_eq(
             p_in=self['p_in'].symbol, p_out=self['p_out'].symbol,
@@ -430,80 +471,53 @@ class TwoPortSegment(Model):
             m_dot_avg=m_dot_avg, f_avg=f_avg, Dh_avg=Dh_avg,
         )
 
-        # Energy.  `q` is the heat-transfer RATE into the fluid CV [W]
-        # (e.g. `alpha * A_surface * (T_wall - T)` for the convective pipe).
-        # Convective surface area of THIS segment = mean wetted perimeter x
-        # segment length, built from the segment's OWN geometry Parameter
-        # symbols (shared via `ParameterAlias` with the parent pipe).  Passing
-        # `Dh_avg` / `area_conv` as symbols -- rather than letting the injected
-        # `q_inflow_func` reach back into the parent's Python floats -- keeps
-        # the heat term literal-free and the cached template instance-invariant.
-        P_avg = (self['P_in'].symbol + self['P_out'].symbol) / 2
         area_conv = P_avg * self['L'].symbol
-        q = self.q_inflow_func(w_avg, p_avg, h_avg, rho_avg, T_avg, mu_avg, k_avg, f_avg, self['T_wall'].symbol, Dh_avg, area_conv)
-        # Steady CV energy balance.  The advected quantity is the SPECIFIC
-        # total enthalpy `h + w^2/2` [J/kg], so the wall heat must enter as a
-        # SPECIFIC term `q / m_dot` [J/kg] -- NOT as the raw power `q` [W]
-        # (the latter is dimensionally wrong and silently breaks energy
-        # conservation against a connected wall: the fluid would gain
-        # `m_dot * q` watts instead of `q`).  Writing it as `q / m_dot` makes
-        # the fluid gain exactly `m_dot * (q / m_dot) = q` watts, matching the
-        # heat the wall loses through the thermal port.
-        #
-        # `m_dot` is regularised to `sqrt(m_dot_avg^2 + m_eps^2)` so the
-        # division stays finite as the flow crosses zero; combined with the
-        # smoothed `sign_w` this credits the heat to the actual downstream
-        # port under either flow direction.  `w_eps` / `m_eps` keep the
-        # Jacobian smooth across zero-flow crossings (kinks otherwise hurt
-        # Newton convergence near startup / flow reversal); both sit well
-        # below realistic operating values.  For an adiabatic segment `q == 0`,
-        # so the whole term vanishes and this reduces to the classic
-        # `h + w^2/2` conservation (identical to the pre-heat-port model).
+
+        #TODO: comment this section.
+        q = self.q_inflow_func(
+            w_avg, p_avg, h_avg, rho_avg, T_avg, mu_avg, k_avg, 
+            f_avg, self['T_wall'].symbol, Dh_avg, area_conv
+        )
+        
+        # regularization to avoid division by zero
         w_eps = 1e-4
         m_eps = 1e-6
         sign_w = w_avg / sp.sqrt(w_avg ** 2 + w_eps ** 2)
         m_dot_reg = sp.sqrt(m_dot_avg ** 2 + m_eps ** 2)
         q_specific = sign_w * q / m_dot_reg
-        eq_energy = self['h_in'].symbol + w_in ** 2 / 2 + q_specific - (self['h_out'].symbol + w_out ** 2 / 2)
 
-        # `q_inflow` stays the raw magnitude of heat transfer (direction-
-        # independent) so users get a meaningful "wall heat input" diagnostic
-        # regardless of which way the fluid happens to be flowing.
+        # energy conservation equation
+        eq_energy = self['h_in'].symbol + w_in ** 2 / 2 + q_specific - (self['h_out'].symbol + w_out ** 2 / 2)
         eq_q_diag = self['q_inflow'].symbol - q
 
-        # Face-property closures.  Each is `leaf - X_ph(p, h) == 0`, i.e.
-        # linear in its dedicated leaf with a constant (= 1) coefficient
-        # and a (p, h)-only "rest" term.  Two adjacent segments meeting at
-        # an internal interface end up with structurally identical closures
-        # (after `add_connection` unifies (p, h) across the face and
-        # `_decompose` in the dedup pass picks the leaf as `var`); the
-        # iterated `Model.remove_duplicate_equations` then collapses the
-        # closure pair and unifies the two leaves.
+        # face property closures 
+        # adds variables but removes complexity at runtime -> simulations speeds up
         p_in_sym = self['p_in'].symbol
         p_out_sym = self['p_out'].symbol
         h_in_sym = self['h_in'].symbol
         h_out_sym = self['h_out'].symbol
-        eq_T_in    = T_in    - self.medium.T_ph(p_in_sym, h_in_sym)
-        eq_rho_in  = rho_in  - self.medium.rho_ph(p_in_sym, h_in_sym)
-        eq_mu_in   = mu_in   - self.medium.mu_ph(p_in_sym, h_in_sym)
-        eq_k_in    = k_in    - self.medium.k_ph(p_in_sym, h_in_sym)
-        eq_T_out   = T_out   - self.medium.T_ph(p_out_sym, h_out_sym)
-        eq_rho_out = rho_out - self.medium.rho_ph(p_out_sym, h_out_sym)
-        eq_mu_out  = mu_out  - self.medium.mu_ph(p_out_sym, h_out_sym)
-        eq_k_out   = k_out   - self.medium.k_ph(p_out_sym, h_out_sym)
+        T_ph, rho_ph, mu_ph, k_ph = self._property_funcs()
+        eq_T_in    = T_in    - T_ph(p_in_sym, h_in_sym)
+        eq_rho_in  = rho_in  - rho_ph(p_in_sym, h_in_sym)
+        eq_mu_in   = mu_in   - mu_ph(p_in_sym, h_in_sym)
+        eq_k_in    = k_in    - k_ph(p_in_sym, h_in_sym)
+        eq_T_out   = T_out   - T_ph(p_out_sym, h_out_sym)
+        eq_rho_out = rho_out - rho_ph(p_out_sym, h_out_sym)
+        eq_mu_out  = mu_out  - mu_ph(p_out_sym, h_out_sym)
+        eq_k_out   = k_out   - k_ph(p_out_sym, h_out_sym)
 
-        return [
+        # base set of equations (conservatoin + closures)
+        eqs = [
             eq_continuity, eq_w_in, eq_w_out, eq_momentum, eq_energy, eq_q_diag,
             eq_T_in,  eq_rho_in,  eq_mu_in,  eq_k_in,
             eq_T_out, eq_rho_out, eq_mu_out, eq_k_out,
-        ] + self._wall_closure()
+        ]
 
-    # --- wall-temperature interface (subclass hooks) ----------------------
-    #
-    # `T_wall` is always an algebraic Variable; these two hooks decide HOW it
-    # is closed, and they are split by CLASS (base vs `HeatedSegment`) rather
-    # than by an instance flag so the per-class `declare_equations` cache never
-    # sees two different equation structures under the same class.
+        # without heat port the wall temperature equals the mean fluid temperature
+        if not self.heat_port:
+            T_avg = (self['T_in'].symbol + self['T_out'].symbol) / 2
+            eqs.append(self['T_wall'].symbol - T_avg)
+        return eqs
 
     def _momentum_eq(self, *, p_in, p_out, A_in, A_out, A_avg, rho_avg,
                      w_in, w_out, w_avg, m_dot_avg, f_avg, Dh_avg):
@@ -525,21 +539,340 @@ class TwoPortSegment(Model):
         buoyancy_force = -G_const * (self['z_out'].symbol - self['z_in'].symbol) * A_avg * rho_avg
         return p_in * A_in - p_out * A_out - delta_P_friction * A_avg - momentum_flux + buoyancy_force
 
-    def _declare_wall_interface(self):
-        """Base/adiabatic segment: no external thermal interface."""
-        return None
+class StraightPipe(Model):
+    """1D pipe split into `n_segments` equal-length `TwoPortSegment`s with optional heat transfer and hydrogen permeation.
 
-    def _wall_closure(self):
-        """Base/adiabatic segment: close `T_wall` by tying it to the mean
-        fluid temperature (the temperature in the middle of the control
-        volume).  Because the convective law uses `T_wall - T_avg`, this also
-        drives the heat term to zero -- i.e. the base segment is adiabatic."""
-        T_wall = self['T_wall'].symbol
-        T_avg = (self['T_in'].symbol + self['T_out'].symbol) / 2
-        return [T_wall - T_avg]
+    Uses the Churchill correlation for the friction factor and a smoothed
+    Gnielinski / laminar Nusselt blend for the wall heat-transfer coefficient.
 
+    Two orthogonal segment interfaces are exposed via per-segment ports:
+
+      * `heat_port=True` -> a `wall` `ThermalPort_TQ` per segment, collected by
+        `segment_wall_ports` (conjugate heat transfer).
+      * `leaky=True`     -> a `leak` `PermeationPort_pN` per segment, collected
+        by `segment_leak_ports` (hydrogen permeation through the wall).  A
+        leaky pipe uses a zero-flow-robust Churchill friction so a dead-ended,
+        slowly-bleeding line (Re -> 0) stays well-conditioned.
+
+    A pipe may be heated, leaky, both, or neither.
+    """
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        D: Annotated[float, ParamSpec("Pipe bore (inner) diameter.", unit="m",
+                    default=0.01)],
+        L: Annotated[float, ParamSpec("Total pipe length.", unit="m",
+                    default=1.0)],
+        epsilon: Annotated[float, _SPEC_EPSILON],
+        z_in: Annotated[float, _SPEC_Z_IN],
+        z_out: Annotated[float, _SPEC_Z_OUT],
+        n_segments: Annotated[int, ParamSpec("Number of equal-length finite-"
+                             "volume segments (>= 1).", unit="1")] = 3,
+        heat_port: Annotated[bool, ParamSpec("If true, each segment exposes a "
+                            "thermal `wall` port for conjugate heat transfer.",
+                            structural=True)] = False,
+        adiabatic: Annotated[bool | None, ParamSpec("Deprecated legacy flag; "
+                            "use `heat_port` instead. None leaves it unset.")]
+                   = None,
+        multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
+        leaky: Annotated[bool, ParamSpec("If true, each segment exposes a "
+                        "permeation `leak` port.", structural=True)] = False,
+    ):
+        self.medium = medium
+        if multiphase not in TwoPortSegment._MULTIPHASE_MODES:
+            raise ValueError(
+                f"multiphase must be one of {TwoPortSegment._MULTIPHASE_MODES}, "
+                f"got {multiphase!r}")
+        if n_segments < 1:
+            raise ValueError(f"n_segments must be >= 1, got {n_segments!r}")
+        # Forwarded verbatim to every segment so the whole pipe shares one
+        # thermodynamic-property mode (see `TwoPortSegment.multiphase`).
+        self.multiphase = multiphase
+        self.D = D
+        self.L = L
+        self.epsilon = epsilon
+        self.z_in = z_in
+        self.z_out = z_out
+        self.n_segments = n_segments
+        # `heat_port` is the single switch for the segment thermal interface:
+        #   * False (default): each segment is a plain adiabatic `TwoPortSegment`
+        #     (T_wall = T_avg, q = 0); the pipe has no thermal connectivity.
+        #   * True: each segment is a heated `TwoPortSegment` exposing a `wall`
+        #     `ThermalPort_TQ`; the convective heat is driven by whatever is
+        #     wired to those ports (a `CylindricalWall`, a `FixedTemperature`,
+        #     ...).  Reproduce the old "convect to a fixed wall temperature"
+        #     behaviour by setting heat_port=True and connecting a
+        #     `FixedTemperature` to each segment wall port.
+        #
+        # `adiabatic` is the deprecated legacy flag.  It only ever toggled the
+        # heat source against a fixed 293.15 K `T_wall` Parameter, which has
+        # been removed; map it onto `heat_port` and warn.
+        if adiabatic is not None:
+            if adiabatic and heat_port:
+                raise ValueError(
+                    "StraightPipe: pass either the deprecated `adiabatic=` or the new "
+                    "`heat_port=`, not both."
+                )
+            if not adiabatic:
+                warnings.warn(
+                    "StraightPipe(adiabatic=False): the legacy fixed-293.15 K wall "
+                    "heating has been removed. Use heat_port=True and connect a thermal "
+                    "boundary (e.g. FixedTemperature) or a wall to each segment's `wall` "
+                    "port to model heat transfer.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            # adiabatic=True simply means "no heat port" == default.
+        self.heat_port = heat_port
+        # `leaky=True`: every segment exposes a gas-permeation `leak`
+        # `PermeationPort_pN` (collected via `segment_leak_ports`), so a parent
+        # wires each to its own leaky `CylindricalWall`.  Orthogonal to
+        # `heat_port` -- a pipe may be heated, leaky, both, or neither.
+        self.leaky = bool(leaky)
+        super().__init__()
+
+    def get_churchill_f_factor(self, Re, epsilon, D):
+        term1 = (8.0 / (Re + 1)) ** 12
+        A = (-2.457 * sp.log((7.0 / Re) ** 0.9 + 0.27 * epsilon / D)) ** 16
+        B = (37530.0 / (Re + 1)) ** 16
+        term2 = 1.0 / (A + B) ** 1.5
+        f = (term1 + term2) ** (1.0 / 12.0)
+        return f * 8
+
+    def get_churchill_f_factor_regularized(self, Re, epsilon, D):
+        # Churchill, but every `Re` in a denominator is `Re + 1` (including the
+        # log term, unlike `get_churchill_f_factor`).  This keeps the factor --
+        # and its Jacobian -- finite as the flow goes to zero (-> the laminar
+        # limit ~64), which is the operating point of a dead-ended, slowly
+        # leaking pipe (`leaky=True`).  At any non-trivial Re the two forms
+        # agree to well within a percent.
+        term1 = (8.0 / (Re + 1)) ** 12
+        A = (-2.457 * sp.log((7.0 / (Re + 1)) ** 0.9 + 0.27 * epsilon / D)) ** 16
+        B = (37530.0 / (Re + 1)) ** 16
+        term2 = 1.0 / (A + B) ** 1.5
+        return (term1 + term2) ** (1.0 / 12.0) * 8
+
+    def calculate_nu(self, Re, Pr, fr):
+        U = Re / 1000
+        if Re <= 2300:
+            return (fr / 8) * (Re - 1000) * Pr / (1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
+        if 2300 < Re <= 3100:
+            return 3.52 * U ** 4 - 45.148 * U ** 3 + 212.13 * U ** 2 - 427.45 * U + 316.08
+        return 3.66
+
+    def calculate_nu_smooth(self, Re, Pr, fr):
+        # `calculate_nu` smoothed via narrow transition windows so the symbolic system is
+        # differentiable across the laminar/transitional/turbulent boundaries.
+        U = Re / 1000
+        nu_1 = (fr / 8) * (Re - 1000) * Pr / (1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
+        nu_2 = 3.52 * U ** 4 - 45.148 * U ** 3 + 212.13 * U ** 2 - 427.45 * U + 316.08
+        nu_3 = 3.66
+        TRANSITION_WIDTH = 100
+        TRANSITION_CENTER_1 = 2250
+        TRANSITION_CENTER_2 = 3050
+        w1 = sp.Max(0.0, sp.Min(1.0, 1.0 - (Re - TRANSITION_CENTER_1) / TRANSITION_WIDTH))
+        w3 = sp.Max(0.0, sp.Min(1.0, (Re - TRANSITION_CENTER_2) / TRANSITION_WIDTH))
+        w2 = 1.0 - w1 - w3
+        return w1 * nu_1 + w2 * nu_2 + w3 * nu_3
+
+    def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
+        # `Dh` (hydraulic diameter; == D for a circular pipe) and `area` (the
+        # inner wetted surface of ONE segment, = mean perimeter x segment
+        # length) arrive as SymPy expressions built from the SEGMENT's own
+        # geometry Parameter symbols.  Using them -- instead of the parent
+        # pipe's Python floats `self.D` / `self.L` / `self.n_segments` --
+        # keeps this heat term free of baked-in literals, so the cached
+        # heated-segment template is instance-invariant across pipes of
+        # different diameter or length.  (`area` already accounts for the
+        # per-segment length, so there is no `n_segments` over-counting.)
+        Re = w * Dh * rho / mu
+        Pr = mu * rho / k
+        nu = self.calculate_nu_smooth(Re, Pr, fr)
+        alpha = nu * k / Dh
+        return alpha * area * (T_wall - T)
+
+    def get_q_inflow_adiabatic(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
+        return 0.0
+
+    def declare_components(self):
+        # Pipe-level constitutive Parameters.  Hoisting these out of the
+        # per-segment `TwoPortSegment`s and passing them down as shared
+        # `Parameter` references is what makes every segment's equations
+        # reference the SAME SymPy symbols for area, perimeter, and segment
+        # length -- a precondition for `Model.remove_duplicate_equations`
+        # to recognise the per-face `m_dot = rho*A*w` closures of adjacent
+        # segments as structurally identical (apart from a single `w` leaf)
+        # and collapse them.
+        spec = merged_param_specs(type(self))
+        self.add_component('D', Parameter(self.D, **spec['D'].param_kwargs()))
+        self.add_component('L', Parameter(self.L, **spec['L'].param_kwargs()))
+        self.add_component('epsilon', Parameter(self.epsilon, **spec['epsilon'].param_kwargs()))
+        self.add_component('z_in', Parameter(self.z_in, **spec['z_in'].param_kwargs()))
+        self.add_component('z_out', Parameter(self.z_out, **spec['z_out'].param_kwargs()))
+        # Derived shared geometry.  We register them as their own Parameters
+        # (rather than building `pi*D**2/4` as a SymPy expression every time
+        # a segment references it) because Parameter symbols are flat
+        # leaves: the per-segment friction / momentum / energy expression
+        # trees stay shallow, and the equation-dedup signature comparison
+        # is a single-symbol hash rather than a full subtree walk.
+        A_value = np.pi * self.D ** 2 / 4
+        P_value = np.pi * self.D
+        L_segment_value = self.L / self.n_segments
+        self.add_component('A', Parameter(A_value, "m^2"))
+        self.add_component('P', Parameter(P_value, "m"))
+        self.add_component('L_segment', Parameter(L_segment_value, "m"))
+
+        # Pipe-level port Variables.
+        self.add_component('p_in', Variable(101325, "Pa"))
+        self.add_component('h_in', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
+        self.add_component('m_dot_in', Variable(0.0, "kg/s"))
+        self.add_component('p_out', Variable(101325, "Pa"))
+        self.add_component('h_out', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
+        self.add_component('m_dot_out', Variable(0.0, "kg/s"))
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+
+        # `N+1` axial stations shared between adjacent segments: segment `k`'s
+        # `z_out` and segment `k+1`'s `z_in` reference the same `Parameter`.
+        # Not strictly required for the dedup pass to fire on the face
+        # closures (which don't depend on `z`), but it halves the elevation-
+        # Parameter inventory of a pipe and keeps a single source of truth
+        # for each interface elevation.
+        dz = (self.z_out - self.z_in) / self.n_segments
+        for j in range(self.n_segments + 1):
+            self.add_component(f'z_{j}', Parameter(self.z_in + j * dz, "m"))
+
+        A_param = self['A']
+        P_param = self['P']
+        L_seg_param = self['L_segment']
+        # `heat_port` is a per-segment flag on `TwoPortSegment` (registered in
+        # its `_cache_key_flags`, so the per-class equation cache stays correct
+        # in models mixing heated and adiabatic pipes).  It selects the
+        # wall-temperature closure; the convective heat CORRELATION is injected
+        # separately via `q_inflow_func` (zero heat when adiabatic).
+        q_f = self.get_q_inflow if self.heat_port else self.get_q_inflow_adiabatic
+        # A leaky pipe is typically dead-ended and bleeds at near-zero flow, so
+        # use the zero-flow-robust Churchill (regularised log term) to keep the
+        # friction Jacobian finite as Re -> 0.
+        fr_f = (self.get_churchill_f_factor_regularized if self.leaky
+                else self.get_churchill_f_factor)
+        for i in range(self.n_segments):
+            self.add_component(
+                f'pipe_segment_{i}',
+                TwoPortSegment(
+                    self.medium,
+                    A_in=A_param, A_out=A_param,
+                    P_in=P_param, P_out=P_param,
+                    z_in=self[f'z_{i}'], z_out=self[f'z_{i + 1}'],
+                    L=L_seg_param,
+                    epsilon=self.epsilon,
+                    f_factor_func=fr_f,
+                    q_inflow_func=q_f,
+                    multiphase=self.multiphase,
+                    heat_port=self.heat_port,
+                    leaky=self.leaky,
+                ),
+            )
+
+    def declare_equations(self):
+        # Wire the pipe-level (p, h, m_dot)_in/out ports to the matching ports of
+        # the first / last segment.  Using `segment_0.{h,m_dot}_in` (rather than
+        # `_out`) is important: the inlet ports of the pipe must represent the
+        # axial station at the actual pipe entrance, otherwise upstream
+        # connections (a `Splitter`, another pipe, a vessel) compare values
+        # across mismatched stations and the resulting "mass conservation"
+        # through the wiring is off by the small frictional density change
+        # across the first segment.
+        #
+        # All of these are pure variable-equality constraints, so we route them
+        # through `add_connection` (union-find at instantiate time) rather than
+        # building a sympy `Add` per pair and letting the trivial reducer eat them.
+        for port in ('p_in', 'h_in', 'm_dot_in'):
+            self.add_connection(self[port], self['pipe_segment_0'][port])
+        # Inter-segment wiring.  We deliberately do NOT union `w` between
+        # adjacent segments via `add_connection`: each segment owns a pair
+        # of closure equations `m_dot = rho * A * w` (one per face), and at
+        # an internal interface both equations reduce to the same statement
+        # after `(p, h, m_dot)` are unioned -- collapsing the two `w`
+        # symbols via `add_connection` would leave the system over-
+        # determined by one equation per shared face.
+        #
+        # Instead, `Model.remove_duplicate_equations` (run during
+        # `instantiate()`, controlled by the same-named flag) detects the
+        # two face closures as structurally identical apart from their `w`
+        # leaf and unifies them -- removing both the redundant `w` symbol
+        # AND its closure equation per internal interface (`N - 1`
+        # eliminations per pipe).  For this to fire, both segments must
+        # reference the SAME SymPy symbols for area / perimeter /
+        # segment-length, which is exactly what `declare_components` above
+        # wires up via shared `A` / `P` / `L_segment` Parameters.
+        # Under "flow into me", the m_dot at seg_i's out-face and seg_{i+1}'s
+        # in-face describe the same physical interface but from opposite
+        # control volumes (each measures fluid flowing INTO its own
+        # component) -- they're equal in magnitude with opposite sign, so
+        # we route the m_dot wire through signed UF (`sign=-1`) while p
+        # and h stay direct (across variables -- the face's pressure and
+        # enthalpy are single-valued regardless of which side looks at it).
+        for i in range(self.n_segments - 1):
+            self.add_connection(
+                self[f'pipe_segment_{i}']['p_out'],
+                self[f'pipe_segment_{i + 1}']['p_in'],
+            )
+            self.add_connection(
+                self[f'pipe_segment_{i}']['h_out'],
+                self[f'pipe_segment_{i + 1}']['h_in'],
+            )
+            self.add_connection(
+                self[f'pipe_segment_{i}']['m_dot_out'],
+                self[f'pipe_segment_{i + 1}']['m_dot_in'],
+                sign=-1,
+            )
+        last = f'pipe_segment_{self.n_segments - 1}'
+        for port in ('p_out', 'h_out', 'm_dot_out'):
+            self.add_connection(self[port], self[last][port])
+        return []
+
+    @property
+    def segment_wall_ports(self):
+        """List of the per-segment `wall` `ThermalPort_TQ` (only when
+        `heat_port=True`).  A parent model connects these to walls/boundaries,
+        e.g. `self.connect(pipe.segment_wall_ports[i], wall_i.ports['port_a'])`.
+        """
+        if not self.heat_port:
+            raise AttributeError(
+                "StraightPipe was built with heat_port=False; it has no segment "
+                "wall ports. Pass heat_port=True to expose them."
+            )
+        return [self[f'pipe_segment_{i}'].ports['wall'] for i in range(self.n_segments)]
+
+    @property
+    def segment_leak_ports(self):
+        """List of the per-segment `leak` `PermeationPort_pN` (only when
+        `leaky=True`).  A parent model wires each to a permeable wall's inner
+        surface, e.g.
+        `self.connect(pipe.segment_leak_ports[i], wall_i.ports['leak_a'])`.
+        """
+        if not self.leaky:
+            raise AttributeError(
+                "StraightPipe was built with leaky=False; it has no segment "
+                "leak ports. Pass leaky=True to expose them."
+            )
+        return [self[f'pipe_segment_{i}'].ports['leak'] for i in range(self.n_segments)]
 
 class AdiabaticPump(TwoPortSegment):
+    #TODO: make it into real pupm with a real friction
+    # model and make the izoentropic case a special case of real pump.
     """Adiabatic pump segment using a custom friction model `f = a_iz / (Re*Dh)`."""
 
     def __init__(self, medium: CoolPropMedium, A_in, A_out, P_in, P_out, z_in, z_out):
@@ -555,46 +888,6 @@ class AdiabaticPump(TwoPortSegment):
     def declare_components(self):
         super().declare_components()
         self.add_component('a_iz', Variable(0.0, "W"))
-
-
-class HeatedSegment(TwoPortSegment):
-    """`TwoPortSegment` that exchanges heat with an external wall/boundary
-    through a `ThermalPort_TQ`, instead of being adiabatic.
-
-    The convective heat RATE `q` returned by `q_inflow_func` (e.g.
-    `alpha * A_surface * (T_wall - T)` for a pipe) is published on a `wall`
-    port:
-
-        * across channel `T`     = `T_wall`   (set by whatever is connected)
-        * flow   channel `Q_dot` = `q_inflow` (= q, heat INTO the fluid [W])
-
-    Connecting `wall` to a `CylindricalWall.port_a` gives conjugate heat
-    transfer; connecting it to a `FixedTemperature` reproduces a prescribed
-    wall temperature.  Either way the across-equality closes `T_wall` and the
-    same-orientation sum-to-zero makes the partner absorb `-q`, so energy is
-    conserved across the interface (the fluid's energy balance adds exactly
-    `q` watts -- see `TwoPortSegment.declare_equations`).
-
-    The port is declared `require_connection=True`: an open `wall` port leaves
-    `T_wall` unclosed (singular system), so `instantiate()` warns about it.
-
-    Realised as a distinct class (rather than a flag on `TwoPortSegment`) so
-    the per-class equation cache never sees two different equation structures
-    -- adiabatic (with the `T_wall = T_avg` closure) vs heated (without it) --
-    under one class, which would mis-replay in a model mixing both.
-    """
-
-    def _declare_wall_interface(self):
-        self.add_port('wall', ThermalPort_TQ(
-            self,
-            channels={'T': self['T_wall'], 'Q_dot': self['q_inflow']},
-            flow_orientation='in',
-            require_connection=True,
-        ))
-
-    def _wall_closure(self):
-        # Closed externally via the `wall` port connection; no internal eq.
-        return []
 
 
 class Valve(TwoPortSegment):
@@ -621,8 +914,20 @@ class Valve(TwoPortSegment):
     mass flow [kg/s] for pressure drop ``dp = p_in - p_out``).
     """
 
-    def __init__(self, medium: CoolPropMedium, D, opening=1.0,
-                 z_in=0.0, z_out=0.0, dp_eps=1.0):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        D: Annotated[float, ParamSpec("Connecting diameter setting the "
+                    "m_dot = rho*A*w flow area.", unit="m", default=0.01)],
+        opening: Annotated[float, ParamSpec("Initial opening fraction (0 = "
+                          "shut, 1 = full open); driven at runtime by the "
+                          "`opening` signal port.")] = 1.0,
+        z_in=0.0,
+        z_out=0.0,
+        dp_eps: Annotated[float, ParamSpec("Pressure-drop regulariser keeping "
+                         "the sign*sqrt(|dp|) flow law smooth through dp = 0.",
+                         unit="Pa")] = 1.0,
+    ):
         A = float(np.pi * D ** 2 / 4.0)
         P = float(np.pi * D)
         # Store the constructor scalars under their own names so the reflective
@@ -648,7 +953,8 @@ class Valve(TwoPortSegment):
         # sign*sqrt(|dp|) flow law.  Both are leaf symbols, so the valve's
         # equation template stays instance-invariant / cache-safe.
         self.add_component('opening', Variable(self.opening, "-"))
-        self.add_component('dp_eps', Parameter(self.dp_eps, "Pa"))
+        self.add_component('dp_eps', Parameter(self.dp_eps,
+                                               **merged_param_specs(type(self))['dp_eps'].param_kwargs()))
         self.add_port('opening', RealSignal.as_input(
             self, self['opening'], name='opening'))
 
@@ -675,15 +981,22 @@ class IncompressibleValve(Valve):
     ``dp = 0`` (flow reversal).
     """
 
-    def __init__(self, medium: CoolPropMedium, Kv, D, opening=1.0,
-                 z_in=0.0, z_out=0.0, dp_eps=1.0):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        Kv: Annotated[float, ParamSpec("Metric flow coefficient (m^3/h of "
+                     "water at 1 bar pressure drop).", unit="m^3/h",
+                     default=1.0)],
+        D, opening=1.0, z_in=0.0, z_out=0.0, dp_eps=1.0,
+    ):
         self.Kv = Kv
         super().__init__(medium, D, opening=opening, z_in=z_in, z_out=z_out,
                          dp_eps=dp_eps)
 
     def declare_components(self):
         super().declare_components()
-        self.add_component('Kv', Parameter(self.Kv, "m^3/h"))
+        self.add_component('Kv', Parameter(self.Kv,
+                                           **merged_param_specs(type(self))['Kv'].param_kwargs()))
 
     def _valve_flow(self, dp, rho_avg, theta):
         C = self['Kv'].symbol / 36000.0
@@ -710,8 +1023,33 @@ class CompressibleValve(Valve):
     choking.  ``p_eps`` sets the smoothing scale on pressures.
     """
 
-    def __init__(self, medium: CoolPropMedium, Kv, D, xT=0.7, gamma=1.4,
-                 opening=1.0, z_in=0.0, z_out=0.0, dp_eps=1.0, p_eps=1.0):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        Kv: Annotated[float, ParamSpec("Metric flow coefficient (m^3/h of "
+                     "water at 1 bar pressure drop).", unit="m^3/h",
+                     default=1.0)],
+        D: Annotated[float, ParamSpec("Connecting diameter setting the "
+                    "m_dot = rho*A*w flow area.", unit="m", default=0.01)],
+        xT: Annotated[float, ParamSpec("Pressure-differential-ratio factor "
+                     "(~0.7 for many globe valves); sets the choke point.",
+                     unit="1")] = 0.7,
+        gamma: Annotated[float, ParamSpec("Gas specific-heat ratio cp/cv.",
+                        unit="1")] = 1.4,
+        opening: Annotated[float, ParamSpec("Initial opening fraction (0 = "
+                          "shut, 1 = full open); driven at runtime by the "
+                          "`opening` signal port.")] = 1.0,
+        z_in: Annotated[float, ParamSpec("Elevation of the inlet face.",
+                       unit="m")] = 0.0,
+        z_out: Annotated[float, ParamSpec("Elevation of the outlet face.",
+                        unit="m")] = 0.0,
+        dp_eps: Annotated[float, ParamSpec("Pressure-drop regulariser keeping "
+                         "the sign*sqrt(|dp|) flow law smooth through dp = 0.",
+                         unit="Pa")] = 1.0,
+        p_eps: Annotated[float, ParamSpec("Smoothing scale on pressures for "
+                        "the smooth min/max upstream selection and choke "
+                        "clamp.", unit="Pa")] = 1.0,
+    ):
         self.Kv = Kv
         self.xT = xT
         self.gamma = gamma
@@ -721,10 +1059,11 @@ class CompressibleValve(Valve):
 
     def declare_components(self):
         super().declare_components()
-        self.add_component('Kv', Parameter(self.Kv, "m^3/h"))
-        self.add_component('xT', Parameter(self.xT, "-"))
-        self.add_component('gamma', Parameter(self.gamma, "-"))
-        self.add_component('p_eps', Parameter(self.p_eps, "Pa"))
+        spec = merged_param_specs(type(self))
+        self.add_component('Kv', Parameter(self.Kv, **spec['Kv'].param_kwargs()))
+        self.add_component('xT', Parameter(self.xT, **spec['xT'].param_kwargs()))
+        self.add_component('gamma', Parameter(self.gamma, **spec['gamma'].param_kwargs()))
+        self.add_component('p_eps', Parameter(self.p_eps, **spec['p_eps'].param_kwargs()))
 
     def _valve_flow(self, dp, rho_avg, theta):
         Kv = self['Kv'].symbol
@@ -776,7 +1115,14 @@ class PressureOutlet(Model):
         p_in, h_in, m_dot_in    - external connection inputs (driven by upstream)
     """
 
-    def __init__(self, medium: CoolPropMedium, p_ambient=101325.0, T_ambient=293.15):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        p_ambient: Annotated[float, ParamSpec("Imposed outlet (sink) "
+                            "pressure.", unit="Pa")] = 101325.0,
+        T_ambient: Annotated[float, ParamSpec("Sink temperature (sets the "
+                            "initial enthalpy guess).", unit="K")] = 293.15,
+    ):
         self.medium = medium
         self.p_ambient = p_ambient
         self.T_ambient = T_ambient
@@ -784,7 +1130,8 @@ class PressureOutlet(Model):
         super().__init__()
 
     def declare_components(self):
-        self.add_component('p_ambient', Parameter(self.p_ambient, "Pa"))
+        self.add_component('p_ambient', Parameter(self.p_ambient,
+                                                  **merged_param_specs(type(self))['p_ambient'].param_kwargs()))
         self.add_component('p_in', Variable(self.p_ambient, "Pa"))
         self.add_component('h_in', Variable(self._h_ambient, "J/kg"))
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
@@ -821,7 +1168,12 @@ class Splitter(Model):
     anything about port areas -- mass-flow conservation is geometry-free.
     """
 
-    def __init__(self, medium: CoolPropMedium, K):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        K: Annotated[int, ParamSpec("Number of outlet branches.", unit="1",
+                    default=2)],
+    ):
         self.medium = medium
         self.K = K
         self._h_init = float(medium.eval_h_pT(101325.0, 293.15))
@@ -877,8 +1229,16 @@ class PressureSource(Model):
         s(p_out, h_out) = s_total                         (isentropic acceleration)
         h_total         = h_out + (m_dot_out / (rho * A))**2 / 2   (steady energy balance)
 
-    where `h_total = h(p_source, T_source)` and `s_total = s(p_source, h_total)`. The
-    third closure (`p_out`) comes from whatever this source is wired into downstream.
+    The only boundary *parameters* are the reservoir state `(p_source, T_source)`;
+    the stagnation enthalpy / entropy are not free inputs but *computed* from them
+    by two closure equations:
+
+        h_total = h(p_source, T_source)
+        s_total = s(p_source, h_total)
+
+    so a caller slides the operating point by setting `p_source` (and `T_source`)
+    alone — the solver keeps `h_total` / `s_total` consistent.  The third closure
+    (`p_out`) comes from whatever this source is wired into downstream.
     Use this when you want flow to be driven by a pressure differential — e.g. filling
     a vessel from a pressurised line: as the vessel back-pressure rises the inlet
     velocity naturally decays toward zero.
@@ -889,25 +1249,61 @@ class PressureSource(Model):
     into; for low-Mach flows the answer is barely sensitive to the exact value
     because the KE correction is typically <1% of the stagnation pressure.
 
+    `p_control`:
+        - `False` (default): `p_source` is a `Parameter` the caller sets
+          directly (e.g. ``src["p_source"].set_value(...)``).
+        - `True`: `p_source` becomes an algebraic `Variable` exposed on a
+          `RealSignal` INPUT port named ``p_set``, so a control block drives the
+          supply pressure: wire a `control.Ramp` to pressurise over time, a
+          `control.Constant` for a fixed value, or a `control.PID` for
+          closed-loop control.  The port is ``require_connection=True`` -- an
+          unconnected ``p_set`` leaves the supply pressure unclosed (singular
+          system), which `instantiate()` flags by name.
+
     Port (matches the (p, h, m_dot) convention used everywhere):
         p_out, h_out, m_dot_out    - drives the downstream component
+        p_set (signal, if `p_control`) - commanded supply pressure [Pa]
     """
 
-    def __init__(self, medium: CoolPropMedium, p_source=101325, T_source=293.15, A=1e-3):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        p_source: Annotated[float, ParamSpec("Reservoir (stagnation) supply "
+                           "pressure.", unit="Pa")] = 101325,
+        T_source: Annotated[float, ParamSpec("Reservoir (stagnation) "
+                           "temperature.", unit="K")] = 293.15,
+        A: Annotated[float, ParamSpec("Cross-sectional area of the boundary "
+                    "plane (kinetic-energy term); set to the downstream port "
+                    "area.", unit="m^2")] = 1e-3,
+        p_control: Annotated[bool, ParamSpec("If true, expose `p_source` on a "
+                            "`p_set` signal input so a control block drives "
+                            "the supply pressure; if false it is a fixed "
+                            "parameter.", structural=True)] = False,
+    ):
         self.medium = medium
         self.p_source = p_source
         self.T_source = T_source
         self.A = A
+        self.p_control = bool(p_control)
         self._h_total = float(medium.eval_h_pT(p_source, T_source))
         self._s_total = float(medium.eval_s_ph(p_source, self._h_total))
         super().__init__()
 
     def declare_components(self):
-        self.add_component('p_source', Parameter(self.p_source, "Pa"))
-        self.add_component('T_source', Parameter(self.T_source, "K"))
-        self.add_component('h_total', Parameter(self._h_total, "J/kg"))
-        self.add_component('s_total', Parameter(self._s_total, "J/kg/K"))
-        self.add_component('A', Parameter(self.A, "m^2"))
+        spec = merged_param_specs(type(self))
+        if self.p_control:
+            # Supply pressure driven by an external signal (e.g. a control.Ramp).
+            self.add_component('p_source', Variable(self.p_source, "Pa"))
+            self.add_port('p_set', RealSignal.as_input(
+                self, self['p_source'], name='p_set'))
+        else:
+            self.add_component('p_source', Parameter(self.p_source, **spec['p_source'].param_kwargs()))
+        self.add_component('T_source', Parameter(self.T_source, **spec['T_source'].param_kwargs()))
+        self.add_component('A', Parameter(self.A, **spec['A'].param_kwargs()))
+        # Stagnation enthalpy / entropy are *computed* from (p_source, T_source)
+        # by the closure equations below; these values are only initial guesses.
+        self.add_component('h_total', Variable(self._h_total, "J/kg"))
+        self.add_component('s_total', Variable(self._s_total, "J/kg/K"))
         # Initial guesses near the stagnation state - downstream pulls them off-stagnation.
         self.add_component('p_out', Variable(self.p_source, "Pa"))
         self.add_component('h_out', Variable(self._h_total, "J/kg"))
@@ -924,6 +1320,8 @@ class PressureSource(Model):
         ))
 
     def declare_equations(self):
+        p_src = self['p_source'].symbol
+        T_src = self['T_source'].symbol
         h_total = self['h_total'].symbol
         s_total = self['s_total'].symbol
         s_out = self.medium.s_ph(self['p_out'].symbol, self['h_out'].symbol)
@@ -936,7 +1334,11 @@ class PressureSource(Model):
         eq_w = self['m_dot_out'].symbol + rho_out * self['w_out'].symbol * self['A'].symbol
         eq_isentropic = s_total - s_out
         eq_energy = h_total - (self['h_out'].symbol + self['w_out'].symbol ** 2 / 2)
-        return [eq_w, eq_isentropic, eq_energy]
+        # Stagnation state is fixed by the reservoir (p_source, T_source), so the
+        # caller only sets pressure/temperature; h_total / s_total follow.
+        eq_h_total = h_total - self.medium.h_pT(p_src, T_src)
+        eq_s_total = s_total - self.medium.s_ph(p_src, h_total)
+        return [eq_w, eq_isentropic, eq_energy, eq_h_total, eq_s_total]
 
 
 class PressureVessel(Model):
@@ -962,6 +1364,19 @@ class PressureVessel(Model):
         U    = m*h - p*V                                    (since u = h - p/rho, m/rho = V)
         p_in = p                                            (no port-throttling)
 
+    `leaky`:
+        - `True`: a permeation `leak` `PermeationPort_pN` is exposed and its
+          mass-flow enters the mass/energy balance:
+
+              dm/dt = m_dot_in + m_dot_leak
+              dU/dt = m_dot_in*h_in + m_dot_leak*h    (leaked mass carries h)
+
+          Under "flow into me" permeation makes `m_dot_leak < 0` (gas leaves the
+          volume), so the vessel slowly loses mass to a wall while an upstream
+          source makes it up.  The leak port publishes the vessel pressure `p`
+          as the partial pressure (pure-gas assumption).
+        - `False` (default): the `leak` port is removed; the vessel is sealed.
+
     Notes / simplifications:
       * Rigid wall (V constant), no heat loss, no shaft work, no outflow.
       * Inflow kinetic energy is neglected.  For typical vessel-filling regimes
@@ -973,12 +1388,27 @@ class PressureVessel(Model):
         true outflow enthalpy (you'd need an upwinding switch on `h_in <-> h`).
     """
 
-    def __init__(self, medium: CoolPropMedium, V, A_in, p_init=101325.0, T_init=293.15):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        V: Annotated[float, ParamSpec("Internal control volume of the "
+                    "vessel.", unit="m^3", default=0.001)],
+        A_in: Annotated[float, ParamSpec("Inlet port area (used if inflow "
+                       "kinetic energy is added).", unit="m^2", default=1e-3)],
+        p_init: Annotated[float, ParamSpec("Initial vessel pressure.",
+                         unit="Pa")] = 101325.0,
+        T_init: Annotated[float, ParamSpec("Initial vessel temperature.",
+                         unit="K")] = 293.15,
+        leaky: Annotated[bool, ParamSpec("If true, expose a permeation `leak` "
+                        "port that feeds the mass / energy balance; if false "
+                        "the vessel is sealed.", structural=True)] = False,
+    ):
         self.medium = medium
         self.V = V
         self.A_in = A_in
         self.p_init = p_init
         self.T_init = T_init
+        self.leaky = bool(leaky)
         # Pre-compute thermodynamically consistent initial conditions so the t=0 Newton
         # solve starts near a converged state.
         self.h_init = float(medium.eval_h_pT(p_init, T_init))
@@ -988,8 +1418,9 @@ class PressureVessel(Model):
         super().__init__()
 
     def declare_components(self):
-        self.add_component('V', Parameter(self.V, "m^3"))
-        self.add_component('A_in', Parameter(self.A_in, "m^2"))
+        spec = merged_param_specs(type(self))
+        self.add_component('V', Parameter(self.V, **spec['V'].param_kwargs()))
+        self.add_component('A_in', Parameter(self.A_in, **spec['A_in'].param_kwargs()))
 
         # Differential states (auto-attaches `der_m`, `der_U` companions).
         self.add_component('m', DifferentialVariable(self.m_init, "kg"))
@@ -1010,6 +1441,15 @@ class PressureVessel(Model):
             medium=self.medium,
         ))
 
+        if self.leaky:  # expose a permeation leak port (publishes vessel p)
+            self.add_component('m_dot_leak', Variable(0.0, "kg/s"))
+            self.add_port('leak', PermeationPort_pN(
+                self,
+                channels={'p_partial': self['p'], 'm_dot_leak': self['m_dot_leak']},
+                flow_orientation='in',
+                require_connection=True,
+            ))
+
     def declare_equations(self):
         m = self['m'].symbol
         U = self['U'].symbol
@@ -1025,10 +1465,14 @@ class PressureVessel(Model):
         # -- no density/area product needed.
         m_in_dot = self['m_dot_in'].symbol
 
-        # Continuity: m grows at the inflow mass rate.
-        eq_mass = self['der_m'].symbol - m_in_dot
-        # Energy: adiabatic open system with inflow enthalpy (KE neglected).
-        eq_energy = self['der_U'].symbol - m_in_dot * h_in
+        # A leaky vessel also gains/loses mass (and its carried enthalpy)
+        # through the permeation port; `m_dot_leak < 0` when gas permeates out.
+        m_leak = self['m_dot_leak'].symbol if self.leaky else 0
+
+        # Continuity: m grows at the inflow + leak mass rate.
+        eq_mass = self['der_m'].symbol - (m_in_dot + m_leak)
+        # Energy: adiabatic open system; inflow and leaked mass carry enthalpy.
+        eq_energy = self['der_U'].symbol - (m_in_dot * h_in + m_leak * h)
 
         # Algebraic closure linking (m, U) to (p, h) via the equation of state.
         eq_density = m - rho * V
@@ -1187,11 +1631,29 @@ class MixingJunction(Model):
     # quasi-static junctions correct.  (This class also emits `add_connection`
     # side effects, which already routes it to the 'no-cache' path -- but the
     # key is declared defensively so correctness never relies on that.)
-    _cache_key_flags = ("dynamic",)
-
-    def __init__(self, medium: CoolPropMedium, N, V=None,
-                 p_init=101325.0, T_init=293.15,
-                 m_dot_eps=1e-6, dynamic=True, h_anchor_strength=None):
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        N: Annotated[int, ParamSpec("Number of ports (>= 2).", unit="1",
+                    default=2)],
+        V: Annotated[float | None, ParamSpec("Control volume (required for "
+                    "dynamic=True storage; None for the algebraic mixer).",
+                    unit="m^3")] = None,
+        p_init: Annotated[float, ParamSpec("Initial junction pressure.",
+                         unit="Pa")] = 101325.0,
+        T_init: Annotated[float, ParamSpec("Initial junction temperature.",
+                         unit="K")] = 293.15,
+        m_dot_eps: Annotated[float, ParamSpec("Smoothing scale of the donor-"
+                            "cell direction switch (smaller = sharper but "
+                            "stiffer).", unit="kg/s")] = 1e-6,
+        dynamic: Annotated[bool, ParamSpec("If true, mass and internal energy "
+                          "are differential storage states; if false a purely "
+                          "algebraic ideal mixer.", structural=True)] = True,
+        h_anchor_strength: Annotated[float | None, ParamSpec("Enthalpy "
+                          "regulariser for the quasi-static energy balance; "
+                          "None defaults to m_dot_eps (algebraic) or 0 "
+                          "(dynamic).", unit="kg/s")] = None,
+    ):
         if N < 2:
             raise ValueError(f"MixingJunction needs at least 2 ports, got N={N}")
         if dynamic and V is None:
@@ -1223,6 +1685,7 @@ class MixingJunction(Model):
         super().__init__()
 
     def declare_components(self):
+        spec = merged_param_specs(type(self))
         # Well-mixed algebraic states (both modes).
         self.add_component('p', Variable(self.p_init, "Pa"))
         self.add_component('h', Variable(self.h_init, "J/kg"))
@@ -1230,19 +1693,20 @@ class MixingJunction(Model):
         # Direction-switch smoothing scale.  Held as a Parameter (not a baked
         # literal) so its appearance in `sqrt(m_dot**2 + m_dot_eps**2)` keeps
         # the equation template free of instance-varying numeric literals.
-        self.add_component('m_dot_eps', Parameter(self.m_dot_eps, "kg/s"))
+        self.add_component('m_dot_eps', Parameter(self.m_dot_eps, **spec['m_dot_eps'].param_kwargs()))
 
         # Storage states + volume parameter, dynamic mode only.
         if self.dynamic:
-            self.add_component('V', Parameter(self.V, "m^3"))
+            self.add_component('V', Parameter(self.V, **spec['V'].param_kwargs()))
             self.add_component('m', DifferentialVariable(self.m_init, "kg"))
             self.add_component('U', DifferentialVariable(self.U_init, "J"))
         else:
             # Quasi-static `h`-anchor regularization constants, promoted to
             # Parameters for the same template-invariance reason (they appear
-            # in the algebraic energy balance below).
+            # in the algebraic energy balance below).  `h_init` is computed
+            # (no constructor arg), so it keeps an explicit unit.
             self.add_component('h_init', Parameter(self.h_init, "J/kg"))
-            self.add_component('h_anchor_strength', Parameter(self.h_anchor_strength, "kg/s"))
+            self.add_component('h_anchor_strength', Parameter(self.h_anchor_strength, **spec['h_anchor_strength'].param_kwargs()))
 
         # N ports.  Each port has both a CARRIER enthalpy (`h_k`, what the
         # downstream component actually sees through the wire) and a STREAM-IN
@@ -1465,254 +1929,4 @@ class LoopBuffer(MixingJunction):
         return eqs
 
 
-class StraightPipe(Model):
-    """1D pipe split into `n_segments` equal-length `TwoPortSegment`s with optional heat transfer.
 
-    Uses the Churchill correlation for the friction factor and a smoothed
-    Gnielinski / laminar Nusselt blend for the wall heat-transfer coefficient.
-    """
-
-    def __init__(self, medium: CoolPropMedium, D, L, epsilon, z_in, z_out, n_segments=3,
-                 heat_port=False, adiabatic=None):
-        self.medium = medium
-        self.D = D
-        self.L = L
-        self.epsilon = epsilon
-        self.z_in = z_in
-        self.z_out = z_out
-        self.n_segments = n_segments
-        # `heat_port` is the single switch for the segment thermal interface:
-        #   * False (default): each segment is a plain adiabatic `TwoPortSegment`
-        #     (T_wall = T_avg, q = 0); the pipe has no thermal connectivity.
-        #   * True: each segment is a `HeatedSegment` exposing a `wall`
-        #     `ThermalPort_TQ`; the convective heat is driven by whatever is
-        #     wired to those ports (a `CylindricalWall`, a `FixedTemperature`,
-        #     ...).  Reproduce the old "convect to a fixed wall temperature"
-        #     behaviour by setting heat_port=True and connecting a
-        #     `FixedTemperature` to each segment wall port.
-        #
-        # `adiabatic` is the deprecated legacy flag.  It only ever toggled the
-        # heat source against a fixed 293.15 K `T_wall` Parameter, which has
-        # been removed; map it onto `heat_port` and warn.
-        if adiabatic is not None:
-            if adiabatic and heat_port:
-                raise ValueError(
-                    "StraightPipe: pass either the deprecated `adiabatic=` or the new "
-                    "`heat_port=`, not both."
-                )
-            if not adiabatic:
-                warnings.warn(
-                    "StraightPipe(adiabatic=False): the legacy fixed-293.15 K wall "
-                    "heating has been removed. Use heat_port=True and connect a thermal "
-                    "boundary (e.g. FixedTemperature) or a wall to each segment's `wall` "
-                    "port to model heat transfer.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            # adiabatic=True simply means "no heat port" == default.
-        self.heat_port = heat_port
-        super().__init__()
-
-    def get_churchill_f_factor(self, Re, epsilon, D):
-        term1 = (8.0 / (Re + 1)) ** 12
-        A = (-2.457 * sp.log((7.0 / Re) ** 0.9 + 0.27 * epsilon / D)) ** 16
-        B = (37530.0 / (Re + 1)) ** 16
-        term2 = 1.0 / (A + B) ** 1.5
-        f = (term1 + term2) ** (1.0 / 12.0)
-        return f * 8
-
-    def calculate_nu(self, Re, Pr, fr):
-        U = Re / 1000
-        if Re <= 2300:
-            return (fr / 8) * (Re - 1000) * Pr / (1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
-        if 2300 < Re <= 3100:
-            return 3.52 * U ** 4 - 45.148 * U ** 3 + 212.13 * U ** 2 - 427.45 * U + 316.08
-        return 3.66
-
-    def calculate_nu_smooth(self, Re, Pr, fr):
-        # `calculate_nu` smoothed via narrow transition windows so the symbolic system is
-        # differentiable across the laminar/transitional/turbulent boundaries.
-        U = Re / 1000
-        nu_1 = (fr / 8) * (Re - 1000) * Pr / (1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
-        nu_2 = 3.52 * U ** 4 - 45.148 * U ** 3 + 212.13 * U ** 2 - 427.45 * U + 316.08
-        nu_3 = 3.66
-        TRANSITION_WIDTH = 100
-        TRANSITION_CENTER_1 = 2250
-        TRANSITION_CENTER_2 = 3050
-        w1 = sp.Max(0.0, sp.Min(1.0, 1.0 - (Re - TRANSITION_CENTER_1) / TRANSITION_WIDTH))
-        w3 = sp.Max(0.0, sp.Min(1.0, (Re - TRANSITION_CENTER_2) / TRANSITION_WIDTH))
-        w2 = 1.0 - w1 - w3
-        return w1 * nu_1 + w2 * nu_2 + w3 * nu_3
-
-    def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
-        # `Dh` (hydraulic diameter; == D for a circular pipe) and `area` (the
-        # inner wetted surface of ONE segment, = mean perimeter x segment
-        # length) arrive as SymPy expressions built from the SEGMENT's own
-        # geometry Parameter symbols.  Using them -- instead of the parent
-        # pipe's Python floats `self.D` / `self.L` / `self.n_segments` --
-        # keeps this heat term free of baked-in literals, so the cached
-        # `HeatedSegment` template is instance-invariant across pipes of
-        # different diameter or length.  (`area` already accounts for the
-        # per-segment length, so there is no `n_segments` over-counting.)
-        Re = w * Dh * rho / mu
-        Pr = mu * rho / k
-        nu = self.calculate_nu_smooth(Re, Pr, fr)
-        alpha = nu * k / Dh
-        return alpha * area * (T_wall - T)
-
-    def get_q_inflow_adiabatic(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
-        return 0.0
-
-    def declare_components(self):
-        # Pipe-level constitutive Parameters.  Hoisting these out of the
-        # per-segment `TwoPortSegment`s and passing them down as shared
-        # `Parameter` references is what makes every segment's equations
-        # reference the SAME SymPy symbols for area, perimeter, and segment
-        # length -- a precondition for `Model.remove_duplicate_equations`
-        # to recognise the per-face `m_dot = rho*A*w` closures of adjacent
-        # segments as structurally identical (apart from a single `w` leaf)
-        # and collapse them.
-        self.add_component('D', Parameter(self.D, "m"))
-        self.add_component('L', Parameter(self.L, "m"))
-        self.add_component('epsilon', Parameter(self.epsilon, "m"))
-        self.add_component('z_in', Parameter(self.z_in, "m"))
-        self.add_component('z_out', Parameter(self.z_out, "m"))
-        # Derived shared geometry.  We register them as their own Parameters
-        # (rather than building `pi*D**2/4` as a SymPy expression every time
-        # a segment references it) because Parameter symbols are flat
-        # leaves: the per-segment friction / momentum / energy expression
-        # trees stay shallow, and the equation-dedup signature comparison
-        # is a single-symbol hash rather than a full subtree walk.
-        A_value = np.pi * self.D ** 2 / 4
-        P_value = np.pi * self.D
-        L_segment_value = self.L / self.n_segments
-        self.add_component('A', Parameter(A_value, "m^2"))
-        self.add_component('P', Parameter(P_value, "m"))
-        self.add_component('L_segment', Parameter(L_segment_value, "m"))
-
-        # Pipe-level port Variables.
-        self.add_component('p_in', Variable(101325, "Pa"))
-        self.add_component('h_in', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
-        self.add_component('m_dot_in', Variable(0.0, "kg/s"))
-        self.add_component('p_out', Variable(101325, "Pa"))
-        self.add_component('h_out', Variable(self.medium.h_pT(101325, 293.15), "J/kg"))
-        self.add_component('m_dot_out', Variable(0.0, "kg/s"))
-        self.add_port('inlet', FluidPort_phm(
-            self,
-            channels={'p': self['p_in'], 'h': self['h_in'], 'm_dot': self['m_dot_in']},
-            flow_orientation='in',
-            medium=self.medium,
-        ))
-        self.add_port('outlet', FluidPort_phm(
-            self,
-            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
-            flow_orientation='in',
-            medium=self.medium,
-        ))
-
-        # `N+1` axial stations shared between adjacent segments: segment `k`'s
-        # `z_out` and segment `k+1`'s `z_in` reference the same `Parameter`.
-        # Not strictly required for the dedup pass to fire on the face
-        # closures (which don't depend on `z`), but it halves the elevation-
-        # Parameter inventory of a pipe and keeps a single source of truth
-        # for each interface elevation.
-        dz = (self.z_out - self.z_in) / self.n_segments
-        for j in range(self.n_segments + 1):
-            self.add_component(f'z_{j}', Parameter(self.z_in + j * dz, "m"))
-
-        A_param = self['A']
-        P_param = self['P']
-        L_seg_param = self['L_segment']
-        # Pick the segment class by `heat_port` (NOT a per-instance flag on a
-        # single class): `HeatedSegment` and `TwoPortSegment` emit different
-        # equation structures, and keeping them as distinct classes keeps the
-        # per-class equation cache correct in models that mix heated and
-        # adiabatic pipes.
-        seg_cls = HeatedSegment if self.heat_port else TwoPortSegment
-        q_f = self.get_q_inflow if self.heat_port else self.get_q_inflow_adiabatic
-        for i in range(self.n_segments):
-            fr_f = self.get_churchill_f_factor
-            self.add_component(
-                f'pipe_segment_{i}',
-                seg_cls(
-                    self.medium,
-                    A_in=A_param, A_out=A_param,
-                    P_in=P_param, P_out=P_param,
-                    z_in=self[f'z_{i}'], z_out=self[f'z_{i + 1}'],
-                    L=L_seg_param,
-                    epsilon=self.epsilon,
-                    f_factor_func=fr_f,
-                    q_inflow_func=q_f,
-                ),
-            )
-
-    def declare_equations(self):
-        # Wire the pipe-level (p, h, m_dot)_in/out ports to the matching ports of
-        # the first / last segment.  Using `segment_0.{h,m_dot}_in` (rather than
-        # `_out`) is important: the inlet ports of the pipe must represent the
-        # axial station at the actual pipe entrance, otherwise upstream
-        # connections (a `Splitter`, another pipe, a vessel) compare values
-        # across mismatched stations and the resulting "mass conservation"
-        # through the wiring is off by the small frictional density change
-        # across the first segment.
-        #
-        # All of these are pure variable-equality constraints, so we route them
-        # through `add_connection` (union-find at instantiate time) rather than
-        # building a sympy `Add` per pair and letting the trivial reducer eat them.
-        for port in ('p_in', 'h_in', 'm_dot_in'):
-            self.add_connection(self[port], self['pipe_segment_0'][port])
-        # Inter-segment wiring.  We deliberately do NOT union `w` between
-        # adjacent segments via `add_connection`: each segment owns a pair
-        # of closure equations `m_dot = rho * A * w` (one per face), and at
-        # an internal interface both equations reduce to the same statement
-        # after `(p, h, m_dot)` are unioned -- collapsing the two `w`
-        # symbols via `add_connection` would leave the system over-
-        # determined by one equation per shared face.
-        #
-        # Instead, `Model.remove_duplicate_equations` (run during
-        # `instantiate()`, controlled by the same-named flag) detects the
-        # two face closures as structurally identical apart from their `w`
-        # leaf and unifies them -- removing both the redundant `w` symbol
-        # AND its closure equation per internal interface (`N - 1`
-        # eliminations per pipe).  For this to fire, both segments must
-        # reference the SAME SymPy symbols for area / perimeter /
-        # segment-length, which is exactly what `declare_components` above
-        # wires up via shared `A` / `P` / `L_segment` Parameters.
-        # Under "flow into me", the m_dot at seg_i's out-face and seg_{i+1}'s
-        # in-face describe the same physical interface but from opposite
-        # control volumes (each measures fluid flowing INTO its own
-        # component) -- they're equal in magnitude with opposite sign, so
-        # we route the m_dot wire through signed UF (`sign=-1`) while p
-        # and h stay direct (across variables -- the face's pressure and
-        # enthalpy are single-valued regardless of which side looks at it).
-        for i in range(self.n_segments - 1):
-            self.add_connection(
-                self[f'pipe_segment_{i}']['p_out'],
-                self[f'pipe_segment_{i + 1}']['p_in'],
-            )
-            self.add_connection(
-                self[f'pipe_segment_{i}']['h_out'],
-                self[f'pipe_segment_{i + 1}']['h_in'],
-            )
-            self.add_connection(
-                self[f'pipe_segment_{i}']['m_dot_out'],
-                self[f'pipe_segment_{i + 1}']['m_dot_in'],
-                sign=-1,
-            )
-        last = f'pipe_segment_{self.n_segments - 1}'
-        for port in ('p_out', 'h_out', 'm_dot_out'):
-            self.add_connection(self[port], self[last][port])
-        return []
-
-    @property
-    def segment_wall_ports(self):
-        """List of the per-segment `wall` `ThermalPort_TQ` (only when
-        `heat_port=True`).  A parent model connects these to walls/boundaries,
-        e.g. `self.connect(pipe.segment_wall_ports[i], wall_i.ports['port_a'])`.
-        """
-        if not self.heat_port:
-            raise AttributeError(
-                "StraightPipe was built with heat_port=False; it has no segment "
-                "wall ports. Pass heat_port=True to expose them."
-            )
-        return [self[f'pipe_segment_{i}'].ports['wall'] for i in range(self.n_segments)]

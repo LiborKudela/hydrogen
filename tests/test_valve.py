@@ -167,7 +167,7 @@ def test_valve_serialization_round_trip():
     rig.declare_equations()  # wire so reflective dump captures connections
     d = to_dict(rig)
     vspec = d['components']['v']
-    assert vspec['type'] == 'IncompressibleValve'
+    assert vspec['type'] == 'hydrogen.thermofluid.IncompressibleValve'
     assert vspec['params']['Kv'] == 12.5
     assert vspec['params']['D'] == 0.02
     rebuilt = from_dict(d)

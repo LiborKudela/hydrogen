@@ -30,10 +30,12 @@ Crank-Nicolson even when feeding a differential block.  See the domain
 from __future__ import annotations
 
 import math
+from typing import Annotated
 
 import sympy as sp
 
 from ...model import DifferentialVariable, Input, Model, Parameter, Variable
+from ...paramspec import ParamSpec
 from ...ports import Port
 
 # Channel name carried by every signal connector (the connector's value).
@@ -81,6 +83,13 @@ class Block(Model):
     block exposes ports ``u`` (input) and ``y`` (output) by convention.
     """
 
+    #: Shared metadata: every block carries an optional signal `unit` tag.
+    PARAMS = {
+        "unit": ParamSpec(
+            "Optional unit tag for the signal channel (e.g. 'Pa', 'K', '1'); "
+            "None leaves the signal untagged / dimensionless."),
+    }
+
     def _add_input(self, name="u", *, init=0.0, unit=None, require_connection=True):
         self.add_component(name, Variable(init, unit))
         self.add_port(name, RealSignal.as_input(
@@ -103,7 +112,8 @@ class Block(Model):
 class Constant(Block):
     """Constant signal: ``y = k``."""
 
-    def __init__(self, k=0.0, unit=None):
+    def __init__(self, k: Annotated[float, ParamSpec("Constant output value.")] = 0.0,
+                 unit=None):
         self.k = k
         self.unit = unit
         super().__init__()
@@ -142,7 +152,16 @@ class _TimeSource(Block):
 class Step(_TimeSource):
     """Step signal: ``y = offset`` for ``t < start_time`` then ``offset + height``."""
 
-    def __init__(self, height=1.0, start_time=0.0, offset=0.0, unit=None):
+    def __init__(
+        self,
+        height: Annotated[float, ParamSpec("Size of the step (added to the "
+                         "offset at t >= start_time).")] = 1.0,
+        start_time: Annotated[float, ParamSpec("Time at which the step "
+                             "occurs.", unit="s")] = 0.0,
+        offset: Annotated[float, ParamSpec("Baseline output before the "
+                         "step.")] = 0.0,
+        unit=None,
+    ):
         self.height = height
         self.start_time = start_time
         self.offset = offset
@@ -156,7 +175,17 @@ class Step(_TimeSource):
 class Ramp(_TimeSource):
     """Ramp signal: flat ``offset``, linear rise of ``height`` over ``duration``, then flat."""
 
-    def __init__(self, height=1.0, duration=1.0, start_time=0.0, offset=0.0, unit=None):
+    def __init__(
+        self,
+        height: Annotated[float, ParamSpec("Total rise over the ramp.")] = 1.0,
+        duration: Annotated[float, ParamSpec("Time taken for the linear rise "
+                           "(> 0).", unit="s")] = 1.0,
+        start_time: Annotated[float, ParamSpec("Time at which the rise "
+                             "begins.", unit="s")] = 0.0,
+        offset: Annotated[float, ParamSpec("Baseline output before the "
+                         "ramp.")] = 0.0,
+        unit=None,
+    ):
         if duration <= 0.0:
             raise ValueError("Ramp duration must be > 0")
         self.height = height
@@ -177,8 +206,18 @@ class Ramp(_TimeSource):
 class Sine(_TimeSource):
     """Sine signal: ``y = offset + amplitude * sin(2*pi*freq*t + phase)`` for ``t >= start_time``."""
 
-    def __init__(self, amplitude=1.0, freq=1.0, phase=0.0, offset=0.0,
-                 start_time=0.0, unit=None):
+    def __init__(
+        self,
+        amplitude: Annotated[float, ParamSpec("Peak amplitude of the "
+                            "sine.")] = 1.0,
+        freq: Annotated[float, ParamSpec("Frequency.", unit="Hz")] = 1.0,
+        phase: Annotated[float, ParamSpec("Phase offset.", unit="rad")] = 0.0,
+        offset: Annotated[float, ParamSpec("Constant offset added to the "
+                         "sine.")] = 0.0,
+        start_time: Annotated[float, ParamSpec("Time before which the output "
+                             "stays at offset.", unit="s")] = 0.0,
+        unit=None,
+    ):
         self.amplitude = amplitude
         self.freq = freq
         self.phase = phase
@@ -202,7 +241,8 @@ class Sine(_TimeSource):
 class Gain(Block):
     """Scalar gain: ``y = k * u``."""
 
-    def __init__(self, k=1.0, unit=None):
+    def __init__(self, k: Annotated[float, ParamSpec("Gain factor applied to "
+                "the input.")] = 1.0, unit=None):
         self.k = k
         self.unit = unit
         super().__init__()
@@ -219,7 +259,12 @@ class Gain(Block):
 class Add(Block):
     """Weighted sum of two inputs: ``y = k1*u1 + k2*u2``."""
 
-    def __init__(self, k1=1.0, k2=1.0, unit=None):
+    def __init__(
+        self,
+        k1: Annotated[float, ParamSpec("Weight on the first input u1.")] = 1.0,
+        k2: Annotated[float, ParamSpec("Weight on the second input u2.")] = 1.0,
+        unit=None,
+    ):
         self.k1 = k1
         self.k2 = k2
         self.unit = unit
@@ -257,7 +302,13 @@ class Feedback(Block):
 class Sum(Block):
     """N-input weighted sum: ``y = sum_i k_i * u_i``."""
 
-    def __init__(self, n, weights=None, unit=None):
+    def __init__(
+        self,
+        n: Annotated[int, ParamSpec("Number of inputs (>= 1).")],
+        weights: Annotated[list | None, ParamSpec("Per-input weights (length "
+                          "n); None = all ones.")] = None,
+        unit=None,
+    ):
         if n < 1:
             raise ValueError("Sum needs at least one input")
         self.n = n
@@ -308,7 +359,14 @@ class Limiter(Block):
     a valve opening to ``[0, 1]``.
     """
 
-    def __init__(self, lo=0.0, hi=1.0, eps=1e-3, unit=None):
+    def __init__(
+        self,
+        lo: Annotated[float, ParamSpec("Lower saturation bound.")] = 0.0,
+        hi: Annotated[float, ParamSpec("Upper saturation bound (> lo).")] = 1.0,
+        eps: Annotated[float, ParamSpec("Smoothing scale of the soft min/max "
+                      "blend; keep small relative to the signal range.")] = 1e-3,
+        unit=None,
+    ):
         if hi <= lo:
             raise ValueError("Limiter requires hi > lo")
         self.lo = lo
@@ -348,7 +406,13 @@ class Limiter(Block):
 class Integrator(Block):
     """Time integrator: ``der(y) = k * u``, ``y(0) = y_start``."""
 
-    def __init__(self, k=1.0, y_start=0.0, unit=None):
+    def __init__(
+        self,
+        k: Annotated[float, ParamSpec("Integral gain on the input.")] = 1.0,
+        y_start: Annotated[float, ParamSpec("Initial output (integration "
+                          "constant).")] = 0.0,
+        unit=None,
+    ):
         self.k = k
         self.y_start = y_start
         self.unit = unit
@@ -367,7 +431,13 @@ class Integrator(Block):
 class FirstOrder(Block):
     """First-order lag: ``T*der(y) + y = k*u`` (time constant ``T``, gain ``k``)."""
 
-    def __init__(self, T, k=1.0, y_start=0.0, unit=None):
+    def __init__(
+        self,
+        T: Annotated[float, ParamSpec("Time constant (> 0).", unit="s")],
+        k: Annotated[float, ParamSpec("Steady-state gain.")] = 1.0,
+        y_start: Annotated[float, ParamSpec("Initial output.")] = 0.0,
+        unit=None,
+    ):
         if T <= 0.0:
             raise ValueError("FirstOrder time constant T must be > 0")
         self.T = T
@@ -406,7 +476,15 @@ class PID(Block):
     enhancement.
     """
 
-    def __init__(self, kp=1.0, ki=0.0, kd=0.0, Tf=0.1, unit=None):
+    def __init__(
+        self,
+        kp: Annotated[float, ParamSpec("Proportional gain.")] = 1.0,
+        ki: Annotated[float, ParamSpec("Integral gain.", unit="1/s")] = 0.0,
+        kd: Annotated[float, ParamSpec("Derivative gain.", unit="s")] = 0.0,
+        Tf: Annotated[float, ParamSpec("Derivative-filter time constant (> 0); "
+                     "der(x_d) -> de/dt as Tf -> 0.", unit="s")] = 0.1,
+        unit=None,
+    ):
         if Tf <= 0.0:
             raise ValueError("PID derivative-filter time Tf must be > 0")
         self.kp = kp

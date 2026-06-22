@@ -28,7 +28,18 @@ import json
 
 from ..model import Model
 from .errors import SerializationError, SystemSpecError
-from .registry import SCHEMA_VERSION, register_component
+from .registry import (
+    SCHEMA_VERSION,
+    available_domains,
+    component_catalog,
+    component_spec,
+    format_component_catalog,
+    register_component,
+    spec_template,
+    value_object_catalog,
+    value_object_spec,
+    value_template,
+)
 from .spec import from_dict, to_dict
 
 __all__ = [
@@ -37,6 +48,14 @@ __all__ = [
     "to_json",
     "from_json",
     "register_component",
+    "component_catalog",
+    "component_spec",
+    "format_component_catalog",
+    "available_domains",
+    "value_object_catalog",
+    "value_object_spec",
+    "spec_template",
+    "value_template",
     "SerializationError",
     "SystemSpecError",
     "SCHEMA_VERSION",

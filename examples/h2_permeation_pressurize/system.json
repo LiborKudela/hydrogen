@@ -1,0 +1,109 @@
+{
+  "hydrogen_version": "0.1.0",
+  "schema_version": 1,
+  "media": {
+    "Hydrogen": {
+      "fluid": "Hydrogen",
+      "backend": "BICUBIC&HEOS",
+      "disable_warnings": true,
+      "scalar_cache_maxsize": 100
+    }
+  },
+  "components": {
+    "p_cmd": {
+      "type": "hydrogen.control.Ramp",
+      "params": {
+        "height": 19900000.0,
+        "duration": 0.06,
+        "start_time": 0.0,
+        "offset": 100000.0,
+        "unit": "Pa"
+      }
+    },
+    "source": {
+      "type": "hydrogen.thermofluid.PressureSource",
+      "medium": "Hydrogen",
+      "params": {
+        "p_source": 100000.0,
+        "T_source": 423.15,
+        "A": 7.068583470577034e-06,
+        "p_control": true
+      }
+    },
+    "pipe": {
+      "type": "hydrogen.thermofluid.Pipe",
+      "medium": "Hydrogen",
+      "params": {
+        "D": 0.003,
+        "L": 10.0,
+        "epsilon": 1e-06,
+        "z_in": 0.0,
+        "z_out": 0.0,
+        "n_segments": 2,
+        "layers": [
+          {
+            "__type__": "WallLayer",
+            "material": {
+              "__type__": "WallMaterial",
+              "name": "AISI 316/316L",
+              "rho": 7990.0,
+              "cp": 500.0,
+              "k": 15.0
+            },
+            "thickness": 0.0015,
+            "permeation": {
+              "__type__": "TransientDiffusion",
+              "transport_fit": {
+                "__type__": "TransportFit",
+                "permeant": {
+                  "__type__": "Permeant",
+                  "name": "H2",
+                  "M": 0.00201588,
+                  "solubility_exponent": 2.0
+                },
+                "Phi0": 5.462953e-08,
+                "E_Phi": 59800.0,
+                "D0": 6.009657e-07,
+                "E_D": 53900.0,
+                "name": "H2 in AISI 304"
+              },
+              "n_nodes": 8,
+              "C_init": 0.0
+            },
+            "dynamic": false
+          }
+        ],
+        "multiphase": "single",
+        "outer_thermal": "fixed",
+        "h_ext": 10.0,
+        "T_ext": 293.15,
+        "T_outer": 423.15,
+        "p_ext": 1.0,
+        "T_wall_init": 423.15,
+        "p_init": 100000.0
+      }
+    },
+    "cap": {
+      "type": "hydrogen.thermofluid.ClosedEnd",
+      "medium": "Hydrogen",
+      "params": {
+        "p_init": 100000.0,
+        "T_init": 423.15
+      }
+    }
+  },
+  "connections": [
+    {
+      "from": "p_cmd.y",
+      "to": "source.p_set"
+    },
+    {
+      "from": "source.outlet",
+      "to": "pipe.inlet"
+    },
+    {
+      "from": "pipe.outlet",
+      "to": "cap.inlet"
+    }
+  ]
+}

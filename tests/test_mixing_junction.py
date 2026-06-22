@@ -43,19 +43,6 @@ DT              = 0.05      # s
 N_STEPS_PHASE   = 8         # fixed-dt steps per phase
 MDOT_EPS        = 1e-6      # kg/s, smooth-switch width (shared with junction)
 
-
-def _push_params(model: Model) -> None:
-    """Re-read every `Parameter.value` into the lambdified solver's `values` array.
-
-    `Model.initialise` does this implicitly at t = 0, but afterwards parameter
-    mutations don't propagate until something calls `set_param_values` again.
-    Use this helper whenever a test mutates parameters between solver steps.
-    """
-    model.set_param_values(
-        np.array([p.value for p in model.raw_param_references])
-    )
-
-
 # --- Shared boundary components -----------------------------------------------
 
 class _PrescribedStreamBoundary(Model):
@@ -182,9 +169,8 @@ def run_dynamic():
         system.next_step()
 
     # Reverse port 0; rebalance port 3 so the prescribed flows still sum to 0.
-    system['bnd_0']['m_dot_target'].value = -M_DOT_BASE
-    system['bnd_3']['m_dot_target'].value = -M_DOT_BASE
-    _push_params(system)
+    system['bnd_0']['m_dot_target'].set_value(-M_DOT_BASE)
+    system['bnd_3']['m_dot_target'].set_value(-M_DOT_BASE)
 
     # Phase 2: port 0 now receives the (warmer) mixed outflow
     for _ in range(N_STEPS_PHASE):
@@ -355,10 +341,9 @@ def run_quasi():
         system.next_step()
 
     # Flip all three flow pins to source -> mass balance reverses port 0.
-    system['bnd_1']['m_dot_target'].value = +M_DOT_BASE
-    system['bnd_2']['m_dot_target'].value = +M_DOT_BASE
-    system['bnd_3']['m_dot_target'].value = +M_DOT_BASE
-    _push_params(system)
+    system['bnd_1']['m_dot_target'].set_value(+M_DOT_BASE)
+    system['bnd_2']['m_dot_target'].set_value(+M_DOT_BASE)
+    system['bnd_3']['m_dot_target'].set_value(+M_DOT_BASE)
 
     # Phase 2: ports 1, 2, 3 source cool fluid at +M; mass balance -> port 0
     # sinks at -3M, now receiving the well-mixed (cool) outflow.

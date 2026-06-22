@@ -248,7 +248,7 @@ def test_signal_blocks_serialize_round_trip():
     s = S()
     s.declare_equations()  # wire so the reflective dump captures the connection
     d = to_dict(s)
-    assert d['components']['step']['type'] == 'Step'
+    assert d['components']['step']['type'] == 'hydrogen.control.Step'
     assert d['components']['step']['params'] == {
         'height': 2.0, 'start_time': 0.5, 'offset': 0.1, 'unit': None}
     rebuilt = from_dict(d)

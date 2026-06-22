@@ -1,23 +1,25 @@
 # Power-engineering domain
 
-Coupled (conjugate) components that compose the **fluid** and **thermal**
-domains into the building blocks of power-plant / process plumbing. This
-domain introduces no new primitive physics and no new connector kind — it
-wires together the existing `FluidPort_phm` and `ThermalPort_TQ` ports.
+Coupled (conjugate) components that compose the **thermofluid** domain into the
+building blocks of power-plant / process plumbing. This domain introduces no new
+primitive physics and no new connector kind — it wires together the existing
+`FluidPort_phm` and `ThermalPort_TQ` ports.
 
 ## Components
 
 ### `ConjugatePipe`
 
-A fluid `StraightPipe` (built with `heat_port=True`) whose every segment is
-wrapped in a `CylindricalWall`, giving the metal wall real thermal mass and
-letting the fluid exchange heat with it segment-by-segment.
+A thin specialisation of `thermofluid.Pipe` with a single, non-permeable
+`WallLayer`: a fluid `StraightPipe` (built with `heat_port=True`) whose every
+segment is wrapped in a `CylindricalWall`, giving the metal wall real thermal
+mass and letting the fluid exchange heat with it segment-by-segment. For
+multi-layer walls or wall permeation, use `thermofluid.Pipe` directly.
 
 ```
 fluid:   ===[ segment_0 ]===[ segment_1 ]=== ... ===[ segment_N-1 ]===
                |  wall          |  wall                 |  wall
             port_a           port_a                  port_a
-metal:    [ wall_0 ]        [ wall_1 ]      ...    [ wall_N-1 ]
+metal:    [ wall_0_0 ]      [ wall_1_0 ]     ...   [ wall_{N-1}_0 ]
             |  port_b          |  port_b              |  port_b
             outer_0           outer_1               outer_N-1
 ```
@@ -50,7 +52,7 @@ network.
 ## Physics notes
 
 The conjugate coupling relies on two corrections made to the fluid segment
-energy balance (see `components/fluid/fluid_components.py`):
+energy balance (see `components/thermofluid/flow.py`):
 
 1. **Specific heat input.** The wall heat `q` [W] enters the fluid energy
    balance as `q / ṁ` [J/kg], so the fluid gains exactly `q` watts — matching

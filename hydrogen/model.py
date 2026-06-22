@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextvars
 import gc
+import itertools
 import os
 import time
 
@@ -34,6 +35,7 @@ from .caching import (
 )
 from .numerics import (fast_error_norm, fast_linear_solve, fast_sparse_solve,
                         fast_sparse_solve_cached, lambdify_compat)
+from .paramspec import cache_key_flag_names
 
 
 class NewtonConvergenceFailure(RuntimeError):
@@ -261,6 +263,38 @@ def _lambdify_worker_task(task_idx):
     return task_idx, label, key
 
 
+def match_name_index(names, req):
+    """First index in ``names`` matching ``req``: exact, else dotted-suffix,
+    else bare-suffix.  Returns ``None`` if nothing matches.
+
+    This is the shared name-resolution rule used both by recorded-variable
+    lookups (:meth:`Model.resolve_vars`) and the service layer's parameter /
+    variable matching, so a convenient suffix (``"wall_0_0.C_1"``) resolves the
+    same way everywhere.
+    """
+    for i, n in enumerate(names):
+        if n == req:
+            return i
+    for i, n in enumerate(names):
+        if n.endswith("." + req) or n.endswith(req):
+            return i
+    return None
+
+
+def match_name_indices(names, req):
+    """All indices in ``names`` matching ``req`` (exact if any exact match
+    exists, otherwise every dotted-/bare-suffix match).
+
+    Use this to gather a repeated, per-instance quantity -- e.g. every
+    ``wall_*.m_dot_a_leak`` across a multi-segment pipe -- in one call.
+    """
+    exact = [i for i, n in enumerate(names) if n == req]
+    if exact:
+        return exact
+    return [i for i, n in enumerate(names)
+            if n.endswith("." + req) or n.endswith(req)]
+
+
 class Model:
     # Shared symbols used by every Model/Variable instance.  Previously each
     # `Variable.__init__` re-allocated a fresh triple, which for a system with
@@ -293,11 +327,14 @@ class Model:
     # Most classes' `declare_equations` structure is fully determined by the
     # class, so the default is an empty tuple (key == just the class).  A class
     # whose equation structure (or which symbols/variables exist) depends on a
-    # constructor flag MUST list every such flag here, so that two instances
-    # with different flag values get DIFFERENT cache entries instead of one
-    # replaying the other's template.  Example: `TwoNodeWall` lists
-    # `('dynamic',)` because that flag toggles between an ODE form (with
-    # `der_*` states) and an algebraic form.  Flag values must be hashable.
+    # constructor flag should mark that flag `ParamSpec(structural=True)` in its
+    # `Annotated` type hint; `cache_key_flag_names()` then derives the cache key
+    # automatically so two instances with different flag values get DIFFERENT
+    # cache entries instead of one replaying the other's template.  This
+    # `_cache_key_flags` attribute is for *computed* keys that are NOT
+    # constructor arguments (e.g. a private `_perm_key` summarising an injected
+    # model's structural identity); it is merged with the structural args by
+    # `cache_key_flag_names()`.  Flag values must be hashable.
     _cache_key_flags: tuple = ()
 
     def __init__(self):
@@ -309,6 +346,12 @@ class Model:
         # trivial-equation reducer, which is much faster for large systems
         # where the bulk of the trivial equations are connection equalities.
         self.connections = []
+        # Set once `declare_equations()` has been run for its wiring side
+        # effects (so `ensure_equations_declared()` -- used by serialization to
+        # wire a model without compiling it -- stays idempotent and never
+        # double-wires ports).  `instantiate()` runs `declare_equations()` on
+        # its own; this flag only gates the explicit "wire early" helper.
+        self._equations_declared = False
         # Typed `Port` registry.  Optional layer on top of `components`;
         # ports merely group existing Variable references and add type/
         # multiplicity checks at `connect()` time.  See `hydrogen/ports.py`.
@@ -422,6 +465,14 @@ class Model:
             PortMediumMismatchError,
         )
 
+        # Idempotent re-wire: if these two ports are already wired to each
+        # other (e.g. `declare_equations()` ran once for serialization and is
+        # run again by `instantiate()`), do nothing -- so the ports and the
+        # `add_connection` list are never doubled.  Wiring a port to a *new*
+        # partner still raises `PortAlreadyConnectedError` below as usual.
+        if port_a._connected_to is port_b and port_b._connected_to is port_a:
+            return
+
         if port_a.kind != port_b.kind:
             raise PortKindMismatchError(
                 f"Cannot connect ports of different kinds: "
@@ -519,6 +570,47 @@ class Model:
             if isinstance(c, Model) and c.is_composite():
                 conns.extend(c.collect_connections())
         return conns
+
+    def _is_wired(self):
+        """True if `declare_equations()` has already run for its wiring side
+        effects -- i.e. this model (or a nested composite) carries any
+        `add_connection` entry or has a connected port.
+
+        This reflects the *actual* wiring state (not just the
+        `_equations_declared` flag), so it also recognises a model wired by a
+        plain `instantiate()` or a hand call to `declare_equations()`.
+        """
+        if self.connections:
+            return True
+        for comp in self.components.values():
+            for port in getattr(comp, "ports", {}).values():
+                if getattr(port, "is_connected", False):
+                    return True
+            if isinstance(comp, Model) and comp.is_composite() and comp._is_wired():
+                return True
+        return False
+
+    def ensure_equations_declared(self):
+        """Idempotently run `declare_equations()` once for its wiring side
+        effects (port `connect()` / `add_connection`), so callers that need the
+        model **wired but not compiled** -- chiefly serialization -- don't have
+        to call `declare_equations()` (or `instantiate()`) by hand first.
+
+        It is a no-op if the model is already wired (via a prior
+        `instantiate()`, a hand `declare_equations()` call, or an earlier
+        `ensure_equations_declared()`), so it never double-wires a port.
+
+        NB: like the framework's once-only `declare_equations()` contract, do
+        not call this and *then* `instantiate()` the same object -- instantiate
+        re-runs `declare_equations()` and would re-wire already-connected ports.
+        Serialization dumps a built model and (re)builds a fresh one to run, so
+        this never arises there.
+        """
+        if self._equations_declared or self._is_wired():
+            self._equations_declared = True
+            return
+        self.declare_equations()
+        self._equations_declared = True
 
     def is_composite(self):
         for c in self.components.values():
@@ -675,7 +767,8 @@ class Model:
         # other's template.  Including the flag values gives each variant its
         # own entry, so caching still fires WITHIN a variant while staying
         # correct ACROSS variants.
-        key = (cls, tuple(getattr(self, name) for name in cls._cache_key_flags))
+        key = (cls, tuple(getattr(self, name)
+                          for name in cache_key_flag_names(cls)))
         # `eq_cache is None` -> running outside `instantiate()` (e.g. via
         # `get_current_system()` or a unit test).  Just rebuild equations
         # every time; the cache exists purely as an `instantiate()` speed-up.
@@ -2193,6 +2286,13 @@ class Model:
         print(f"Remaining variables and equations: {self.n_v}")
         self.values = np.zeros(2 * self.n_v + self.n_p + self.n_t)
         self.delta_values = np.zeros(self.n_v)
+        # Bind each surviving Parameter to its slot in `self.values` so that
+        # `Parameter.set_value()` can write a single index directly.  Slot
+        # order == position in `raw_param_references`, the same invariant
+        # `set_param_values`/`initialise`/`_refresh_inputs` rely on.
+        _param_base = 2 * self.n_v
+        for _i, _p in enumerate(self.raw_param_references):
+            _p.bind_value_slot(self.values, _param_base + _i)
         improved_equations_list = list(self.improved_equations)
         self.all_improved_symbols_matrix = sp.Matrix(self.all_improved_symbols)
         # `improved_equations` Matrix is no longer needed for lambdify; the
@@ -2986,6 +3086,23 @@ class Model:
         self.set_vars_values(vars)
         return self.lambdified_eqs(*self.values)
 
+    def _safe_residual_norm(self):
+        """`||F(x)||` at the CURRENT variable values, returning `+inf` instead
+        of raising / NaN when the state is thermodynamically invalid.
+
+        This is the merit function the backtracking line search minimises.
+        Returning `+inf` for an infeasible state (e.g. a Newton step that
+        overshoots a boiling density cliff into negative density -- which makes
+        a property call raise or produce NaN) is exactly what lets the line
+        search REJECT that step and backtrack to a feasible one.
+        """
+        try:
+            r = np.asarray(self.eval_residuals(self.get_vars_values())).reshape(-1)
+        except Exception:
+            return np.inf
+        n = float(fast_error_norm(r))
+        return n if np.isfinite(n) else np.inf
+
     def eval_jacobian(self, vars):
         self.set_vars_values(vars)
         return self.lambdified_jacobian(*self.values)
@@ -3037,8 +3154,230 @@ class Model:
         # double-count, so we deliberately do not call `set_t` again.
         self.record_state()
 
+    # --- recorded-state access (shared with the service layer) ------------
+
+    def latest_state(self):
+        """The most recently recorded full-state vector (as a numpy array), or
+        ``None`` if nothing has been recorded yet (i.e. before
+        ``initialise()`` / the first ``next_step()``)."""
+        state = self.record.get('state')
+        if not state:
+            return None
+        return np.asarray(state[-1])
+
+    def resolve_vars(self, vars=None):
+        """Map requested variable name(s) to ``(display_name, column)`` pairs.
+
+        Names match exactly, else by dotted-suffix, else by bare-suffix (see
+        :func:`match_name_index`) -- the same rule the service layer uses, so a
+        convenient suffix like ``"wall_0_0.C_1"`` resolves identically here.
+        ``vars=None`` returns every recorded variable (full names, in order); a
+        single string is treated as a one-element list.  Each requested name
+        resolves to its *first* match (unresolved names are skipped).
+        """
+        names = self.record.get('vars_names', [])
+        if vars is None:
+            return [(n, i) for i, n in enumerate(names)]
+        if isinstance(vars, str):
+            vars = [vars]
+        out = []
+        for req in vars:
+            i = match_name_index(names, req)
+            if i is not None:
+                out.append((req, i))
+        return out
+
+    def get_state(self, vars=None):
+        """Latest recorded value of each requested variable as a
+        ``{display_name: float}`` dict (``vars=None`` -> every variable).
+
+        Mirrors the service client's ``get_state``; matching is by suffix.
+        Returns ``{}`` if no state has been recorded yet.
+        """
+        row = self.latest_state()
+        if row is None:
+            return {}
+        return {name: float(row[i]) for name, i in self.resolve_vars(vars)}
+
+    def state_value(self, name):
+        """Latest recorded value of the *first* variable matching ``name``
+        (suffix match) as a float.
+
+        Raises ``KeyError`` if nothing has been recorded yet or no variable
+        matches.
+        """
+        row = self.latest_state()
+        if row is None:
+            raise KeyError(
+                "no recorded state yet; call initialise() (or next_step()) first")
+        i = match_name_index(self.record.get('vars_names', []), name)
+        if i is None:
+            raise KeyError(f"no recorded variable matching {name!r}")
+        return float(row[i])
+
+    def state_values(self, name):
+        """Latest recorded values of *all* variables matching ``name`` (suffix
+        match) as a 1-D numpy array -- e.g. to sum a per-segment quantity such
+        as ``state_values("m_dot_a_leak").sum()``.
+
+        Raises ``KeyError`` if nothing has been recorded yet or no variable
+        matches.
+        """
+        row = self.latest_state()
+        if row is None:
+            raise KeyError(
+                "no recorded state yet; call initialise() (or next_step()) first")
+        idx = match_name_indices(self.record.get('vars_names', []), name)
+        if not idx:
+            raise KeyError(f"no recorded variable matching {name!r}")
+        return np.array([row[i] for i in idx])
+
+    # --- recorded-history (timeseries) access -----------------------------
+    #
+    # These are the *timeseries* analogues of the latest-state accessors
+    # above: where `state_value` / `state_values` return the most recent
+    # value(s), `series` / `series_values` return the whole recorded column(s)
+    # over time, and `record_time` gives the matching time axis.  All accept an
+    # optional ``start:stop:stride`` window so a long adaptive run can be
+    # subsampled without copying the full history first.
+
+    def record_time(self, start=0, stop=None, stride=1):
+        """Recorded time axis as a 1-D numpy array (optionally sliced).
+
+        Pair with :meth:`series` / :meth:`series_values` (which accept the same
+        window) to get aligned ``(t, y)`` arrays for plotting or integration.
+        """
+        sl = slice(start, stop, max(1, stride or 1))
+        return np.asarray(self.record.get('time', [])[sl], dtype=float)
+
+    def series(self, name, start=0, stop=None, stride=1):
+        """1-D recorded timeseries of the *first* variable matching ``name``
+        (suffix match) -- the timeseries analogue of :meth:`state_value`.
+
+        Raises ``KeyError`` if nothing has been recorded yet or no variable
+        matches.
+        """
+        state_all = self.record.get('state', [])
+        if not state_all:
+            raise KeyError(
+                "no recorded state yet; call initialise() (or next_step()) first")
+        i = match_name_index(self.record.get('vars_names', []), name)
+        if i is None:
+            raise KeyError(f"no recorded variable matching {name!r}")
+        sl = slice(start, stop, max(1, stride or 1))
+        return np.asarray(state_all)[sl, i].astype(float)
+
+    def series_values(self, name, start=0, stop=None, stride=1):
+        """2-D recorded timeseries (rows = time, columns = matches) of *all*
+        variables matching ``name`` (suffix match) -- the timeseries analogue
+        of :meth:`state_values`.
+
+        Sum a per-instance quantity across segments in one call, e.g.
+        ``series_values("m_dot_a_leak").sum(axis=1)``.  Raises ``KeyError`` if
+        nothing has been recorded yet or no variable matches.
+        """
+        state_all = self.record.get('state', [])
+        if not state_all:
+            raise KeyError(
+                "no recorded state yet; call initialise() (or next_step()) first")
+        idx = match_name_indices(self.record.get('vars_names', []), name)
+        if not idx:
+            raise KeyError(f"no recorded variable matching {name!r}")
+        sl = slice(start, stop, max(1, stride or 1))
+        return np.asarray(state_all)[sl][:, idx].astype(float)
+
+    def expand_names(self, template, *index_specs):
+        """Expand a ``str.format`` template into an ordered list of variable
+        names by formatting it with the Cartesian product of ``index_specs``
+        (one iterable -- a ``range`` or list -- per replacement field; the last
+        spec varies fastest).
+
+        Use this when a quantity is indexed at one *or more* positions in the
+        name, e.g.::
+
+            expand_names("wall_0_0.C_{}", range(1, 4))
+            #  -> ['wall_0_0.C_1', 'wall_0_0.C_2', 'wall_0_0.C_3']
+            expand_names("wall_{}_0.C_{}", range(2), [1, 2])
+            #  -> ['wall_0_0.C_1', 'wall_0_0.C_2', 'wall_1_0.C_1', 'wall_1_0.C_2']
+
+        The result can be handed straight to :meth:`get_record` /
+        :meth:`get_series`; :meth:`series_grid` does exactly that and also
+        reshapes the result to the index grid.
+        """
+        specs = [list(s) for s in index_specs]
+        return [template.format(*combo) for combo in itertools.product(*specs)]
+
+    def series_grid(self, template, *index_specs, start=0, stop=None,
+                    stride=1, reshape=True):
+        """Recorded timeseries for a *grid* of variables, named by formatting
+        ``template`` with the Cartesian product of ``index_specs`` (see
+        :meth:`expand_names`).
+
+        Returns a numpy array whose first axis is time and whose remaining
+        axes follow ``index_specs`` -- so a single varying index gives the same
+        ``(n_time, n)`` shape you'd otherwise build by hand::
+
+            C = system.series_grid("wall_0_0.C_{}", range(1, n_nodes + 1))
+            #  shape (n_time, n_nodes); C[t, j] is node j+1 at time t
+
+        and two indices give ``(n_time, len(spec_0), len(spec_1))``.  Pass
+        ``reshape=False`` to keep the flat ``(n_time, n_names)`` layout.  Every
+        generated name must resolve (exact, else suffix match) -- a missing one
+        raises ``KeyError`` so the returned grid shape is always exact.
+        """
+        specs = [list(s) for s in index_specs]
+        names = [template.format(*combo) for combo in itertools.product(*specs)]
+        state_all = self.record.get('state', [])
+        if not state_all:
+            raise KeyError(
+                "no recorded state yet; call initialise() (or next_step()) first")
+        var_names = self.record.get('vars_names', [])
+        cols, missing = [], []
+        for nm in names:
+            i = match_name_index(var_names, nm)
+            (cols if i is not None else missing).append(i if i is not None else nm)
+        if missing:
+            raise KeyError(f"no recorded variable(s) matching {missing!r}")
+        sl = slice(start, stop, max(1, stride or 1))
+        rows = np.asarray(state_all)[sl][:, cols].astype(float)
+        if reshape and len(specs) > 1:
+            rows = rows.reshape((rows.shape[0],) + tuple(len(s) for s in specs))
+        return rows
+
+    def get_record(self, vars=None, start=0, stop=None, stride=1):
+        """A slice of recorded history, row-major (mirrors the service client's
+        ``get_record``): ``{"names": [...], "time": ndarray, "rows": ndarray}``
+        where ``rows[k]`` is the selected variables at ``time[k]``.
+
+        Each requested name resolves to its *first* match (use
+        :meth:`series_values` to gather every match of a name).
+        ``vars=None`` returns every recorded variable, in order.
+        """
+        cols = self.resolve_vars(vars)
+        time = self.record_time(start, stop, stride)
+        state_all = self.record.get('state', [])
+        sl = slice(start, stop, max(1, stride or 1))
+        if state_all and cols:
+            rows = np.asarray(state_all)[sl][:, [i for _, i in cols]].astype(float)
+        else:
+            rows = np.empty((len(time), len(cols)), dtype=float)
+        return {"names": [name for name, _ in cols], "time": time, "rows": rows}
+
+    def get_series(self, vars=None, start=0, stop=None, stride=1):
+        """A slice of recorded history, column-major (mirrors the service
+        client's ``get_series``): ``{"time": ndarray, "series": {name: ndarray}}``.
+
+        This is the convenient shape for plotting a chosen variable / list over
+        time.  Each requested name resolves to its *first* match;
+        ``vars=None`` returns every recorded variable.
+        """
+        rec = self.get_record(vars, start=start, stop=stop, stride=stride)
+        series = {name: rec["rows"][:, k] for k, name in enumerate(rec["names"])}
+        return {"time": rec["time"], "series": series}
+
     @line_profiler.profile
-    def initialise(self, n=1, relaxation=1.0, tol=1e-6, max_iter=100):
+    def initialise(self, n=1, relaxation=1.0, tol=1e-6, max_iter=100,
+                   line_search=False):
         """Set the system to a Newton-consistent state at t = 0.
 
         For weakly-coupled or smoothly-conditioned problems the default
@@ -3047,7 +3386,8 @@ class Model:
         upstream pressure where the pipe's default initial guesses are far
         from the boundary-driven values), pass a smaller `relaxation` to
         damp the first few iterations and avoid overshooting into infeasible
-        thermodynamic states.
+        thermodynamic states, or pass `line_search=True` to let a backtracking
+        line search pick the step length automatically (see `custom_solve`).
         """
         self.set_t_values([0.0, 0.0, 0.0])
         init_values = np.array([var.value for var in self.active_vars_references])
@@ -3055,7 +3395,8 @@ class Model:
         self.set_vars_values(init_values)
         self.set_prev_vars_values(init_values)
         self.set_param_values(init_params)
-        self.custom_solve(tol=tol, max_iter=max_iter, relaxation=relaxation)
+        self.custom_solve(tol=tol, max_iter=max_iter, relaxation=relaxation,
+                          line_search=line_search)
         self.next_step()
 
     def update_delta(self):
@@ -3230,7 +3571,43 @@ class Model:
 
     @line_profiler.profile
     def custom_solve(self, tol=1e-6, max_iter=100, relaxation=1.0,
-                     raise_on_no_convergence=False):
+                     raise_on_no_convergence=False, line_search=False,
+                     ls_beta=0.5, ls_c=1e-4, ls_max_backtracks=30,
+                     ls_grow=np.inf):
+        """Damped Newton solve.
+
+        Two step-length policies:
+
+        * Default (`line_search=False`): a fixed `relaxation` damping -- every
+          step is `x <- x - relaxation * J^-1 F`.  Cheap (no extra residual
+          evals) and fine for smoothly-conditioned problems, but on a stiff
+          property cliff (boiling/flashing density) the right `relaxation` has
+          to be hand-tuned or the full step overshoots into an infeasible state.
+
+        * `line_search=True`: feasibility-guarded backtracking.  Start from a
+          step of `relaxation` (default 1.0 = full Newton) and halve it
+          (`ls_beta`) until the trial state is FEASIBLE -- i.e. `||F||` is
+          finite.  On a stiff property cliff (boiling/flashing) a full Newton
+          step overshoots into an infeasible state (e.g. negative density),
+          which makes a property call raise / return NaN and scores `+inf`
+          (see `_safe_residual_norm`); that step is rejected and the search
+          backs off until it lands in a valid region.  Where the full step is
+          already feasible (the common case) `lam` stays at `relaxation`, so
+          this is identical to plain Newton -- it only damps where it must,
+          with no hand-tuned `relaxation`.  Costs `1 + n_backtracks` extra
+          residual evals per iteration.
+
+          A decrease test (Armijo, or the residual-growth cap `ls_grow`) is
+          NOT applied by default: the mixed-unit residual (Pa ~ 1e5 dwarfs
+          continuity ~ 1e-3) makes the raw norm a poor merit, and capping
+          growth rejects perfectly good Newton steps in the ill-conditioned
+          single-phase region -- benchmarked at ~4-18x more iterations than
+          the pure feasibility guard.  `ls_grow` defaults to `+inf` (pure
+          feasibility); pass a finite value to additionally reject any step
+          that grows `||F||` past `ls_grow x ||F(x)||` (rarely useful here).
+
+        `ls_c` is unused (kept for signature stability).
+        """
         guess = self.get_vars_values()
         error_norm = np.inf
         i = 0
@@ -3244,13 +3621,44 @@ class Model:
             buf = self._scaled_delta_buf
         while error_norm > tol and i < max_iter:
             self.update_delta()
-            self.delta_values *= relaxation
+            delta = self.delta_values
+            # (Scaled) norm of the FULL Newton step, computed before any
+            # damping; the actual step taken is `lam * delta`.
             if is_scaled:
-                np.multiply(self.delta_values, inv_scales, out=buf)
-                error_norm = fast_error_norm(buf)
+                np.multiply(delta, inv_scales, out=buf)
+                full_step_norm = fast_error_norm(buf)
             else:
-                error_norm = fast_error_norm(self.delta_values)
-            guess -= self.delta_values
+                full_step_norm = fast_error_norm(delta)
+            if line_search:
+                x0 = guess.copy()
+                f0 = self._safe_residual_norm()
+                # By default (`ls_grow=inf`) the only thing that triggers a
+                # backtrack is INFEASIBILITY: an overshoot into e.g. negative
+                # density scores +inf and fails the `f_try <= f_cap` test below,
+                # while every feasible (finite) trial passes -- so Newton keeps
+                # its natural full step wherever it is valid.  A finite
+                # `ls_grow` additionally caps residual growth at `ls_grow x f0`
+                # (skipped while f0 is infinite, i.e. recovering from a bad
+                # start, so any finite trial is accepted).
+                if not np.isfinite(f0) or not np.isfinite(ls_grow):
+                    f_cap = np.inf
+                else:
+                    f_cap = ls_grow * f0
+                lam = relaxation
+                for _ls in range(ls_max_backtracks):
+                    guess[:] = x0
+                    guess -= lam * delta
+                    f_try = self._safe_residual_norm()
+                    if np.isfinite(f_try) and f_try <= f_cap:
+                        break
+                    lam *= ls_beta
+                # On exhaustion the most-damped (smallest-lam) step is already
+                # applied to `guess`; convergence is judged on what we took.
+                error_norm = lam * full_step_norm
+            else:
+                delta *= relaxation
+                error_norm = relaxation * full_step_norm
+                guess -= delta
             i += 1
         # Expose the last solve's outcome so `solve_adaptive_step` (and any
         # diagnostic tooling) can inspect convergence without re-evaluating
@@ -3263,11 +3671,12 @@ class Model:
 
     @line_profiler.profile
     def solve_dae_step(self, dt, relaxation=1.0, tol=1e-6, max_iter=100,
-                       raise_on_no_convergence=False):
+                       raise_on_no_convergence=False, line_search=False):
         self.set_dt(dt)
         self.set_t(self.get_t_value() + dt)
         self.custom_solve(tol=tol, max_iter=max_iter, relaxation=relaxation,
-                          raise_on_no_convergence=raise_on_no_convergence)
+                          raise_on_no_convergence=raise_on_no_convergence,
+                          line_search=line_search)
 
     # --- adaptive time stepping -------------------------------------------------------
     #
@@ -3387,6 +3796,150 @@ class Model:
                     grow=grow, shrink=shrink, max_retries=max_retries,
                     relaxation=relaxation, tol=tol, max_iter=max_iter,
                     params=params)
+
+    def run(self, stop_time=None, *, steps=None, strategy="richardson",
+            dt=None, dt_min=1e-9, dt_max=None, dt_start=None,
+            grow=1.5, shrink=0.5, max_retries=20,
+            relaxation=1.0, tol=1e-6, max_iter=100,
+            max_steps=None, wall_budget=None, on_step=None,
+            raise_on_no_convergence=True):
+        """Integrate from the current time, owning the whole step loop.
+
+        This is the single high-level driver for time integration: it picks
+        each step's `dt` (fixed or via an adaptive `strategy`), takes the step,
+        commits it with `next_step()`, and repeats until a stop condition is
+        met.  Scripts, examples, and the service all share it so the loop and
+        the dt controller are implemented once.
+
+        Stop conditions (give at least one; the loop ends on whichever trips
+        first): advance until `t >= stop_time`, or until `steps` accepted steps
+        have been taken, or `max_steps`, or `wall_budget` seconds of wall-clock.
+
+        Parameters
+        ----------
+        stop_time : float | None
+            Integrate until the model time reaches this (in the model's time
+            unit).  Steps are clipped so the last one lands exactly on it.
+        steps, max_steps : int | None
+            Cap on the number of accepted steps (`steps` is the natural
+            fixed-`dt` budget; `max_steps` is an extra hard safety cap).
+        strategy : str | dict | None
+            Passed through to :meth:`solve_adaptive_step`.  `"fixed"` requires
+            `dt`; the adaptive strategies (`"richardson"`, `"derivative_limit"`,
+            `"predictor_corrector"`) use `dt`/`dt_start` only as the first
+            target and then self-adapt (carrying `dt` forward via `_dt_hint`).
+        dt : float | None
+            Fixed step (`strategy="fixed"`) or the initial adaptive target.
+        dt_min, dt_max : float
+            Hard floor / ceiling on the adaptive `dt`.  When `dt_max` is None it
+            defaults to `(stop_time - t_start) / 20` (so dt can grow to ~5% of
+            the span) or, failing that, `4 * dt_start`.
+        dt_start : float | None
+            First adaptive target when `dt` is not given (defaults to `dt_max`).
+        grow, shrink, max_retries, relaxation, tol, max_iter
+            Forwarded to :meth:`solve_adaptive_step`.
+        wall_budget : float | None
+            Abort (cleanly) after this many seconds of wall-clock.
+        on_step : callable | None
+            Called after every committed step as `on_step(model, info)` where
+            `info` carries `{"step", "t", "dt", "rejections", "metric",
+            "strategy"}`.  Return `False` to request a cooperative stop (this is
+            how the service injects streaming / stop / pause).
+        raise_on_no_convergence : bool
+            If True, a Newton/adaptive failure propagates; if False the loop
+            stops and the failure is reported in the returned summary.
+
+        Returns
+        -------
+        dict
+            `{"strategy", "steps", "rejections", "t_start", "t_end",
+            "wall_time", "stop_reason", "error"}`.
+        """
+        if stop_time is None and steps is None and max_steps is None:
+            raise ValueError(
+                "run() needs at least one stop condition: stop_time, steps, "
+                "or max_steps")
+        name, _ = _normalise_adaptive_strategy(strategy)
+        is_fixed = (name == "fixed")
+        if is_fixed and dt is None:
+            raise ValueError("run(strategy='fixed', ...) requires a dt")
+
+        t_start = self.get_t_value()
+        if dt_max is None and not is_fixed:
+            if stop_time is not None:
+                dt_max = (stop_time - t_start) / 20.0
+            elif dt_start is not None or dt is not None:
+                dt_max = 4.0 * (dt_start if dt_start is not None else dt)
+        init_target = (dt if dt is not None
+                       else dt_start if dt_start is not None
+                       else dt_max if dt_max is not None else 1.0)
+
+        n_steps = 0
+        n_rej = 0
+        reason = "stop_time"
+        err = None
+        t_wall0 = time.perf_counter()
+        while True:
+            t = self.get_t_value()
+            if stop_time is not None and t >= stop_time - 1e-9:
+                reason = "stop_time"
+                break
+            if steps is not None and n_steps >= steps:
+                reason = "steps"
+                break
+            if max_steps is not None and n_steps >= max_steps:
+                reason = "max_steps"
+                break
+            if (wall_budget is not None
+                    and time.perf_counter() - t_wall0 > wall_budget):
+                reason = "wall_budget"
+                break
+
+            if is_fixed:
+                dt_try = dt
+            else:
+                dt_try = getattr(self, "_dt_hint", init_target)
+                if dt_max is not None:
+                    dt_try = min(dt_try, dt_max)
+            if stop_time is not None:
+                dt_try = min(dt_try, stop_time - t)
+
+            adaptive_dt_max = dt_max if dt_max is not None else 4.0 * dt_try
+            try:
+                dt_used, info = self.solve_adaptive_step(
+                    dt_try, strategy=strategy, dt_min=dt_min,
+                    dt_max=adaptive_dt_max, grow=grow, shrink=shrink,
+                    max_retries=max_retries, relaxation=relaxation, tol=tol,
+                    max_iter=max_iter)
+                self.next_step()
+            except (NewtonConvergenceFailure, RuntimeError) as e:
+                if raise_on_no_convergence:
+                    raise
+                reason = "error"
+                err = str(e)
+                break
+
+            n_steps += 1
+            n_rej += int(info.get("rejections", 0))
+            if on_step is not None:
+                cont = on_step(self, {
+                    "step": n_steps, "t": self.get_t_value(), "dt": dt_used,
+                    "rejections": info.get("rejections", 0),
+                    "metric": info.get("metric", 0.0), "strategy": name})
+                if cont is False:
+                    reason = "callback"
+                    break
+
+        return {
+            "strategy": name,
+            "steps": n_steps,
+            "rejections": n_rej,
+            "t_start": t_start,
+            "t_end": self.get_t_value(),
+            "wall_time": time.perf_counter() - t_wall0,
+            "stop_reason": reason,
+            "error": err,
+        }
 
     def set_initial_time(self, t):
         for c in self.components.values():
@@ -3719,7 +4272,7 @@ class Parameter(Model):
     works regardless of whether `self.A_in` is a `float` or a `Parameter`.
     """
 
-    def __new__(cls, value=None, unit=None):
+    def __new__(cls, value=None, unit=None, description=None):
         # Unwrap alias chains so we never build alias-to-alias references --
         # the target is always a concrete `Parameter`.
         while isinstance(value, ParameterAlias):
@@ -3731,12 +4284,43 @@ class Parameter(Model):
             return ParameterAlias(value)
         return super().__new__(cls)
 
-    def __init__(self, value, unit=None):
+    def __init__(self, value, unit=None, description=None):
         self.components = {}
         self.symbol = None
         self.value = value
         self.unit = unit
+        #: Optional human-readable description (authored once via the owning
+        #: component's `PARAMS` spec; see `hydrogen.paramspec`).
+        self.description = description
         self.can_evaluate = False
+        # Filled in by the top-level Model at `instantiate()` so `set_value`
+        # can write straight into the live solver buffer (a single slot)
+        # instead of re-pushing the whole parameter vector.  `None` until
+        # bound (e.g. before instantiate, or for an unused Parameter).
+        self._value_array = None
+        self._value_index = None
+
+    def bind_value_slot(self, value_array, index):
+        """Wire this Parameter to its slot in the owning model's `values` array.
+
+        Called once per `instantiate()` for every Parameter that survives into
+        the residual.  After binding, `set_value` keeps `self.value` and the
+        live solver buffer in sync.
+        """
+        self._value_array = value_array
+        self._value_index = index
+
+    def set_value(self, value):
+        """Update this Parameter and push it straight into the solver buffer.
+
+        Equivalent to assigning `.value` *and* refreshing only this parameter's
+        slot, so the next solve sees the new value without re-pushing the whole
+        param vector.  Before `instantiate()` (unbound) it just records the
+        value, which `initialise()` later snapshots into the buffer.
+        """
+        self.value = value
+        if self._value_array is not None:
+            self._value_array[self._value_index] = value
 
     def free(self):
         return Variable(self.value, self.unit)
@@ -3809,8 +4393,17 @@ class ParameterAlias:
         return getattr(self._target, 'unit', None)
 
     @property
+    def description(self):
+        return getattr(self._target, 'description', None)
+
+    @property
     def target(self):
         return self._target
+
+    def set_value(self, value):
+        # Aliases never own a slot; forward to the concrete target, which is
+        # the Parameter that actually lives in the param block.
+        self._target.set_value(value)
 
     # --- composition hooks expected by the framework -------------------
 

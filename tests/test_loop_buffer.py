@@ -35,10 +35,6 @@ DT           = 0.05        # s
 N_STEPS      = 6
 
 
-def _push_params(model: Model) -> None:
-    model.set_param_values(
-        np.array([p.value for p in model.raw_param_references])
-    )
 
 
 class _InletPin(Model):
@@ -233,9 +229,8 @@ def reverse_run():
     rec_idx_phase1_end = len(system.record['time']) - 1
 
     # Flip the sign of BOTH pinned mass flows.
-    system['inlet']['m_dot_target'].value = -M_DOT_BASE
-    system['outlet']['m_dot_target'].value = -M_DOT_BASE
-    _push_params(system)
+    system['inlet']['m_dot_target'].set_value(-M_DOT_BASE)
+    system['outlet']['m_dot_target'].set_value(-M_DOT_BASE)
 
     # Phase 2: reverse, expect freeze at the warmed-up state.
     for _ in range(N_STEPS):

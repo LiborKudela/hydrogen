@@ -1,0 +1,17 @@
+{
+  "hydrogen_version": "0.1.0",
+  "schema_version": 1,
+  "components": {
+    "src": {
+      "type": "hydrogen.control.Sine",
+      "params": {"amplitude": 1.0, "freq": 0.2, "offset": 0.0}
+    },
+    "lag": {
+      "type": "hydrogen.control.FirstOrder",
+      "params": {"T": 1.5, "k": 1.0}
+    }
+  },
+  "connections": [
+    {"from": "src.y", "to": "lag.u"}
+  ]
+}

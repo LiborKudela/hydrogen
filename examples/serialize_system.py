@@ -154,13 +154,13 @@ def part2_from_data():
     spec = {
         "schema_version": 1,
         "components": {
-            "hot": {"type": "FixedTemperature", "params": {"T_set": 400.0}},
-            "cold": {"type": "FixedTemperature", "params": {"T_set": 300.0}},
+            "hot": {"type": "hydrogen.thermofluid.FixedTemperature", "params": {"T_set": 400.0}},
+            "cold": {"type": "hydrogen.thermofluid.FixedTemperature", "params": {"T_set": 300.0}},
             "stack": {
                 "type": "Model",
                 "components": {
-                    "c1": {"type": "ThermalConductor", "params": {"G": 10.0}},
-                    "c2": {"type": "ThermalConductor", "params": {"G": 10.0}},
+                    "c1": {"type": "hydrogen.thermofluid.ThermalConductor", "params": {"G": 10.0}},
+                    "c2": {"type": "hydrogen.thermofluid.ThermalConductor", "params": {"G": 10.0}},
                 },
                 "connections": [
                     {"from": "c1.heat_b", "to": "c2.heat_a"},

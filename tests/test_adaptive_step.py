@@ -406,3 +406,82 @@ def test_info_dict_contents():
     assert info["rejections"] >= 0
     assert info["metric"] >= 0.0
     assert info["n_iters"] >= 1
+
+
+# --- 12. Model.run: the high-level loop driver ---------------------------------
+
+def test_run_to_stop_time_integrates_accurately():
+    """`run(stop_time=...)` owns the loop, lands exactly on stop_time, and
+    integrates the decay model to the analytic value."""
+    model = _build_decay_model()
+    summary = model.run(
+        stop_time=1.0,
+        strategy={"name": "richardson", "tol_local": 1e-3, "atol": 1.0},
+        dt_start=0.01, dt_min=1e-6, dt_max=0.2)
+    assert summary["stop_reason"] == "stop_time"
+    assert summary["steps"] > 0
+    assert abs(summary["t_end"] - 1.0) < 1e-9
+    y_end = _trace(model, ".y")[-1]
+    assert abs(y_end - np.exp(-1.0)) < 1e-3
+
+
+def test_run_fixed_steps_counts_and_advances():
+    """`run(strategy='fixed', dt, steps)` takes exactly `steps` steps."""
+    model = _build_test_model()
+    summary = model.run(strategy="fixed", dt=0.02, steps=10)
+    assert summary["stop_reason"] == "steps"
+    assert summary["steps"] == 10
+    assert summary["rejections"] == 0
+    assert abs(summary["t_end"] - 0.2) < 1e-12
+
+
+def test_run_fixed_matches_manual_loop():
+    """The fixed path must reproduce a hand-rolled solve_dae_step loop exactly."""
+    m_run = _build_test_model()
+    m_manual = _build_test_model()
+    m_run.run(strategy="fixed", dt=0.03, steps=7)
+    for _ in range(7):
+        m_manual.solve_dae_step(0.03)
+        m_manual.next_step()
+    np.testing.assert_array_equal(
+        np.asarray(m_run.record["state"]),
+        np.asarray(m_manual.record["state"]),
+    )
+
+
+def test_run_requires_a_stop_condition():
+    model = _build_test_model()
+    with pytest.raises(ValueError, match="stop_time, steps"):
+        model.run(strategy="fixed", dt=0.01)
+
+
+def test_run_fixed_requires_dt():
+    model = _build_test_model()
+    with pytest.raises(ValueError, match="requires a dt"):
+        model.run(steps=5, strategy="fixed")
+
+
+def test_run_on_step_callback_can_stop_early():
+    """Returning False from `on_step` requests a cooperative stop."""
+    model = _build_test_model()
+    seen = []
+
+    def _cb(_m, info):
+        seen.append(info["step"])
+        return info["step"] < 3            # stop right after the 3rd step
+
+    summary = model.run(steps=100, strategy="fixed", dt=0.01, on_step=_cb)
+    assert summary["stop_reason"] == "callback"
+    assert summary["steps"] == 3
+    assert seen == [1, 2, 3]
+
+
+def test_run_resumes_from_current_time():
+    """Two back-to-back `run` calls continue from where the first left off."""
+    model = _build_test_model()
+    model.run(stop_time=0.5, strategy="fixed", dt=0.05)
+    t_mid = model.get_t_value()
+    summary = model.run(stop_time=1.0, strategy="fixed", dt=0.05)
+    assert abs(t_mid - 0.5) < 1e-12
+    assert abs(summary["t_end"] - 1.0) < 1e-12
+    assert summary["t_start"] == pytest.approx(t_mid)

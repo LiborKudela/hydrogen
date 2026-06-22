@@ -8,14 +8,13 @@ This module defines only the *domain-agnostic* core:
   * `PortError` + subclasses -- the wiring-error hierarchy raised by
     `Model.connect()` and `Port._mark_connected()`.
 
-Concrete port subclasses (`FluidPort_phm`, future `ThermalPort_TQ`,
-`ElectricalPort_VI`, ...) live in their respective domain libraries at
-the top of the same file that defines the components using them, e.g.
-`hydrogen.components.fluid`.  Keeping the library-specific
-ports next to the components that own them means each physics domain is
-self-contained: a user reading the fluid module sees the port contract
-and the component implementations side-by-side, without cross-module
-hopping into a global "ports.py".
+Concrete port subclasses (`FluidPort_phm`, `ThermalPort_TQ`,
+`PermeationPort_pN`, ...) live in their respective domain libraries next to
+the components that use them, e.g. `hydrogen.components.thermofluid.ports`.
+Keeping the library-specific ports inside the domain means each library is
+self-contained: a user reading the thermofluid package sees the port contracts
+and the component implementations side-by-side, without hopping into a global
+"ports.py".
 
 Wiring contract (enforced by `Model.connect()`):
 
@@ -56,8 +55,9 @@ class PortNotConnectedWarning(UserWarning):
     Such a port leaves its backing across-variable unclosed, so the system is
     structurally singular and the Newton solve would otherwise fail with an
     opaque "Factor is exactly singular".  The warning names the offending port
-    so the cause is obvious.  Used by, e.g., the fluid `HeatedSegment` wall
-    port, which only makes sense once a thermal boundary or wall is attached.
+    so the cause is obvious.  Used by, e.g., a heated fluid segment's `wall`
+    port (`TwoPortSegment(heat_port=True)`), which only makes sense once a
+    thermal boundary or wall is attached.
     """
 
 

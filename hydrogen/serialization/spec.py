@@ -38,6 +38,7 @@ from .registry import (
     package_requirement,
     serialize_medium,
 )
+from .values import decode_value, encode_value, value_spec_ok
 
 # Variable "kind" discriminator <-> class.  Exact-type keyed (so a
 # `ParameterAlias` or other subclass is never silently misclassified).
@@ -102,11 +103,14 @@ def _param_spec(cls):
 
 
 def serialize_params(component) -> dict:
-    """Recover a leaf component's constructor kwargs as JSON scalars.
+    """Recover a leaf component's constructor kwargs in JSON-able form.
 
-    Relies on the package convention that each scalar constructor argument is
-    stored as a like-named attribute.  An optional kwarg that is not stored is
-    simply omitted (the loader falls back to the constructor default); a
+    Relies on the package convention that each constructor argument is stored as
+    a like-named attribute.  Scalars (and numpy scalars) are emitted directly;
+    structured value objects (and lists of them) that implement ``to_spec`` --
+    e.g. ``WallLayer`` / permeation flux models -- are encoded recursively (see
+    :mod:`hydrogen.serialization.values`).  An optional kwarg that is not stored
+    is simply omitted (the loader falls back to the constructor default); a
     *required* one that is missing is a hard error (needs a custom hook).
     """
     sig = inspect.signature(type(component).__init__)
@@ -124,8 +128,20 @@ def serialize_params(component) -> dict:
                 f"{pname!r} is not stored as an attribute, so it cannot be "
                 f"serialized automatically (a custom hook would be needed)."
             )
-        out[pname] = _jsonable(getattr(component, pname))
+        out[pname] = _encode_param(getattr(component, pname))
     return out
+
+
+def _encode_param(value):
+    """Encode one constructor-param value (scalar, numpy scalar, list, or a
+    structured value object implementing ``to_spec``)."""
+    if isinstance(value, _JSON_SCALAR):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_encode_param(v) for v in value]
+    if callable(getattr(value, "to_spec", None)):
+        return encode_value(value)
+    return _jsonable(value)  # numpy scalar -> python; else raises a clear error
 
 
 def _validate_params(cls, params, where, errors):
@@ -138,9 +154,10 @@ def _validate_params(cls, params, where, errors):
     for key in required - set(params):
         errors.append(f"{where}: missing required param {key!r} for {cls.__name__}")
     for key, val in params.items():
-        if key in allowed and not isinstance(val, _JSON_SCALAR):
+        if key in allowed and not value_spec_ok(val):
             errors.append(
-                f"{where}: param {key!r} value {val!r} is not a JSON scalar"
+                f"{where}: param {key!r} value {val!r} is not a JSON scalar "
+                f"or a known value spec"
             )
 
 
@@ -259,7 +276,7 @@ def _validate_component(name, cspec, ctx, parent_path, errors):
 
     cls = ctx.registry.get(ctype)
     if cls is None:
-        known = sorted(k for k in ctx.registry if "." not in k)
+        known = sorted(k for k in ctx.registry if k.startswith("hydrogen."))
         errors.append(
             f"{where}: unknown component type {ctype!r}. Builtin types: {known}. "
             f"(For a user library, declare it under requires.packages and use a "
@@ -313,7 +330,7 @@ def _build_component(cspec, ctx):
     if ctype == "Model":
         return _SpecComposite(cspec, ctx, medium=medium)
     cls = ctx.registry[ctype]
-    params = dict(cspec.get("params", {}))
+    params = {k: decode_value(v) for k, v in cspec.get("params", {}).items()}
     if medium is not None:
         return cls(medium, **params)
     return cls(**params)
@@ -582,9 +599,13 @@ def to_dict(model: Model) -> dict:
     A model produced by :func:`from_dict` already carries its canonical spec,
     so it is echoed back verbatim (with a refreshed version header) -- this
     makes ``to_dict(from_dict(spec))`` exact without needing to instantiate.
-    For a hand-written `Model`, the dump is reflective and therefore requires
-    the model to be **wired** (call ``instantiate(...)`` first) so that its
-    port-level connections are present.
+
+    A hand-written `Model` is **wired on demand**: its `declare_equations()` is
+    run once (via :meth:`Model.ensure_equations_declared`) so the port-level
+    connections are present, unless it was already wired (by an earlier
+    `instantiate()` / `declare_equations()` call), in which case nothing extra
+    happens.  So a freshly built model can be dumped directly -- no need to
+    `instantiate()` or call `declare_equations()` first.
     """
     if isinstance(model, _SpecComposite):
         out = dict(model._spec)
@@ -594,6 +615,10 @@ def to_dict(model: Model) -> dict:
         ordered = {k: out[k] for k in _HEADER_KEYS}
         ordered.update({k: v for k, v in out.items() if k not in _HEADER_KEYS})
         return ordered
+
+    # Wire the model on demand (idempotent) so its port connections are present
+    # to dump -- callers no longer have to instantiate / declare_equations first.
+    model.ensure_equations_declared()
 
     ctx = _DumpCtx()
     body = _composite_to_dict(model, ctx)

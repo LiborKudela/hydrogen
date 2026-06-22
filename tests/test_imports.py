@@ -17,7 +17,6 @@ def test_top_level_attributes():
         "AmbientInlet",
         "AmbientOutlet",
         "TwoPortSegment",
-        "HeatedSegment",
         "AdiabaticPump",
         "StraightPipe",
         "PressureSource",
@@ -53,9 +52,20 @@ def test_top_level_attributes():
 def test_submodule_imports():
     from hydrogen.caching import ModelCache, hash_args, numpy_cache  # noqa: F401
     from hydrogen.components import StraightPipe  # noqa: F401
-    from hydrogen.components.fluid import FluidPort_phm, HeatedSegment  # noqa: F401
     from hydrogen.components.power import ConjugatePipe  # noqa: F401
-    from hydrogen.components.thermal import FlatWall, ThermalPort_TQ  # noqa: F401
+    from hydrogen.components.thermofluid import (  # noqa: F401
+        CylindricalWall,
+        FluidPort_phm,
+        PermeationPort_pN,
+        ThermalPort_TQ,
+        TwoPortSegment,
+    )
+    from hydrogen.components.thermofluid.flow import StraightPipe as _SP  # noqa: F401
+    from hydrogen.components.thermofluid.permeation import (  # noqa: F401
+        SteadyRichardson,
+        TransientDiffusion,
+    )
+    from hydrogen.components.thermofluid.walls import FlatWall  # noqa: F401
     from hydrogen.medium import CoolPropMedium  # noqa: F401
     from hydrogen.model import Model, Variable  # noqa: F401
     from hydrogen.numerics import G_const, fast_error_norm, lambdify_compat  # noqa: F401
