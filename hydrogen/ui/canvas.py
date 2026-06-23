@@ -101,6 +101,13 @@ class Canvas(QtWidgets.QGraphicsView):
         self._show_port_names = True   # per-port name labels
         self._scene = QtWidgets.QGraphicsScene(self)
         self._scene.setSceneRect(-2000, -2000, 6800, 5200)
+        # The default BSP index caches each item's scene bounds. When a node is
+        # resized, its child ports move (setPos) and the node is repositioned to
+        # keep the grabbed corner fixed; the index can then hold stale bounds and
+        # the scene paints a port both at its old and new spot ("duplicated port"
+        # ghost). NoIndex re-evaluates item geometry on every paint, which is
+        # cheap at schematic scale and removes the artefact entirely.
+        self._scene.setItemIndexMethod(QtWidgets.QGraphicsScene.NoIndex)
         self.setScene(self._scene)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
