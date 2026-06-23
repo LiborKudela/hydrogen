@@ -94,6 +94,8 @@ class Canvas(QtWidgets.QGraphicsView):
         self._zoom = 1.0
         self._panning = False
         self._pan_start = QtCore.QPoint()
+        self._show_titles = True   # instance name + type label group
+        self._show_params = True   # ui_label parameter labels
         self._scene = QtWidgets.QGraphicsScene(self)
         self._scene.setSceneRect(-2000, -2000, 6800, 5200)
         self.setScene(self._scene)
@@ -227,6 +229,8 @@ class Canvas(QtWidgets.QGraphicsView):
 
     def add_node(self, entry: dict, scene_pos: QtCore.QPointF) -> NodeItem:
         node = NodeItem(entry, self._next_id(entry["name"]), self)
+        node.set_title_labels_visible(self._show_titles)
+        node.set_param_labels_visible(self._show_params)
         r = node.rect()
         node.setPos(scene_pos.x() - r.width() / 2, scene_pos.y() - r.height() / 2)
         self._scene.addItem(node)
@@ -238,13 +242,34 @@ class Canvas(QtWidgets.QGraphicsView):
     def add_node_at_center(self, entry: dict) -> NodeItem:
         return self.add_node(entry, self.mapToScene(self.viewport().rect().center()))
 
+    def set_titles_visible(self, visible: bool):
+        self._show_titles = visible
+        for node in self.nodes():
+            node.set_title_labels_visible(visible)
+
+    def set_params_visible(self, visible: bool):
+        self._show_params = visible
+        for node in self.nodes():
+            node.set_param_labels_visible(visible)
+
+    def refresh_catalog(self, by_type: dict[str, dict]):
+        """Rebind every placed node to fresh catalogue metadata.
+
+        Saving and loading the in-memory canvas state is the least surprising
+        way to keep placements, transforms, params, custom ports, locks, and
+        any still-valid wires while rebuilding items from the updated catalogue.
+        """
+        state = self.to_project()
+        self._by_type = by_type
+        self.load_project(state)
+
     # --- project (canvas) save / load --------------------------------------- #
     def to_project(self) -> dict:
         """Full canvas state: every node (placement, transform, medium, params)
         plus the wiring between them."""
         nodes = []
         for n in self.nodes():
-            nodes.append({
+            node = {
                 "comp_id": n.comp_id,
                 "type": n.type_name,
                 "x": n.pos().x(),
@@ -254,9 +279,18 @@ class Canvas(QtWidgets.QGraphicsView):
                 "mirror_y": n._mirror_y,
                 "medium": n.medium,
                 "params": n.params,
+                "ports_locked": n.ports_locked,
+                "label_offsets": {
+                    name: [offset.x(), offset.y()]
+                    for name, offset in n._label_offsets.items()
+                },
                 "ports": {name: list(layout)
                           for name, layout in n._port_layout.items()},
-            })
+            }
+            if n._custom_size is not None:
+                node["w"] = n.rect().width()
+                node["h"] = n.rect().height()
+            nodes.append(node)
         connections = [
             {"from": f"{c.src.node.comp_id}.{c.src.pname}",
              "to": f"{c.dst.node.comp_id}.{c.dst.pname}"}
@@ -277,13 +311,21 @@ class Canvas(QtWidgets.QGraphicsView):
             node = NodeItem(entry, nd["comp_id"], self)
             node.medium = nd.get("medium")
             node.params = nd.get("params")
+            for name, offset in nd.get("label_offsets", {}).items():
+                if name in node._label_offsets and len(offset) == 2:
+                    node._label_offsets[name] = QtCore.QPointF(offset[0], offset[1])
+            if "w" in nd and "h" in nd:
+                node.set_custom_size(nd["w"], nd["h"])
             node._port_layout = {name: tuple(layout)
                                  for name, layout in nd.get("ports", {}).items()}
             node.rebuild_ports()                    # ports match params + layout
             node.setPos(nd.get("x", 0.0), nd.get("y", 0.0))
-            node._rot = int(nd.get("rot", 0))
+            node._rot = int(nd.get("rot", node._default_rot))
             node._mirror_x = bool(nd.get("mirror_x", False))
             node._mirror_y = bool(nd.get("mirror_y", False))
+            node.set_ports_locked(bool(nd.get("ports_locked", node.ports_locked)))
+            node.set_title_labels_visible(self._show_titles)
+            node.set_param_labels_visible(self._show_params)
             node.apply_transform()
             self._scene.addItem(node)
             by_id[node.comp_id] = node
@@ -335,6 +377,11 @@ class Canvas(QtWidgets.QGraphicsView):
             self._clear_temp()
             self._on_status("Connection cancelled")
             return
+        if event.key() == QtCore.Qt.Key_R:
+            rotated = self._rotate_selection(90)
+            if rotated:
+                self._on_status(f"Rotated {rotated} selected component(s)")
+                return
         if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
             removed = [i for i in self._scene.selectedItems() if isinstance(i, NodeItem)]
             for node in removed:
@@ -344,6 +391,36 @@ class Canvas(QtWidgets.QGraphicsView):
                                 f"({self.node_count()} on canvas)")
                 return
         super().keyPressEvent(event)
+
+    def _rotate_selection(self, degrees: int) -> int:
+        selected = [i for i in self._scene.selectedItems() if isinstance(i, NodeItem)]
+        if not selected:
+            return 0
+
+        total_area = 0.0
+        cx = cy = 0.0
+        for node in selected:
+            box = node.sceneBoundingRect()
+            area = max(1.0, box.width() * box.height())
+            center = box.center()
+            total_area += area
+            cx += center.x() * area
+            cy += center.y() * area
+        group_center = QtCore.QPointF(cx / total_area, cy / total_area)
+
+        around_group = QtGui.QTransform()
+        around_group.translate(group_center.x(), group_center.y())
+        around_group.rotate(degrees)
+        around_group.translate(-group_center.x(), -group_center.y())
+
+        for node in selected:
+            old_center = node.mapToScene(node.rect().center())
+            new_center = around_group.map(old_center)
+            node.rotate_by(degrees)
+            transformed_center = node.transform().map(node.rect().center())
+            node.setPos(new_center - transformed_center)
+            self.refresh_connections(node)
+        return len(selected)
 
     # --- connection lifecycle (driven by PortItem mouse events) ------------- #
     def connections(self) -> list[ConnectionItem]:
@@ -459,6 +536,10 @@ class Canvas(QtWidgets.QGraphicsView):
         act_reset = tmenu.addAction(_transform_icon("reset"), "Reset transform")
 
         menu.addSeparator()
+        act_lock_ports = menu.addAction("Lock port positions")
+        act_lock_ports.setCheckable(True)
+        act_lock_ports.setChecked(node.ports_locked)
+        menu.addSeparator()
         act_del = menu.addAction("Delete")
         chosen = exec_(menu, event.globalPos())
         if chosen == act_props:
@@ -481,6 +562,10 @@ class Canvas(QtWidgets.QGraphicsView):
         elif chosen == act_reset:
             node.reset_transform()
             self._on_status(f"Reset transform on '{node.comp_id}'")
+        elif chosen == act_lock_ports:
+            node.set_ports_locked(act_lock_ports.isChecked())
+            state = "locked" if node.ports_locked else "unlocked"
+            self._on_status(f"Port positions {state} on '{node.comp_id}'")
         elif chosen == act_del:
             self.remove_node(node)
             self._on_status(f"Removed '{node.comp_id}'  "

@@ -46,9 +46,17 @@ class MainWindow(QtWidgets.QMainWindow):
         left = QtWidgets.QWidget()
         ll = QtWidgets.QVBoxLayout(left)
         ll.setContentsMargins(6, 6, 6, 6)
-        ll.addWidget(QtWidgets.QLabel(
-            f"<b>Catalogue</b> &mdash; {len(catalog)} components, "
-            f"{len(hd.available_domains())} domains"))
+        self._catalog_label = QtWidgets.QLabel()
+        self._update_catalog_label(catalog)
+        refresh = QtWidgets.QPushButton("Refresh data")
+        refresh.setToolTip("Reload the component catalogue and rebuild placed "
+                           "canvas components from the latest metadata.")
+        refresh.clicked.connect(self._refresh_data)
+
+        catalog_bar = QtWidgets.QHBoxLayout()
+        catalog_bar.addWidget(self._catalog_label, 1)
+        catalog_bar.addWidget(refresh)
+        ll.addLayout(catalog_bar)
         ll.addWidget(self._filter)
         ll.addWidget(self._tree, 1)
 
@@ -65,12 +73,24 @@ class MainWindow(QtWidgets.QMainWindow):
         fit.setToolTip("Zoom/pan so all placed components fit the view.")
         fit.clicked.connect(self._canvas.fit_view)
 
+        self._show_names = QtWidgets.QCheckBox("Names")
+        self._show_names.setToolTip("Show the instance name + type label group.")
+        self._show_names.setChecked(True)
+        self._show_names.toggled.connect(self._canvas.set_titles_visible)
+
+        self._show_labels = QtWidgets.QCheckBox("Labels")
+        self._show_labels.setToolTip("Show the ui_label parameter labels.")
+        self._show_labels.setChecked(True)
+        self._show_labels.toggled.connect(self._canvas.set_params_visible)
+
         right = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(right)
         rl.setContentsMargins(6, 6, 6, 6)
         bar = QtWidgets.QHBoxLayout()
         bar.addWidget(QtWidgets.QLabel("<b>Canvas</b>"))
         bar.addWidget(fit)
+        bar.addWidget(self._show_names)
+        bar.addWidget(self._show_labels)
         bar.addStretch(1)
         bar.addWidget(simulate)
         bar.addWidget(clear)
@@ -224,6 +244,22 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_status(self, text: str):
         self.statusBar().showMessage(text)
 
+    def _update_catalog_label(self, catalog: list[dict]):
+        domains = {entry["domain"] for entry in catalog}
+        self._catalog_label.setText(
+            f"<b>Catalogue</b> &mdash; {len(catalog)} components, "
+            f"{len(domains)} domains")
+
+    def _refresh_data(self):
+        catalog = hd.component_catalog()
+        self._by_type = {e["type"]: e for e in catalog}
+        self._tree.set_catalog(catalog)
+        self._canvas.refresh_catalog(self._by_type)
+        self._apply_filter(self._filter.text())
+        self._update_catalog_label(catalog)
+        self._set_status(
+            f"Refreshed catalogue and {self._canvas.node_count()} canvas component(s)")
+
     def _on_double_click(self, item, _column):
         entry = item.data(0, ComponentTree.ENTRY_ROLE)
         if entry:
@@ -233,15 +269,27 @@ class MainWindow(QtWidgets.QMainWindow):
         needle = text.strip().lower()
         for i in range(self._tree.topLevelItemCount()):
             domain_item = self._tree.topLevelItem(i)
-            visible_children = 0
-            for j in range(domain_item.childCount()):
-                leaf = domain_item.child(j)
-                entry = leaf.data(0, ComponentTree.ENTRY_ROLE) or {}
-                hay = (entry.get("name", "") + " " + entry.get("type", "")).lower()
-                match = needle in hay
-                leaf.setHidden(not match)
-                visible_children += match
-            domain_item.setHidden(needle != "" and visible_children == 0)
+            domain_visible = self._filter_item(domain_item, needle)
+            domain_item.setHidden(needle != "" and not domain_visible)
+
+    def _filter_item(self, item, needle: str) -> bool:
+        entry = item.data(0, ComponentTree.ENTRY_ROLE)
+        if entry:
+            hay = " ".join(
+                str(entry.get(key, ""))
+                for key in ("name", "type", "domain", "category")
+            ).lower()
+            match = needle in hay
+            item.setHidden(not match)
+            return match
+
+        visible_children = 0
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if self._filter_item(child, needle):
+                visible_children += 1
+        item.setHidden(needle != "" and visible_children == 0)
+        return visible_children > 0
 
     def _build_system(self, nodes: list[NodeItem]) -> dict:
         components: dict[str, dict] = {}

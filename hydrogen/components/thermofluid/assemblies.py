@@ -196,9 +196,9 @@ class Pipe(Model):
         self,
         medium: CoolPropMedium,
         D: Annotated[float, ParamSpec("Pipe bore (inner) diameter.",
-                    unit="m", default=0.01)],
+                    unit="m", default=0.01, ui_label=True)],
         L: Annotated[float, ParamSpec("Total pipe length.", unit="m",
-                    default=1.0)],
+                    default=1.0, ui_label=True)],
         epsilon: Annotated[float, ParamSpec("Absolute wall roughness "
                           "(friction).", unit="m", default=1e-6)],
         z_in: Annotated[float, ParamSpec("Elevation of the inlet.", unit="m",
@@ -238,7 +238,7 @@ class Pipe(Model):
                         "permeation, outer area) is scaled by `count`, so N "
                         "identical pipes cost the same equations as one and "
                         "share the same pressure / temperature / velocity.",
-                        unit="1", default=1)] = 1,
+                        unit="1", default=1, ui_label=True)] = 1,
     ):
         if outer_thermal not in self._OUTER_MODES:
             raise ValueError(
@@ -489,9 +489,10 @@ class Tank(Model):
         self,
         medium: CoolPropMedium,
         volume: Annotated[float, ParamSpec("Internal (gas) control volume of "
-                         "the tank.", unit="m^3", default=0.05)],
+                         "the tank.", unit="m^3", default=0.05,
+                         ui_label=True)],
         diameter: Annotated[float, ParamSpec("Inner diameter of the barrel / "
-                           "caps.", unit="m", default=0.3)],
+                           "caps.", unit="m", default=0.3, ui_label=True)],
         layers: Annotated[list[WallLayer], ParamSpec("Radial wall stack, "
                          "innermost first; inner radius of layer 0 is "
                          "diameter/2.")],
@@ -504,7 +505,7 @@ class Tank(Model):
                         "wall mass, conductance, film, permeation) is scaled by "
                         "`count`, so N identical tanks cost the same equations "
                         "as one and share the same pressure / temperature.",
-                        unit="1", default=1)] = 1,
+                        unit="1", default=1, ui_label=True)] = 1,
         outer_thermal: Annotated[str, ParamSpec("Thermal termination of the "
                                 "outermost wall surface.",
                                 choices=_OUTER_THERMAL_MODES)] = "adiabatic",

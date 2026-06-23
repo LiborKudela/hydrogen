@@ -177,17 +177,23 @@ class OptionsForm(QtWidgets.QWidget):
 
 
 class LogPanel(QtWidgets.QWidget):
-    """Scrollable run/host log with a level + free-text filter.
+    """Scrollable run/host log with per-level toggles + a free-text filter.
 
     Every line is tagged with a level (``"status"`` for the dialog's own
     progress notes, ``"host"`` for messages streamed from the hydrogen host,
-    ``"error"`` for host errors / failures).  The toolbar filters by level
-    (combo) and a case-insensitive substring, so host chatter can be isolated
-    from the dialog's bookkeeping.
+    ``"warning"`` for host warnings, ``"error"`` for host errors / failures).
+    Each level has its own checkbox so any combination can be shown or hidden
+    independently -- e.g. keep progress + host output but mute warnings -- and
+    a case-insensitive substring narrows things further.
     """
 
-    #: Combo label -> stored level key (None = show every level).
-    _LEVELS = {"All": None, "Host": "host", "Errors": "error", "Status": "status"}
+    #: (checkbox label, stored level key), in display order.
+    _LEVELS = [
+        ("Progress", "status"),
+        ("Host", "host"),
+        ("Warnings", "warning"),
+        ("Errors", "error"),
+    ]
 
     def __init__(self):
         super().__init__()
@@ -198,10 +204,13 @@ class LogPanel(QtWidgets.QWidget):
 
         bar = QtWidgets.QHBoxLayout()
         bar.addWidget(QtWidgets.QLabel("show:"))
-        self._level = QtWidgets.QComboBox()
-        self._level.addItems(list(self._LEVELS))
-        self._level.currentTextChanged.connect(self._render)
-        bar.addWidget(self._level)
+        self._checks: dict[str, QtWidgets.QCheckBox] = {}
+        for label, key in self._LEVELS:
+            cb = QtWidgets.QCheckBox(label)
+            cb.setChecked(True)
+            cb.toggled.connect(self._render)
+            bar.addWidget(cb)
+            self._checks[key] = cb
         self._text = QtWidgets.QLineEdit()
         self._text.setPlaceholderText("filter text…")
         self._text.setClearButtonEnabled(True)
@@ -218,8 +227,8 @@ class LogPanel(QtWidgets.QWidget):
         v.addWidget(self._view, 1)
 
     def _passes(self, level: str, text: str) -> bool:
-        want = self._LEVELS.get(self._level.currentText())
-        if want is not None and level != want:
+        cb = self._checks.get(level)
+        if cb is not None and not cb.isChecked():
             return False
         needle = self._text.text().strip().lower()
         return needle in text.lower() if needle else True
@@ -339,7 +348,12 @@ class SimulateDialog(QtWidgets.QDialog):
     def _drain(self, sysp):
         for ev in sysp.poll_events():
             if ev.get("type") == "log":
-                self._append(f"  [host] {ev['message']}", "host")
+                message = ev["message"]
+                level = ev.get("level") or ""
+                if "warn" in level.lower() or "warning" in message.lower():
+                    self._append(f"  [host warning] {message}", "warning")
+                else:
+                    self._append(f"  [host] {message}", "host")
             elif ev.get("type") == "error":
                 self._append(f"  [host error] {ev.get('kind')}: {ev.get('message')}",
                              "error")

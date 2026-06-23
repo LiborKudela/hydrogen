@@ -12,12 +12,16 @@ of an import cycle with the view.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 from hydrogen.components.icons import icon_path
 
 from .introspect import introspect_ports
 from .qt import QtCore, QtGui, QtSvg, QtWidgets
 from .style import domain_color, kind_color, port_on_right
+
+if TYPE_CHECKING:
+    from .canvas import Canvas
 
 __all__ = ["PortItem", "NodeItem", "ConnectionItem", "nearest_on_rect"]
 
@@ -83,7 +87,7 @@ class PortItem(QtWidgets.QGraphicsEllipseItem):
         self.setZValue(3)
         self.setAcceptHoverEvents(True)
         self.setCursor(QtCore.Qt.CrossCursor)
-        self.setToolTip(f"{name}  ·  {kind}  (Ctrl+drag to reposition)")
+        self._update_tooltip()
 
         self._label = QtWidgets.QGraphicsSimpleTextItem(name, self)
         lf = self._label.font()
@@ -91,6 +95,13 @@ class PortItem(QtWidgets.QGraphicsEllipseItem):
         self._label.setFont(lf)
         self._label.setBrush(QtGui.QColor("#333"))
         self._reposition_label()
+
+    def _update_tooltip(self):
+        if self.node.ports_locked:
+            hint = "port position locked"
+        else:
+            hint = "Ctrl+drag to reposition"
+        self.setToolTip(f"{self.pname}  ·  {self.kind}  ({hint})")
 
     def _reposition_label(self):
         """Anchor the label outside whichever edge the port sits on, so it never
@@ -103,6 +114,10 @@ class PortItem(QtWidgets.QGraphicsEllipseItem):
             self._label.setPos(-br.width() / 2, -br.height() - 8)
         elif abs(p.y() - rect.bottom()) < eps:     # bottom edge -> below the dot
             self._label.setPos(-br.width() / 2, 8)
+        elif self.node._icon_only and (abs(p.x() - rect.right()) < eps or self.side == 1):
+            self._label.setPos(10, -br.height() / 2)  # right edge -> outside right
+        elif self.node._icon_only:
+            self._label.setPos(-10 - br.width(), -br.height() / 2)  # left -> outside left
         elif abs(p.x() - rect.right()) < eps or self.side == 1:
             self._label.setPos(-10 - br.width(), -br.height() / 2)  # right -> left
         else:                                      # left edge -> right of the dot
@@ -171,6 +186,11 @@ class PortItem(QtWidgets.QGraphicsEllipseItem):
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
             if event.modifiers() & QtCore.Qt.ControlModifier:
+                if self.node.ports_locked:
+                    self.node._canvas._on_status(
+                        f"Port positions are locked on '{self.node.comp_id}'")
+                    event.accept()
+                    return
                 self._moving = True            # Ctrl+drag -> reposition the port
                 self.setCursor(QtCore.Qt.SizeAllCursor)
             else:
@@ -198,6 +218,54 @@ class PortItem(QtWidgets.QGraphicsEllipseItem):
         event.accept()
 
 
+class LabelTextItem(QtWidgets.QGraphicsSimpleTextItem):
+    """Movable node label text; Ctrl-hover/drag moves the whole label group."""
+
+    def __init__(self, text: str, node: "NodeItem", group: str):
+        super().__init__(text, node)
+        self.node = node
+        self.group = group
+        self.setAcceptHoverEvents(True)
+
+    def hoverMoveEvent(self, event):
+        if event.modifiers() & QtCore.Qt.ControlModifier:
+            self.node._set_label_hover_group(self.group)
+            self.setCursor(QtCore.Qt.SizeAllCursor)
+            event.accept()
+            return
+        self.node._set_label_hover_group(None)
+        self.setCursor(QtCore.Qt.ArrowCursor)
+        super().hoverMoveEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        if self.node._label_hover_group == self.group:
+            self.node._set_label_hover_group(None)
+        self.setCursor(QtCore.Qt.ArrowCursor)
+        super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if (event.button() == QtCore.Qt.LeftButton
+                and event.modifiers() & QtCore.Qt.ControlModifier):
+            self.node._begin_label_drag(self.group, event.scenePos())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.node._label_drag_group == self.group:
+            self.node._update_label_drag(event.scenePos())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.node._label_drag_group == self.group:
+            self.node._finish_label_drag()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class NodeItem(QtWidgets.QGraphicsRectItem):
     """A movable box on the canvas standing in for one component instance.
 
@@ -211,6 +279,25 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
     HEADER_H = 36.0
     ROW_H = 22.0
     ICON_BODY_H = 70.0     # min body height when a node renders an SVG symbol
+    MIN_W = 48.0
+    MIN_H = 36.0
+    RESIZE_HIT = 10.0
+    # Padding added around the rect for the bounding box, so the resize-handle
+    # dots (drawn centred on the corners, extending outside the rect) are inside
+    # the invalidated region -- otherwise shrinking leaves uncleared corner
+    # trails (especially visible over X-forwarding).
+    BOUND_MARGIN = 8.0
+    ICON_ONLY_TYPES = {
+        "hydrogen.thermofluid.CompressibleValve",
+        "hydrogen.thermofluid.IncompressibleValve",
+        "hydrogen.thermofluid.Pipe",
+        "hydrogen.thermofluid.PressureSource",
+        "hydrogen.thermofluid.Tank",
+        "hydrogen.thermofluid.Valve",
+    }
+    DEFAULT_ROTATIONS = {
+        "hydrogen.thermofluid.Tank": -90,
+    }
 
     def __init__(self, entry: dict, comp_id: str, canvas: "Canvas"):
         super().__init__(0, 0, 190, 58)
@@ -222,12 +309,30 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self.medium: str | None = "Hydrogen" if entry.get("needs_medium") else None
         self._fill = domain_color(entry["domain"])
         self._icon = icon_renderer(entry.get("icon"))   # None -> generic box render
+        self._is_control = entry.get("domain") == "control"
+        self._icon_only = self._icon is not None and (
+            self.type_name in self.ICON_ONLY_TYPES or self._is_control
+        )
+        self._ports_locked = self._icon_only
         self._hovered = False
+        self._hover_corner: str | None = None
+        self._resize_corner: str | None = None
+        self._resize_anchor_scene: QtCore.QPointF | None = None
+        self._custom_size: tuple[float, float] | None = None
+        self._label_offsets = {
+            "title": QtCore.QPointF(0.0, 0.0),
+            "params": QtCore.QPointF(0.0, 0.0),
+        }
+        self._label_hover_group: str | None = None
+        self._label_drag_group: str | None = None
+        self._label_drag_start_scene: QtCore.QPointF | None = None
+        self._label_drag_start_offset: QtCore.QPointF | None = None
         self.port_items: list[PortItem] = []
         # Custom port placements: pname -> (x, y, side); empty = use defaults.
         self._port_layout: dict[str, tuple] = {}
         # Visual transform state (applied around the node's centre).
-        self._rot = 0           # degrees, multiples of 90
+        self._default_rot = self.DEFAULT_ROTATIONS.get(self.type_name, 0)
+        self._rot = self._default_rot  # degrees, multiples of 90
         self._mirror_x = False
         self._mirror_y = False
         self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
@@ -237,16 +342,17 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self.setZValue(1)
         self.setToolTip(f"{entry['type']}\n\n{entry.get('summary', '')}")
 
-        self._title = QtWidgets.QGraphicsSimpleTextItem(entry["name"], self)
+        self._title = LabelTextItem(comp_id, self, "title")
         tf = self._title.font()
         tf.setBold(True)
         tf.setPointSize(10)
         self._title.setFont(tf)
+        self._title.setBrush(QtGui.QColor("#222"))
         self._title.setPos(12, 7)
         self._title.setZValue(6)
 
-        sub_text = comp_id + ("  *" if entry.get("needs_medium") else "")
-        self._sub = QtWidgets.QGraphicsSimpleTextItem(sub_text, self)
+        sub_text = entry["type"] + ("  *" if entry.get("needs_medium") else "")
+        self._sub = LabelTextItem(sub_text, self, "title")
         sf = self._sub.font()
         sf.setPointSize(8)
         self._sub.setFont(sf)
@@ -254,7 +360,37 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._sub.setPos(12, 21)
         self._sub.setZValue(6)
 
+        # Each ui_label parameter renders as two right-aligned columns: a name
+        # item and a value item, for a compact technical/tabular look.
+        self._param_labels: list[tuple[dict, LabelTextItem, LabelTextItem]] = []
+        for field in entry.get("parameters", []):
+            if not field.get("ui_label"):
+                continue
+            name_item = LabelTextItem("", self, "params")
+            value_item = LabelTextItem("", self, "params")
+            for item, color in ((name_item, "#555"), (value_item, "#222")):
+                fnt = item.font()
+                fnt.setPointSize(8)
+                if item is value_item:
+                    fnt.setBold(True)
+                item.setFont(fnt)
+                item.setBrush(QtGui.QColor(color))
+                item.setZValue(6)
+            self._param_labels.append((field, name_item, value_item))
+        self._title_visible = True
+        self._params_visible = True
+        self.refresh_param_labels()
+
         self.rebuild_ports()
+
+    @property
+    def ports_locked(self) -> bool:
+        return self._ports_locked
+
+    def set_ports_locked(self, locked: bool):
+        self._ports_locked = bool(locked)
+        for port in self.port_items:
+            port._update_tooltip()
 
     # --- ports -------------------------------------------------------------- #
     def rebuild_ports(self, specs: list[tuple[str, str]] | None = None):
@@ -272,13 +408,23 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         right = [s for s in specs if port_on_right(s[0])]
 
         rows = max(len(left), len(right), 1)
-        width = max(190.0, self._title.boundingRect().width() + 28)
-        height = self.HEADER_H + rows * self.ROW_H + 6
-        if self._icon is not None:           # give the symbol room to breathe
-            height = max(height, self.HEADER_H + self.ICON_BODY_H)
+        if self._icon_only:
+            width = 150.0
+            height = 78.0
+        else:
+            width = max(190.0, self._title.boundingRect().width() + 28)
+            height = self.HEADER_H + rows * self.ROW_H + 6
+            if self._icon is not None:           # give the symbol room to breathe
+                height = max(height, self.HEADER_H + self.ICON_BODY_H)
+        if self._custom_size is not None:
+            width = max(width, self._custom_size[0], self.MIN_W)
+            height = max(height, self._custom_size[1], self.MIN_H)
         self.setRect(0, 0, width, height)
-        self._place_side(left, x=0.0, align_left=True)
-        self._place_side(right, x=width, align_left=False)
+        if self._icon_only:
+            self._place_icon_ports(specs)
+        else:
+            self._place_side(left, x=0.0, align_left=True)
+            self._place_side(right, x=width, align_left=False)
         self.apply_transform()   # rect changed -> recompute centre-anchored xform
 
     def _place_side(self, specs, x: float, align_left: bool):
@@ -299,17 +445,120 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             port = PortItem(self, name, kind, QtCore.QPointF(lx, ly), side)
             self.port_items.append(port)
 
+    def _place_icon_ports(self, specs):
+        if self._is_control:
+            self._place_control_icon_ports(specs)
+            return
+
+        rect = self.rect()
+        extras_top = []
+        extras_bottom = []
+        for name, kind in specs:
+            if name in ("inlet", "p_set"):
+                pt = QtCore.QPointF(rect.left(), rect.center().y())
+                side = -1
+            elif name == "outlet":
+                pt = QtCore.QPointF(rect.right(), rect.center().y())
+                side = 1
+            elif name == "opening" or kind == "thermal":
+                extras_top.append((name, kind))
+                continue
+            else:
+                extras_bottom.append((name, kind))
+                continue
+            if name in self._port_layout:
+                x, y, side = self._port_layout[name]
+                pt = QtCore.QPointF(x, y)
+            port = PortItem(self, name, kind, pt, side)
+            self.port_items.append(port)
+
+        for i, (name, kind) in enumerate(extras_top):
+            x = rect.left() + rect.width() * (i + 1) / (len(extras_top) + 1)
+            pt = QtCore.QPointF(x, rect.top())
+            side = 1
+            if name in self._port_layout:
+                x, y, side = self._port_layout[name]
+                pt = QtCore.QPointF(x, y)
+            port = PortItem(self, name, kind, pt, side)
+            self.port_items.append(port)
+
+        for i, (name, kind) in enumerate(extras_bottom):
+            x = rect.left() + rect.width() * (i + 1) / (len(extras_bottom) + 1)
+            pt = QtCore.QPointF(x, rect.bottom())
+            side = 1
+            if name in self._port_layout:
+                x, y, side = self._port_layout[name]
+                pt = QtCore.QPointF(x, y)
+            port = PortItem(self, name, kind, pt, side)
+            self.port_items.append(port)
+
+    def _place_control_icon_ports(self, specs):
+        rect = self.rect()
+        left = [s for s in specs if not port_on_right(s[0])]
+        right = [s for s in specs if port_on_right(s[0])]
+
+        for i, (name, kind) in enumerate(left):
+            y = rect.top() + rect.height() * (i + 1) / (len(left) + 1)
+            pt = QtCore.QPointF(rect.left(), y)
+            side = -1
+            if name in self._port_layout:
+                x, y, side = self._port_layout[name]
+                pt = QtCore.QPointF(x, y)
+            self.port_items.append(PortItem(self, name, kind, pt, side))
+
+        for i, (name, kind) in enumerate(right):
+            y = rect.top() + rect.height() * (i + 1) / (len(right) + 1)
+            pt = QtCore.QPointF(rect.right(), y)
+            side = 1
+            if name in self._port_layout:
+                x, y, side = self._port_layout[name]
+                pt = QtCore.QPointF(x, y)
+            self.port_items.append(PortItem(self, name, kind, pt, side))
+
     def store_port_layout(self, port: "PortItem"):
         self._port_layout[port.pname] = (port.pos().x(), port.pos().y(), port.side)
+
+    def set_custom_size(self, width: float, height: float):
+        self._custom_size = (max(self.MIN_W, float(width)),
+                             max(self.MIN_H, float(height)))
 
     def sync_ports(self) -> bool:
         """Re-derive ports after a parameter edit; rebuild only if the port set
         actually changed (so ordinary edits keep existing wires)."""
+        self.refresh_param_labels()
         new = introspect_ports(self.type_name, self.medium, self.params)
         if {(p.pname, p.kind) for p in self.port_items} == set(new):
             return False
         self.rebuild_ports(new)
         return True
+
+    def set_title_labels_visible(self, visible: bool):
+        self._title_visible = visible
+        self._title.setVisible(visible)
+        self._sub.setVisible(visible)
+
+    def set_param_labels_visible(self, visible: bool):
+        self._params_visible = visible
+        for _field, name_item, value_item in self._param_labels:
+            name_item.setVisible(visible)
+            value_item.setVisible(visible)
+
+    def refresh_param_labels(self):
+        params = self.params or {}
+        for field, name_item, value_item in self._param_labels:
+            name = field["name"]
+            value = params.get(name, field.get("default"))
+            if value is None:
+                value_text = "?"
+            elif isinstance(value, float):
+                value_text = f"{value:g}"
+            else:
+                value_text = f"{value}"
+            unit = field.get("unit")
+            if unit:
+                value_text += f" {unit}"
+            name_item.setText(f"{name} =")
+            value_item.setText(value_text)
 
     # --- transforms (rotate / mirror, around the node centre) --------------- #
     def apply_transform(self):
@@ -329,6 +578,9 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         """Counter-transform the text so labels stay readable (upright, not
         mirrored) while the box and ports rotate/flip around them."""
         texts = [self._title, self._sub]
+        for _field, name_item, value_item in self._param_labels:
+            texts.append(name_item)
+            texts.append(value_item)
         for pi in self.port_items:
             texts.extend(pi.childItems())
         for it in texts:
@@ -340,9 +592,11 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             tt.translate(-tc.x(), -tc.y())
             it.setTransform(tt)
         self._place_title_text()
+        self._place_param_labels()
+        self._sync_label_hover_brushes()
 
     def _place_title_text(self):
-        """Pin the block title to the node's visual top edge.
+        """Pin the instance/type label group to the node's visual top edge.
 
         The node itself rotates around its centre, so the original local header
         may end up at the bottom or side.  Work in scene coordinates here: place
@@ -350,8 +604,13 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         map those points back into the node's local coordinates.
         """
         bbox = self.sceneTransform().mapRect(self.rect())
-        title_at = QtCore.QPointF(bbox.left() + 12.0, bbox.top() + 7.0)
-        sub_at = QtCore.QPointF(bbox.left() + 12.0, bbox.top() + 21.0)
+        offset = self._label_offsets["title"]
+        gap = 4.0
+        title_h = self._title.boundingRect().height()
+        sub_h = self._sub.boundingRect().height()
+        top = bbox.top() - gap - (title_h + sub_h)
+        title_at = QtCore.QPointF(bbox.left() + 12.0, top) + offset
+        sub_at = QtCore.QPointF(bbox.left() + 12.0, top + title_h) + offset
         self._set_text_scene_origin(self._title, title_at)
         self._set_text_scene_origin(self._sub, sub_at)
 
@@ -364,6 +623,114 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         # compensate so the rendered text starts at the requested scene point.
         offset = item.transform().map(QtCore.QPointF(0.0, 0.0))
         item.setPos(local_pos - offset)
+
+    def _place_param_labels(self):
+        if not self._param_labels:
+            return
+        bbox = self.sceneTransform().mapRect(self.rect())
+        gap = 4.0          # below the node
+        line_gap = 2.0     # between rows
+        col_gap = 6.0      # between the name and value columns
+        offset = self._label_offsets["params"]
+
+        name_w = max(n.boundingRect().width() for _f, n, _v in self._param_labels)
+        val_w = max(v.boundingRect().width() for _f, _n, v in self._param_labels)
+        total_w = name_w + col_gap + val_w
+        left = bbox.center().x() - total_w / 2.0 + offset.x()
+        name_right = left + name_w        # names right-aligned to here
+        val_left = name_right + col_gap   # values left-aligned from here
+
+        y = bbox.bottom() + gap + offset.y()
+        for _field, name_item, value_item in self._param_labels:
+            nbr = name_item.boundingRect()
+            vbr = value_item.boundingRect()
+            row_h = max(nbr.height(), vbr.height())
+            self._set_text_scene_origin(
+                name_item, QtCore.QPointF(name_right - nbr.width(), y))
+            self._set_text_scene_origin(
+                value_item, QtCore.QPointF(val_left, y))
+            y += row_h + line_gap
+
+    def _label_items(self, group: str):
+        if group == "title":
+            return [self._title, self._sub]
+        if group == "params":
+            items = []
+            for _field, name_item, value_item in self._param_labels:
+                items.append(name_item)
+                items.append(value_item)
+            return items
+        return []
+
+    def _label_group_scene_rect(self, group: str) -> QtCore.QRectF | None:
+        rect: QtCore.QRectF | None = None
+        for item in self._label_items(group):
+            if not item.isVisible():
+                continue
+            item_rect = item.sceneBoundingRect()
+            rect = item_rect if rect is None else rect.united(item_rect)
+        return rect
+
+    def _label_group_at(self, scene_pos: QtCore.QPointF) -> str | None:
+        for group in ("title", "params"):
+            rect = self._label_group_scene_rect(group)
+            if rect is not None and rect.adjusted(-4, -4, 4, 4).contains(scene_pos):
+                return group
+        return None
+
+    def _set_label_offset(self, group: str, offset: QtCore.QPointF):
+        self._label_offsets[group] = offset
+        self._keep_text_upright()
+        self.update()
+
+    def _set_label_hover_group(self, group: str | None):
+        self._label_hover_group = group
+        self._sync_label_hover_brushes()
+        self.update()
+
+    def _begin_label_drag(self, group: str, scene_pos: QtCore.QPointF):
+        self._label_drag_group = group
+        self._label_drag_start_scene = scene_pos
+        self._label_drag_start_offset = QtCore.QPointF(self._label_offsets[group])
+        self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, False)
+        self.setCursor(QtCore.Qt.SizeAllCursor)
+        self._sync_label_hover_brushes()
+
+    def _update_label_drag(self, scene_pos: QtCore.QPointF):
+        if self._label_drag_group is None:
+            return
+        delta = scene_pos - self._label_drag_start_scene
+        self._set_label_offset(
+            self._label_drag_group,
+            self._label_drag_start_offset + delta,
+        )
+
+    def _finish_label_drag(self):
+        if self._label_drag_group is None:
+            return
+        group = self._label_drag_group
+        self._label_drag_group = None
+        self._label_drag_start_scene = None
+        self._label_drag_start_offset = None
+        self._label_hover_group = None
+        self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
+        self.setCursor(QtCore.Qt.ArrowCursor)
+        self._sync_label_hover_brushes()
+        self._canvas._on_status(f"Moved {group} label on '{self.comp_id}'")
+
+    def _sync_label_hover_brushes(self):
+        primary = {self._title}
+        muted = {self._sub}
+        for _field, name_item, value_item in self._param_labels:
+            muted.add(name_item)
+            primary.add(value_item)
+        for group in ("title", "params"):
+            active = group == self._label_hover_group or group == self._label_drag_group
+            for item in self._label_items(group):
+                if active:
+                    item.setBrush(QtGui.QColor("#d62828"))
+                else:
+                    item.setBrush(QtGui.QColor("#222" if item in primary else "#555"))
 
     def _visual_header_line(self) -> tuple[QtCore.QPointF, QtCore.QPointF] | None:
         """Line under the visual title, kept with the text after transforms."""
@@ -383,12 +750,15 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         if not ok:
             return None
         bbox = self.sceneTransform().mapRect(self.rect())
-        body = QtCore.QRectF(
-            bbox.left() + 12.0,
-            bbox.top() + self.HEADER_H + 8.0,
-            max(1.0, bbox.width() - 24.0),
-            max(1.0, bbox.height() - self.HEADER_H - 18.0),
-        )
+        if self._icon_only:
+            body = bbox.adjusted(4.0, 4.0, -4.0, -4.0)
+        else:
+            body = QtCore.QRectF(
+                bbox.left() + 12.0,
+                bbox.top() + self.HEADER_H + 8.0,
+                max(1.0, bbox.width() - 24.0),
+                max(1.0, bbox.height() - self.HEADER_H - 18.0),
+            )
         # The icon still rotates with the block. For quarter-turns, local width
         # becomes visual height and local height becomes visual width.
         if self._rot % 180:
@@ -404,6 +774,24 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             fitted.height(),
         )
 
+    def _draw_pressure_source_control_guide(self, painter, icon_rect: QtCore.QRectF):
+        if self.type_name != "hydrogen.thermofluid.PressureSource":
+            return
+        port = next((p for p in self.port_items if p.pname == "p_set"), None)
+        if port is None:
+            return
+        pen = QtGui.QPen(kind_color("signal_real"), 1.6)
+        pen.setStyle(QtCore.Qt.DashLine)
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        painter.setPen(pen)
+        # pressure_source.svg uses viewBox 0 0 120 60 and a circle at x=40,
+        # r=20; the left tangent is x=20, on the vertical centreline.
+        target = QtCore.QPointF(
+            icon_rect.left() + icon_rect.width() * (20.0 / 120.0),
+            icon_rect.center().y(),
+        )
+        painter.drawLine(port.pos(), target)
+
     def rotate_by(self, degrees: int):
         self._rot = (self._rot + degrees) % 360
         self.apply_transform()
@@ -416,11 +804,69 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self.apply_transform()
 
     def reset_transform(self):
-        self._rot = 0
+        self._rot = self._default_rot
         self._mirror_x = self._mirror_y = False
         self.apply_transform()
 
     # --- geometry / hover --------------------------------------------------- #
+    def _resize_handles(self) -> dict[str, QtCore.QPointF]:
+        r = self.rect()
+        return {
+            "tl": r.topLeft(),
+            "tr": r.topRight(),
+            "bl": r.bottomLeft(),
+            "br": r.bottomRight(),
+        }
+
+    def _resize_corner_at(self, pos: QtCore.QPointF) -> str | None:
+        for name, corner in self._resize_handles().items():
+            if (abs(pos.x() - corner.x()) <= self.RESIZE_HIT
+                    and abs(pos.y() - corner.y()) <= self.RESIZE_HIT):
+                return name
+        return None
+
+    def _resize_cursor(self, corner: str):
+        if corner in ("tl", "br"):
+            return QtCore.Qt.SizeFDiagCursor
+        return QtCore.Qt.SizeBDiagCursor
+
+    def _resize_to(self, width: float, height: float,
+                   fixed_scene: QtCore.QPointF | None = None,
+                   fixed_local: QtCore.QPointF | None = None):
+        old = self.rect()
+        # Scene region the node (incl. handle margin) occupied before shrinking;
+        # forced-updated below so X-forwarding's minimal repaint can't leave a
+        # stale corner trail.
+        old_scene_rect = self.sceneTransform().mapRect(self.boundingRect())
+        width = max(self.MIN_W, width)
+        height = max(self.MIN_H, height)
+        sx = width / old.width() if old.width() else 1.0
+        sy = height / old.height() if old.height() else 1.0
+        self._custom_size = (width, height)
+        self.setRect(0, 0, width, height)
+
+        # Keep ports on their same relative spot after a resize. Defaults such
+        # as inlet/outlet therefore remain on the icon stubs.
+        for port in self.port_items:
+            port.setPos(QtCore.QPointF(port.pos().x() * sx, port.pos().y() * sy))
+            port._reposition_label()
+            if port.pname in self._port_layout:
+                self._port_layout[port.pname] = (
+                    port.pos().x(), port.pos().y(), port.side)
+
+        self.apply_transform()
+        if fixed_scene is not None and fixed_local is not None:
+            transformed_fixed = self.transform().map(fixed_local)
+            self.setPos(fixed_scene - transformed_fixed)
+        self._keep_text_upright()
+        self.update()
+        # Repaint the union of the old and new footprints so no corner pixels
+        # are left behind when the node gets smaller.
+        scene = self.scene()
+        if scene is not None:
+            new_scene_rect = self.sceneTransform().mapRect(self.boundingRect())
+            scene.update(old_scene_rect.united(new_scene_rect))
+
     def itemChange(self, change, value):
         if (change == QtWidgets.QGraphicsItem.ItemPositionHasChanged
                 and self._canvas is not None):
@@ -431,9 +877,96 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._hovered = True
         self.update()
 
+    def hoverMoveEvent(self, event):
+        ctrl = bool(event.modifiers() & QtCore.Qt.ControlModifier)
+        self._label_hover_group = self._label_group_at(event.scenePos()) if ctrl else None
+        if self._label_hover_group is not None:
+            self.setCursor(QtCore.Qt.SizeAllCursor)
+            self._hover_corner = None
+            self._set_label_hover_group(self._label_hover_group)
+            self.update()
+            return
+
+        self._hover_corner = self._resize_corner_at(event.pos())
+        if self._hover_corner is not None:
+            self.setCursor(self._resize_cursor(self._hover_corner))
+        else:
+            self.setCursor(QtCore.Qt.ArrowCursor)
+        self._set_label_hover_group(None)
+        self.update()
+
     def hoverLeaveEvent(self, event):
         self._hovered = False
+        self._hover_corner = None
+        self._set_label_hover_group(None)
+        self.setCursor(QtCore.Qt.ArrowCursor)
         self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            if event.modifiers() & QtCore.Qt.ControlModifier:
+                group = self._label_group_at(event.scenePos())
+                if group is not None:
+                    self._begin_label_drag(group, event.scenePos())
+                    event.accept()
+                    return
+            corner = self._resize_corner_at(event.pos())
+            if corner is not None:
+                self._resize_corner = corner
+                fixed = {
+                    "tl": self.rect().bottomRight(),
+                    "tr": self.rect().bottomLeft(),
+                    "bl": self.rect().topRight(),
+                    "br": self.rect().topLeft(),
+                }[corner]
+                self._resize_anchor_scene = self.mapToScene(fixed)
+                self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, False)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._label_drag_group is not None:
+            self._update_label_drag(event.scenePos())
+            event.accept()
+            return
+        if self._resize_corner is not None:
+            r = self.rect()
+            p = event.pos()
+            if self._resize_corner == "br":
+                width, height = p.x(), p.y()
+                fixed_local = QtCore.QPointF(0.0, 0.0)
+            elif self._resize_corner == "tr":
+                width, height = p.x(), r.bottom() - p.y()
+                fixed_local = QtCore.QPointF(0.0, max(self.MIN_H, height))
+            elif self._resize_corner == "bl":
+                width, height = r.right() - p.x(), p.y()
+                fixed_local = QtCore.QPointF(max(self.MIN_W, width), 0.0)
+            else:  # tl
+                width, height = r.right() - p.x(), r.bottom() - p.y()
+                fixed_local = QtCore.QPointF(max(self.MIN_W, width),
+                                             max(self.MIN_H, height))
+            self._resize_to(width, height, self._resize_anchor_scene, fixed_local)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._label_drag_group is not None:
+            self._finish_label_drag()
+            event.accept()
+            return
+        if self._resize_corner is not None:
+            self._resize_corner = None
+            self._resize_anchor_scene = None
+            self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
+            self._canvas.refresh_connections(self)
+            self._canvas._on_status(
+                f"Resized '{self.comp_id}' to "
+                f"{self.rect().width():.0f}×{self.rect().height():.0f}")
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     @staticmethod
     def _fit(size, into: QtCore.QRectF) -> QtCore.QRectF:
@@ -446,11 +979,30 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         return QtCore.QRectF(into.left() + (into.width() - fw) / 2,
                              into.top() + (into.height() - fh) / 2, fw, fh)
 
+    def _draw_resize_handles(self, painter):
+        if self._hover_corner is None and self._resize_corner is None:
+            return
+        painter.save()
+        for name, corner in self._resize_handles().items():
+            active = name in (self._hover_corner, self._resize_corner)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#d62828" if active else "#333"),
+                                      1.2))
+            painter.setBrush(QtGui.QColor("#ffffff"))
+            painter.drawEllipse(corner, 3.5 if active else 3.0, 3.5 if active else 3.0)
+        painter.restore()
+
+    def boundingRect(self) -> QtCore.QRectF:
+        # Expand past the rect so the corner resize handles (and the selection
+        # outline) are inside the region Qt repaints/clears; without this the
+        # handles leave trails when the node is resized smaller.
+        m = self.BOUND_MARGIN
+        return self.rect().adjusted(-m, -m, m, m)
+
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         selected = self.isSelected()
         if selected:
-            color, w = QtGui.QColor("#1b1b1b"), 2
+            color, w = QtGui.QColor("#d62828"), 2
         elif self._hovered:
             color, w = QtGui.QColor("#1b6fb3"), 2
         else:
@@ -458,6 +1010,19 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         rect = self.rect()
 
         if self._icon is not None:
+            if self._icon_only:
+                if self._is_control or selected or self._hovered:
+                    border = color if selected else QtGui.QColor("#111111")
+                    painter.setPen(QtGui.QPen(border, w))
+                    painter.setBrush(QtCore.Qt.NoBrush)
+                    painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 8, 8)
+                body = self._visual_icon_rect(self._icon.defaultSize())
+                if body is not None:
+                    self._icon.render(painter, body)
+                    self._draw_pressure_source_control_guide(painter, body)
+                self._draw_resize_handles(painter)
+                return
+
             # P&ID symbol on a clean (white) card: a domain-coloured header strip
             # carries the labels, the SVG fills the body below the separator.
             painter.setPen(QtGui.QPen(color, w))
@@ -471,11 +1036,13 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             body = self._visual_icon_rect(self._icon.defaultSize())
             if body is not None:
                 self._icon.render(painter, body)
+            self._draw_resize_handles(painter)
             return
 
         painter.setPen(QtGui.QPen(color, w))
         painter.setBrush(self._fill.lighter(106) if self._hovered else self._fill)
         painter.drawRoundedRect(rect, 9, 9)
+        self._draw_resize_handles(painter)
 
 
 class ConnectionItem(QtWidgets.QGraphicsPathItem):

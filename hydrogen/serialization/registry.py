@@ -64,6 +64,17 @@ def domain_of(cls: type) -> str | None:
     return None
 
 
+def category_of(cls: type) -> str | None:
+    """The component submodule inside its domain, e.g. ``assemblies`` or
+    ``flow`` for ``hydrogen.components.thermofluid`` classes."""
+    parts = (cls.__module__ or "").split(".")
+    if "components" in parts:
+        i = parts.index("components")
+        if i + 2 < len(parts):
+            return ".".join(parts[i + 2:])
+    return None
+
+
 def full_type_name(cls: type) -> str:
     """Canonical, collision-proof type name: ``hydrogen.<domain>.<ClassName>``.
 
@@ -464,7 +475,7 @@ def _param_entry(pname, p, hints, spec, choices, units) -> dict:
     unit = extras.get("unit") or units.get(pname)
     if unit:
         entry["unit"] = unit
-    for key in ("description", "relevant_when", "required_when"):
+    for key in ("description", "relevant_when", "required_when", "ui_label"):
         if key in extras:
             entry[key] = extras[key]
     return entry
@@ -577,6 +588,8 @@ def _component_entry(obj: type) -> dict:
         "type": full_type_name(obj),
         "name": obj.__name__,
         "domain": domain_of(obj),
+        "module": obj.__module__,
+        "category": category_of(obj),
         "summary": _first_doc_line(obj),
         "needs_medium": needs_medium,
         # UI symbol declared on the class as ``UI_ICON`` (filename in

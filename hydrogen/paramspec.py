@@ -82,6 +82,9 @@ class ParamSpec:
         pre-fills the field without loosening the API: ``required`` keeps
         reflecting the constructor, the catalog just also reports a ``default``.
         Leave unset (``UNSET``) for no suggestion.
+    ui_label : bool
+        ``True`` marks a parameter whose value should be shown directly on an
+        icon-based UI node, next to the component symbol.
     """
 
     description: str = ""
@@ -91,6 +94,7 @@ class ParamSpec:
     relevant_when: "dict | str | None" = None
     required_when: "dict | str | None" = None
     default: object = UNSET
+    ui_label: bool = False
 
     @property
     def has_default(self) -> bool:
@@ -119,6 +123,8 @@ class ParamSpec:
             extras["relevant_when"] = self.relevant_when
         if self.required_when is not None:
             extras["required_when"] = self.required_when
+        if self.ui_label:
+            extras["ui_label"] = True
         return extras
 
 

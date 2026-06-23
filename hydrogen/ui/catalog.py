@@ -7,6 +7,8 @@ component's canonical ``type`` string on :data:`MIME_TYPE`.
 
 from __future__ import annotations
 
+from hydrogen.components.icons import icon_path
+
 from .qt import QtCore, QtGui, QtWidgets
 from .style import domain_color
 
@@ -25,30 +27,49 @@ class ComponentTree(QtWidgets.QTreeWidget):
     def __init__(self, catalog: list[dict]):
         super().__init__()
         self.setHeaderHidden(True)
+        self.setIconSize(QtCore.QSize(22, 22))
+        font = self.font()
+        font.setPointSize(font.pointSize() + 1)
+        self.setFont(font)
         self.setDragEnabled(True)
         self.setDragDropMode(QtWidgets.QAbstractItemView.DragOnly)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.set_catalog(catalog)
 
-        by_domain: dict[str, list[dict]] = {}
+    def set_catalog(self, catalog: list[dict]):
+        self.clear()
+        by_domain: dict[str, dict[str, list[dict]]] = {}
         for entry in catalog:
-            by_domain.setdefault(entry["domain"], []).append(entry)
+            domain = entry["domain"]
+            category = entry.get("category") or "components"
+            by_domain.setdefault(domain, {}).setdefault(category, []).append(entry)
 
         for domain in sorted(by_domain):
             parent = QtWidgets.QTreeWidgetItem(self, [domain])
             # Domain headers are not draggable; only their component leaves are.
-            parent.setFlags(parent.flags() & ~QtCore.Qt.ItemIsDragEnabled)
-            f = parent.font(0)
-            f.setBold(True)
-            parent.setFont(0, f)
-            for entry in sorted(by_domain[domain], key=lambda e: e["name"]):
-                leaf = QtWidgets.QTreeWidgetItem(parent, [entry["name"]])
-                leaf.setData(0, self.ENTRY_ROLE, entry)
-                tip = entry.get("summary") or entry["type"]
-                if entry.get("needs_medium"):
-                    tip += "\n(needs a medium)"
-                leaf.setToolTip(0, f"{entry['type']}\n\n{tip}")
-                leaf.setForeground(0, QtGui.QBrush(domain_color(domain).darker(170)))
+            self._style_group(parent)
+            for category in sorted(by_domain[domain]):
+                cat_item = QtWidgets.QTreeWidgetItem(parent, [category])
+                self._style_group(cat_item)
+                for entry in sorted(by_domain[domain][category], key=lambda e: e["name"]):
+                    leaf = QtWidgets.QTreeWidgetItem(cat_item, [entry["name"]])
+                    leaf.setData(0, self.ENTRY_ROLE, entry)
+                    tip = entry.get("summary") or entry["type"]
+                    if entry.get("needs_medium"):
+                        tip += "\n(needs a medium)"
+                    leaf.setToolTip(0, f"{entry['type']}\n\n{tip}")
+                    leaf.setForeground(0, QtGui.QBrush(domain_color(domain).darker(170)))
+                    path = icon_path(entry.get("icon"))
+                    if path:
+                        leaf.setIcon(0, QtGui.QIcon(path))
         self.expandAll()
+
+    @staticmethod
+    def _style_group(item):
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemIsDragEnabled)
+        f = item.font(0)
+        f.setBold(True)
+        item.setFont(0, f)
 
     # QAbstractItemView calls this to build the drag payload from the selection.
     def mimeData(self, items):  # noqa: N802 (Qt camelCase override)
