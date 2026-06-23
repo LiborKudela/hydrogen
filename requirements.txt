@@ -5,3 +5,4 @@ scipy
 sympy
 line_profiler
 plotly
+PySide6>=6.5

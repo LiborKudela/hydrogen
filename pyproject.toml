@@ -15,6 +15,7 @@ dependencies = [
     "sympy>=1.12",
     "line_profiler",
     "plotly",
+    "PySide6>=6.5",
 ]
 
 [project.scripts]
@@ -24,7 +25,6 @@ hydrogen-ui = "hydrogen.ui.app:main"
 dev = ["pytest>=7"]
 examples = ["matplotlib>=3.7"]
 mpi = ["mpi4py>=3.1"]
-qt = ["PySide6>=6.5"]
 docs = [
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.25",
