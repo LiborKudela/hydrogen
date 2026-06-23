@@ -28,7 +28,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hydrogen.components import MixingJunction
+from hydrogen.components.thermofluid.flow import MixingJunction
 from hydrogen.medium import CoolPropMedium
 from hydrogen.model import Model, Parameter, Variable
 

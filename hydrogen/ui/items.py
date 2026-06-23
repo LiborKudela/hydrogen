@@ -377,8 +377,10 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
                 item.setBrush(QtGui.QColor(color))
                 item.setZValue(6)
             self._param_labels.append((field, name_item, value_item))
-        self._title_visible = True
+        self._name_visible = True
+        self._type_visible = True
         self._params_visible = True
+        self._port_labels_visible = True
         self.refresh_param_labels()
 
         self.rebuild_ports()
@@ -425,6 +427,10 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         else:
             self._place_side(left, x=0.0, align_left=True)
             self._place_side(right, x=width, align_left=False)
+        # Freshly built ports default to a visible label; honour the toggle.
+        if not self._port_labels_visible:
+            for port in self.port_items:
+                port._label.setVisible(False)
         self.apply_transform()   # rect changed -> recompute centre-anchored xform
 
     def _place_side(self, specs, x: float, align_left: bool):
@@ -532,9 +538,12 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self.rebuild_ports(new)
         return True
 
-    def set_title_labels_visible(self, visible: bool):
-        self._title_visible = visible
+    def set_name_visible(self, visible: bool):
+        self._name_visible = visible
         self._title.setVisible(visible)
+
+    def set_type_visible(self, visible: bool):
+        self._type_visible = visible
         self._sub.setVisible(visible)
 
     def set_param_labels_visible(self, visible: bool):
@@ -542,6 +551,11 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         for _field, name_item, value_item in self._param_labels:
             name_item.setVisible(visible)
             value_item.setVisible(visible)
+
+    def set_port_labels_visible(self, visible: bool):
+        self._port_labels_visible = visible
+        for port in self.port_items:
+            port._label.setVisible(visible)
 
     def refresh_param_labels(self):
         params = self.params or {}
@@ -694,6 +708,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._label_drag_start_offset = QtCore.QPointF(self._label_offsets[group])
         self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, False)
         self.setCursor(QtCore.Qt.SizeAllCursor)
+        if self._canvas is not None:
+            self._canvas.begin_live_update()
         self._sync_label_hover_brushes()
 
     def _update_label_drag(self, scene_pos: QtCore.QPointF):
@@ -715,6 +731,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._label_hover_group = None
         self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
         self.setCursor(QtCore.Qt.ArrowCursor)
+        if self._canvas is not None:
+            self._canvas.end_live_update()
         self._sync_label_hover_brushes()
         self._canvas._on_status(f"Moved {group} label on '{self.comp_id}'")
 
@@ -834,10 +852,12 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
                    fixed_scene: QtCore.QPointF | None = None,
                    fixed_local: QtCore.QPointF | None = None):
         old = self.rect()
-        # Scene region the node (incl. handle margin) occupied before shrinking;
-        # forced-updated below so X-forwarding's minimal repaint can't leave a
-        # stale corner trail.
-        old_scene_rect = self.sceneTransform().mapRect(self.boundingRect())
+        # Scene region the node occupied before resizing -- including the resize
+        # handles (boundingRect margin) AND every child (ports + their labels,
+        # which stick out past the body).  Forced-updated below so a minimal /
+        # X-forwarded viewport repaint can't leave a stale port or corner ghost.
+        old_scene_rect = self.sceneTransform().mapRect(
+            self.boundingRect().united(self.childrenBoundingRect()))
         width = max(self.MIN_W, width)
         height = max(self.MIN_H, height)
         sx = width / old.width() if old.width() else 1.0
@@ -864,7 +884,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         # are left behind when the node gets smaller.
         scene = self.scene()
         if scene is not None:
-            new_scene_rect = self.sceneTransform().mapRect(self.boundingRect())
+            new_scene_rect = self.sceneTransform().mapRect(
+                self.boundingRect().united(self.childrenBoundingRect()))
             scene.update(old_scene_rect.united(new_scene_rect))
 
     def itemChange(self, change, value):
@@ -921,6 +942,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
                 }[corner]
                 self._resize_anchor_scene = self.mapToScene(fixed)
                 self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, False)
+                if self._canvas is not None:
+                    self._canvas.begin_live_update()
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -960,6 +983,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             self._resize_corner = None
             self._resize_anchor_scene = None
             self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
+            if self._canvas is not None:
+                self._canvas.end_live_update()
             self._canvas.refresh_connections(self)
             self._canvas._on_status(
                 f"Resized '{self.comp_id}' to "

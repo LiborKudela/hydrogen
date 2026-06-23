@@ -83,6 +83,9 @@ class Block(Model):
     block exposes ports ``u`` (input) and ``y`` (output) by convention.
     """
 
+    #: Abstract base -- excluded from the component catalog / registry.
+    _catalog_abstract = True
+
     #: Shared metadata: every block carries an optional signal `unit` tag.
     PARAMS = {
         "unit": ParamSpec(

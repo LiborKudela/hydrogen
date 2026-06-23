@@ -36,13 +36,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from hydrogen import (  # noqa: E402
-    AmbientInlet,
-    ConjugatePipe,
-    CoolPropMedium,
-    Model,
-    plot_results,
-)
+from hydrogen import CoolPropMedium, Model, plot_results  # noqa: E402
+from hydrogen.components.power.power_components import ConjugatePipe  # noqa: E402
+from hydrogen.components.thermofluid.flow import AmbientInlet  # noqa: E402
 
 # Geometry / material -------------------------------------------------------
 D = 0.05            # m     inner (flow) diameter

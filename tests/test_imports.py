@@ -6,6 +6,7 @@ from __future__ import annotations
 def test_top_level_attributes():
     import hydrogen
 
+    # The top-level package exposes the framework + tooling only.
     expected = {
         "Model",
         "Parameter",
@@ -14,26 +15,6 @@ def test_top_level_attributes():
         "Input",
         "NewtonConvergenceFailure",
         "CoolPropMedium",
-        "AmbientInlet",
-        "AmbientOutlet",
-        "TwoPortSegment",
-        "AdiabaticPump",
-        "StraightPipe",
-        "PressureSource",
-        "PressureOutlet",
-        "PressureVessel",
-        "LoopBuffer",
-        "MixingJunction",
-        "Splitter",
-        "ThermalPort_TQ",
-        "FixedTemperature",
-        "FixedHeatFlow",
-        "ConvectiveBoundary",
-        "ThermalConductor",
-        "TwoNodeWall",
-        "FlatWall",
-        "CylindricalWall",
-        "ConjugatePipe",
         "IntegrationTest",
         "SimpleODE",
         "InnerODE_1",
@@ -42,6 +23,9 @@ def test_top_level_attributes():
         "Interpolation2D",
         "plot_results",
         "local_results_path",
+        "component_catalog",
+        "component_spec",
+        "start_host",
     }
     missing = expected - set(hydrogen.__all__)
     assert not missing, f"missing public exports: {missing}"
@@ -49,23 +33,36 @@ def test_top_level_attributes():
         assert hasattr(hydrogen, name), f"hydrogen.{name} not importable"
 
 
+def test_components_not_reexported_at_top_level():
+    """Components keep their module structure -- they are not re-exported from
+    ``hydrogen`` or the ``hydrogen.components`` aggregate / domain packages."""
+    import hydrogen
+    import hydrogen.components as components
+    import hydrogen.components.thermofluid as thermofluid
+
+    for name in ("Pipe", "StraightPipe", "ConjugatePipe", "FluidPort_phm"):
+        assert not hasattr(hydrogen, name)
+        assert not hasattr(components, name)
+        assert not hasattr(thermofluid, name)
+
+
 def test_submodule_imports():
     from hydrogen.caching import ModelCache, hash_args, numpy_cache  # noqa: F401
-    from hydrogen.components import StraightPipe  # noqa: F401
-    from hydrogen.components.power import ConjugatePipe  # noqa: F401
-    from hydrogen.components.thermofluid import (  # noqa: F401
-        CylindricalWall,
-        FluidPort_phm,
-        PermeationPort_pN,
-        ThermalPort_TQ,
+    from hydrogen.components.power.power_components import ConjugatePipe  # noqa: F401
+    from hydrogen.components.thermofluid.flow import (  # noqa: F401
+        StraightPipe,
         TwoPortSegment,
     )
-    from hydrogen.components.thermofluid.flow import StraightPipe as _SP  # noqa: F401
     from hydrogen.components.thermofluid.permeation import (  # noqa: F401
         SteadyRichardson,
         TransientDiffusion,
     )
-    from hydrogen.components.thermofluid.walls import FlatWall  # noqa: F401
+    from hydrogen.components.thermofluid.ports import (  # noqa: F401
+        FluidPort_phm,
+        PermeationPort_pN,
+        ThermalPort_TQ,
+    )
+    from hydrogen.components.thermofluid.walls import CylindricalWall, FlatWall  # noqa: F401
     from hydrogen.medium import CoolPropMedium  # noqa: F401
     from hydrogen.model import Model, Variable  # noqa: F401
     from hydrogen.numerics import G_const, fast_error_norm, lambdify_compat  # noqa: F401

@@ -1,0 +1,186 @@
+{
+  "format": "hydrogen-ui-project",
+  "version": 1,
+  "hydrogen_version": "0.1.0",
+  "canvas": {
+    "nodes": [
+      {
+        "comp_id": "ramp_6",
+        "type": "hydrogen.control.Ramp",
+        "x": 1102.9191651125666,
+        "y": 449.88671757865063,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": null,
+        "params": {
+          "height": 1.0,
+          "duration": 1.0,
+          "start_time": 1.0,
+          "offset": 0.0,
+          "unit": "1"
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.0,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {},
+        "w": 72.19987520179257,
+        "h": 55.80074878924438
+      },
+      {
+        "comp_id": "pressuresource_5",
+        "type": "hydrogen.thermofluid.PressureSource",
+        "x": 890.1096804488067,
+        "y": 565.8269564127914,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": {
+          "p_source": 1001325.0,
+          "T_source": 293.15,
+          "A": 0.001,
+          "p_control": false
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.0,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {}
+      },
+      {
+        "comp_id": "compressiblevalve_4",
+        "type": "hydrogen.thermofluid.CompressibleValve",
+        "x": 1151.4546616148275,
+        "y": 564.8935814800557,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": null,
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            -24.26774825113057,
+            112.00499192829477
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {}
+      },
+      {
+        "comp_id": "tank_3",
+        "type": "hydrogen.thermofluid.Tank",
+        "x": 1655.6097514356456,
+        "y": 387.6195933185569,
+        "rot": -90,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": null,
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            -55.069121031411555,
+            2.800124798207378
+          ],
+          "params": [
+            98.00436793725794,
+            -116.6718665919737
+          ]
+        },
+        "ports": {}
+      },
+      {
+        "comp_id": "pipe_2",
+        "type": "hydrogen.thermofluid.Pipe",
+        "x": 1403.7447315696058,
+        "y": 567.6046175336728,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": null,
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.0,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {}
+      }
+    ],
+    "connections": [
+      {
+        "from": "compressiblevalve_4.outlet",
+        "to": "pipe_2.inlet"
+      },
+      {
+        "from": "pipe_2.outlet",
+        "to": "tank_3.inlet"
+      },
+      {
+        "from": "pressuresource_5.outlet",
+        "to": "compressiblevalve_4.inlet"
+      },
+      {
+        "from": "ramp_6.y",
+        "to": "compressiblevalve_4.opening"
+      }
+    ]
+  },
+  "sim_options": {
+    "instantiate": {
+      "cse": true,
+      "enable_blt": true,
+      "enable_var_scaling": false,
+      "max_remove_trival_passes": 1,
+      "max_remove_duplicate_passes": 5,
+      "max_remove_linear_block_passes": 3
+    },
+    "initialise": {
+      "n": 1,
+      "relaxation": 1.0,
+      "tol": 1e-06,
+      "max_iter": 200
+    },
+    "simulate": {
+      "strategy": "richardson",
+      "stop_time": 1.0,
+      "dt_start": 0.0001,
+      "dt_min": 1e-09,
+      "dt_max": 10.0,
+      "grow": 1.5,
+      "shrink": 0.5,
+      "max_retries": 20,
+      "relaxation": 1.0,
+      "tol": 1e-06,
+      "max_iter": 200,
+      "tol_local": 0.001,
+      "atol": 1.0
+    }
+  }
+}

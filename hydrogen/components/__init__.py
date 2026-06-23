@@ -19,143 +19,15 @@ Currently shipped domains:
     controllers) wired through the `RealSignal` connector.  Used to build
     setpoints / feedback controllers that drive actuators in other domains.
 
-This `__init__` re-exports the top-level public API of every shipped
-domain so existing call sites can keep writing
-`from hydrogen.components import StraightPipe` (or `FluidPort_phm`).
+This `__init__` deliberately does **not** re-export the domain APIs.  Each
+component is imported from the module where it is defined, so the import path
+mirrors the package layout, e.g.::
+
+    from hydrogen.components.thermofluid.assemblies import Pipe, Tank
+    from hydrogen.components.thermofluid.flow import StraightPipe
+    from hydrogen.components.control.control_components import PID
+
+Tooling that needs the full set of shipped components should use the catalog
+helpers in :mod:`hydrogen.serialization` (``component_catalog`` /
+``component_spec``), which discover components by walking these subpackages.
 """
-
-from .control import (
-    Add,
-    Constant,
-    Feedback,
-    FirstOrder,
-    Gain,
-    Integrator,
-    Limiter,
-    PID,
-    Product,
-    Ramp,
-    RealSignal,
-    Sine,
-    Step,
-    Sum,
-)
-from .materials import AISI_304, AISI_316, WallMaterial
-from .power import ConjugatePipe
-from .thermofluid import (
-    H2,
-    H2_IN_AUSTENITIC,
-    H2_IN_AISI_304,
-    H2_IN_AISI_316,
-    HELIUM,
-    NITROGEN,
-    AdiabaticPump,
-    AmbientInlet,
-    AmbientOutlet,
-    ClosedEnd,
-    CompressibleValve,
-    ConvectiveBoundary,
-    CylindricalWall,
-    FixedHeatFlow,
-    FixedPartialPressure,
-    FixedTemperature,
-    FlatWall,
-    FluidPort_phm,
-    IncompressibleValve,
-    LoopBuffer,
-    MixingJunction,
-    Permeant,
-    PermeationFlux,
-    PermeationPort_pN,
-    Pipe,
-    PressureOutlet,
-    PressureSource,
-    PressureVessel,
-    Splitter,
-    SphericalWall,
-    SteadyRichardson,
-    StraightPipe,
-    Tank,
-    ThermalConductor,
-    ThermalPort_TQ,
-    TransientDiffusion,
-    TransportFit,
-    TwoNodeWall,
-    TwoPortSegment,
-    Valve,
-    WallLayer,
-)
-
-__all__ = [
-    # connectors (re-exported from the `thermofluid` domain)
-    "FluidPort_phm",
-    # flow components
-    "AmbientInlet",
-    "AmbientOutlet",
-    "ClosedEnd",
-    "TwoPortSegment",
-    "AdiabaticPump",
-    "StraightPipe",
-    "Valve",
-    "IncompressibleValve",
-    "CompressibleValve",
-    "PressureOutlet",
-    "PressureSource",
-    "PressureVessel",
-    "Splitter",
-    "MixingJunction",
-    "LoopBuffer",
-    # ports (re-exported from the `thermal` domain)
-    "ThermalPort_TQ",
-    # thermal components
-    "FixedTemperature",
-    "FixedHeatFlow",
-    "ConvectiveBoundary",
-    "ThermalConductor",
-    "TwoNodeWall",
-    "FlatWall",
-    "CylindricalWall",
-    "SphericalWall",
-    # composite assemblies
-    "Pipe",
-    "Tank",
-    "WallLayer",
-    # power components
-    "ConjugatePipe",
-    # permeation-library port
-    "PermeationPort_pN",
-    # permeation materials
-    "Permeant",
-    "TransportFit",
-    "H2",
-    "HELIUM",
-    "NITROGEN",
-    "H2_IN_AUSTENITIC",
-    "H2_IN_AISI_304",
-    "H2_IN_AISI_316",
-    # permeation models / boundary
-    "PermeationFlux",
-    "SteadyRichardson",
-    "TransientDiffusion",
-    "FixedPartialPressure",
-    # wall materials
-    "WallMaterial",
-    "AISI_304",
-    "AISI_316",
-    # control-library port
-    "RealSignal",
-    # control components
-    "Constant",
-    "Step",
-    "Ramp",
-    "Sine",
-    "Gain",
-    "Add",
-    "Feedback",
-    "Sum",
-    "Product",
-    "Limiter",
-    "Integrator",
-    "FirstOrder",
-    "PID",
-]

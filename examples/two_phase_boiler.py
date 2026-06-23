@@ -53,14 +53,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 import CoolProp.CoolProp as CP  # noqa: E402
 import numpy as np  # noqa: E402
 
-from hydrogen import (  # noqa: E402
-    AmbientInlet,
-    CoolPropMedium,
-    FixedHeatFlow,
-    Model,
-    NewtonConvergenceFailure,
-    StraightPipe,
-)
+from hydrogen import CoolPropMedium, Model, NewtonConvergenceFailure  # noqa: E402
+from hydrogen.components.thermofluid.flow import AmbientInlet, StraightPipe  # noqa: E402
+from hydrogen.components.thermofluid.walls import FixedHeatFlow  # noqa: E402
 
 # --- operating point -------------------------------------------------------
 FLUID = "Water"

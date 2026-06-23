@@ -22,7 +22,7 @@ import math
 import numpy as np
 import pytest
 
-from hydrogen.components import (
+from hydrogen.components.thermofluid.walls import (
     CylindricalWall,
     FixedHeatFlow,
     FixedTemperature,

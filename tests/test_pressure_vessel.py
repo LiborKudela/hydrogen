@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hydrogen.components import PressureVessel
+from hydrogen.components.thermofluid.flow import PressureVessel
 from hydrogen.medium import CoolPropMedium
 from hydrogen.model import Model, Parameter, Variable
 

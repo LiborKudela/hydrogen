@@ -1,85 +1,32 @@
 """Hydrogen: symbolic DAE/ODE solver for fluid-system dynamics.
 
-Public API:
+The top-level package exposes the modelling *framework* and tooling:
 
     from hydrogen import (
         Model, Parameter, Variable, DifferentialVariable, Input,  # framework
         CoolPropMedium,                                          # medium
-        AmbientInlet, AmbientOutlet, TwoPortSegment,             # fluid components
-        AdiabaticPump, StraightPipe, LoopBuffer, MixingJunction,
-        FlatWall, CylindricalWall, SphericalWall, FixedTemperature,  # thermal components
-        FixedHeatFlow, ConvectiveBoundary, ThermalConductor,
-        ConjugatePipe,                                           # power components
         Interpolation1D, Interpolation2D,                        # interpolation utilities
         IntegrationTest, SimpleODE, InnerODE_1, InnerODE_2,      # ODE test sub-models
         plot_results,                                            # plotting
+        component_catalog, component_spec,                       # serialization tooling
     )
+
+Components are **not** re-exported here.  Import each from the module where it
+is defined, so the import path mirrors the package layout::
+
+    from hydrogen.components.thermofluid.assemblies import Pipe, Tank
+    from hydrogen.components.thermofluid.flow import StraightPipe, Valve
+    from hydrogen.components.thermofluid.walls import CylindricalWall
+    from hydrogen.components.thermofluid.ports import FluidPort_phm
+    from hydrogen.components.power.power_components import ConjugatePipe
+    from hydrogen.components.control.control_components import PID, Gain
+
+Use ``hydrogen.component_catalog()`` to enumerate everything that ships.
 
 Lower-level helpers (`numpy_cache`, `lambdify_compat`, `fast_*`) live in their
 respective submodules; import directly from there if you need them.
 """
 
-from .components import (
-    AISI_304,
-    AISI_316,
-    H2,
-    H2_IN_AUSTENITIC,
-    H2_IN_AISI_304,
-    H2_IN_AISI_316,
-    HELIUM,
-    NITROGEN,
-    Add,
-    AdiabaticPump,
-    AmbientInlet,
-    AmbientOutlet,
-    ClosedEnd,
-    CompressibleValve,
-    ConjugatePipe,
-    Constant,
-    ConvectiveBoundary,
-    CylindricalWall,
-    Feedback,
-    FirstOrder,
-    FixedHeatFlow,
-    FixedPartialPressure,
-    FixedTemperature,
-    FlatWall,
-    FluidPort_phm,
-    Gain,
-    IncompressibleValve,
-    Integrator,
-    Limiter,
-    LoopBuffer,
-    MixingJunction,
-    PID,
-    Permeant,
-    PermeationFlux,
-    PermeationPort_pN,
-    Pipe,
-    PressureOutlet,
-    PressureSource,
-    PressureVessel,
-    Product,
-    Ramp,
-    RealSignal,
-    Sine,
-    Splitter,
-    SphericalWall,
-    SteadyRichardson,
-    Step,
-    StraightPipe,
-    Sum,
-    Tank,
-    ThermalConductor,
-    ThermalPort_TQ,
-    TransientDiffusion,
-    TransportFit,
-    TwoNodeWall,
-    TwoPortSegment,
-    Valve,
-    WallLayer,
-    WallMaterial,
-)
 from .medium import CoolPropMedium, get_symbolic_property_function
 from .model import (
     DifferentialVariable,
@@ -130,77 +77,6 @@ __all__ = [
     "PortKindMismatchError",
     "PortChannelMissingError",
     "PortMediumMismatchError",
-    # fluid-library ports
-    "FluidPort_phm",
-    # fluid components
-    "AmbientInlet",
-    "AmbientOutlet",
-    "ClosedEnd",
-    "TwoPortSegment",
-    "AdiabaticPump",
-    "StraightPipe",
-    "Valve",
-    "IncompressibleValve",
-    "CompressibleValve",
-    "PressureSource",
-    "PressureOutlet",
-    "PressureVessel",
-    "LoopBuffer",
-    "MixingJunction",
-    "Splitter",
-    # thermal-library ports
-    "ThermalPort_TQ",
-    # thermal components
-    "FixedTemperature",
-    "FixedHeatFlow",
-    "ConvectiveBoundary",
-    "ThermalConductor",
-    "TwoNodeWall",
-    "FlatWall",
-    "CylindricalWall",
-    "SphericalWall",
-    # composite assemblies
-    "Pipe",
-    "Tank",
-    "WallLayer",
-    # power components
-    "ConjugatePipe",
-    # permeation-library port
-    "PermeationPort_pN",
-    # permeation materials
-    "Permeant",
-    "TransportFit",
-    "H2",
-    "HELIUM",
-    "NITROGEN",
-    "H2_IN_AUSTENITIC",
-    "H2_IN_AISI_304",
-    "H2_IN_AISI_316",
-    # permeation models / boundary
-    "PermeationFlux",
-    "SteadyRichardson",
-    "TransientDiffusion",
-    "FixedPartialPressure",
-    # wall materials
-    "WallMaterial",
-    "AISI_304",
-    "AISI_316",
-    # control-library port
-    "RealSignal",
-    # control components
-    "Constant",
-    "Step",
-    "Ramp",
-    "Sine",
-    "Gain",
-    "Add",
-    "Feedback",
-    "Sum",
-    "Product",
-    "Limiter",
-    "Integrator",
-    "FirstOrder",
-    "PID",
     # ODE test sub-models
     "IntegrationTest",
     "SimpleODE",

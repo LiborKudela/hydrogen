@@ -31,12 +31,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from hydrogen import (  # noqa: E402
+from hydrogen import Model, plot_results  # noqa: E402
+from hydrogen.components.thermofluid.walls import (  # noqa: E402
     ConvectiveBoundary,
     FixedHeatFlow,
     FlatWall,
-    Model,
-    plot_results,
 )
 
 # Material: concrete-ish slab ------------------------------------------------------------

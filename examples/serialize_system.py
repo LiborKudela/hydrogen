@@ -33,16 +33,15 @@ if str(_PROJECT_ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 from hydrogen import (  # noqa: E402
-    AmbientInlet,
     CoolPropMedium,
     Model,
-    StraightPipe,
     from_dict,
     from_json,
     local_results_path,
     to_dict,
     to_json,
 )
+from hydrogen.components.thermofluid.flow import AmbientInlet, StraightPipe  # noqa: E402
 
 # Default HEOS backend keeps this demo fast (no BICUBIC table build).
 AIR = CoolPropMedium('air', disable_warnings=True)

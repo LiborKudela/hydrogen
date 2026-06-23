@@ -17,7 +17,6 @@ import numpy as np
 import pytest
 
 from hydrogen import (
-    FluidPort_phm,
     Model,
     Port,
     PortAlreadyConnectedError,
@@ -25,12 +24,13 @@ from hydrogen import (
     PortMediumMismatchError,
     Variable,
 )
-from hydrogen.components import (
+from hydrogen.components.thermofluid.flow import (
     AmbientInlet,
     PressureOutlet,
     PressureSource,
     StraightPipe,
 )
+from hydrogen.components.thermofluid.ports import FluidPort_phm
 from hydrogen.medium import CoolPropMedium
 
 

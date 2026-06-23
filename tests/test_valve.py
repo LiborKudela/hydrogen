@@ -12,16 +12,13 @@ import warnings
 import numpy as np
 import pytest
 
-from hydrogen import (
+from hydrogen import CoolPropMedium, Model, from_dict, to_dict
+from hydrogen.components.control.control_components import Constant
+from hydrogen.components.thermofluid.flow import (
     CompressibleValve,
-    Constant,
-    CoolPropMedium,
     IncompressibleValve,
-    Model,
     PressureOutlet,
     PressureSource,
-    from_dict,
-    to_dict,
 )
 from hydrogen.ports import PortNotConnectedWarning
 

@@ -12,7 +12,9 @@ import warnings
 import numpy as np
 import pytest
 
-from hydrogen import (
+from hydrogen import Model, from_dict, to_dict
+from hydrogen.components.control.control_components import (
+    PID,
     Add,
     Constant,
     Feedback,
@@ -20,15 +22,11 @@ from hydrogen import (
     Gain,
     Integrator,
     Limiter,
-    Model,
-    PID,
     Product,
     Ramp,
     Sine,
     Step,
     Sum,
-    from_dict,
-    to_dict,
 )
 from hydrogen.ports import PortAlreadyConnectedError, PortNotConnectedWarning
 

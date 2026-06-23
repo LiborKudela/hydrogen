@@ -23,7 +23,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hydrogen.components import (
+from hydrogen.components.thermofluid.walls import (
     ConvectiveBoundary,
     FixedHeatFlow,
     FixedTemperature,

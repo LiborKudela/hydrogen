@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import pkgutil
 import re
 import sys
 import types
@@ -87,15 +88,38 @@ def full_type_name(cls: type) -> str:
 
 
 def _iter_builtin_components():
-    """Yield every hydrogen-shipped component class (re-exported leaf Models)."""
+    """Yield every hydrogen-shipped component class.
+
+    The component subpackages keep their natural module structure (no flat
+    re-exports), so discovery walks every module under ``hydrogen.components``
+    and collects the concrete `Model` subclasses *defined* in each one.  A class
+    is skipped when its name is private (leading underscore) or it is flagged as
+    an abstract base via ``_catalog_abstract = True``; classes are de-duplicated
+    by identity so a class imported into a sibling module is only yielded once.
+    """
     # Imported lazily: this module is imported from `hydrogen/__init__`, and we
-    # want `hydrogen.components` to be fully initialised first (it is, by the
-    # time the serialization subpackage is imported at the end of __init__).
+    # want `hydrogen.components` to be importable first.
     from .. import components as comps
 
-    for name in getattr(comps, "__all__", []):
-        obj = getattr(comps, name, None)
-        if isinstance(obj, type) and issubclass(obj, Model) and obj is not Model:
+    seen: set[type] = set()
+    for info in pkgutil.walk_packages(comps.__path__, comps.__name__ + "."):
+        try:
+            module = importlib.import_module(info.name)
+        except Exception:
+            continue
+        for name, obj in vars(module).items():
+            if name.startswith("_"):
+                continue
+            if not (isinstance(obj, type) and issubclass(obj, Model)
+                    and obj is not Model):
+                continue
+            if obj.__module__ != module.__name__:
+                continue  # imported here, defined elsewhere -- yield at its home
+            if obj.__dict__.get("_catalog_abstract", False):
+                continue  # own flag only -- subclasses are still real components
+            if obj in seen:
+                continue
+            seen.add(obj)
             yield obj
 
 

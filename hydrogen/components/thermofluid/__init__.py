@@ -23,98 +23,12 @@ component, not three).  Organised into submodules:
     conjugate heat, and optional permeation) built from the modules above.
 
 See `README.md` in this folder for the full domain overview.
+
+Components are imported from their defining submodule (no flat re-exports),
+so the import path mirrors the package layout, e.g.::
+
+    from hydrogen.components.thermofluid.flow import StraightPipe, Valve
+    from hydrogen.components.thermofluid.walls import CylindricalWall
+    from hydrogen.components.thermofluid.assemblies import Pipe, Tank
+    from hydrogen.components.thermofluid.ports import FluidPort_phm
 """
-
-from .assemblies import Pipe, Tank, WallLayer
-from .flow import (
-    AdiabaticPump,
-    AmbientInlet,
-    AmbientOutlet,
-    ClosedEnd,
-    CompressibleValve,
-    IncompressibleValve,
-    LoopBuffer,
-    MixingJunction,
-    PressureOutlet,
-    PressureSource,
-    PressureVessel,
-    Splitter,
-    StraightPipe,
-    TwoPortSegment,
-    Valve,
-)
-from .permeation import (
-    H2,
-    H2_IN_AUSTENITIC,
-    H2_IN_AISI_304,
-    H2_IN_AISI_316,
-    HELIUM,
-    NITROGEN,
-    FixedPartialPressure,
-    Permeant,
-    PermeationFlux,
-    SteadyRichardson,
-    TransientDiffusion,
-    TransportFit,
-)
-from .ports import FluidPort_phm, PermeationPort_pN, ThermalPort_TQ
-from .walls import (
-    ConvectiveBoundary,
-    CylindricalWall,
-    FixedHeatFlow,
-    FixedTemperature,
-    FlatWall,
-    SphericalWall,
-    ThermalConductor,
-    TwoNodeWall,
-)
-
-__all__ = [
-    # ports
-    "FluidPort_phm",
-    "ThermalPort_TQ",
-    "PermeationPort_pN",
-    # flow components
-    "AmbientInlet",
-    "AmbientOutlet",
-    "ClosedEnd",
-    "TwoPortSegment",
-    "AdiabaticPump",
-    "StraightPipe",
-    "Valve",
-    "IncompressibleValve",
-    "CompressibleValve",
-    "PressureOutlet",
-    "PressureSource",
-    "PressureVessel",
-    "Splitter",
-    "MixingJunction",
-    "LoopBuffer",
-    # wall / thermal components
-    "FixedTemperature",
-    "FixedHeatFlow",
-    "ConvectiveBoundary",
-    "ThermalConductor",
-    "TwoNodeWall",
-    "FlatWall",
-    "CylindricalWall",
-    "SphericalWall",
-    # composite assemblies
-    "Pipe",
-    "Tank",
-    "WallLayer",
-    # permeation materials
-    "Permeant",
-    "TransportFit",
-    "H2",
-    "HELIUM",
-    "NITROGEN",
-    "H2_IN_AUSTENITIC",
-    "H2_IN_AISI_304",
-    "H2_IN_AISI_316",
-    # permeation models / boundary
-    "PermeationFlux",
-    "SteadyRichardson",
-    "TransientDiffusion",
-    "FixedPartialPressure",
-]

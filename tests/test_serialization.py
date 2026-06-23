@@ -14,19 +14,21 @@ import pytest
 
 from hydrogen import (
     CoolPropMedium,
-    CylindricalWall,
-    FixedTemperature,
-    FlatWall,
     Model,
     ParamSpec,
     Parameter,
-    StraightPipe,
-    ThermalConductor,
     Variable,
     from_dict,
     from_json,
     to_dict,
     to_json,
+)
+from hydrogen.components.thermofluid.flow import StraightPipe
+from hydrogen.components.thermofluid.walls import (
+    CylindricalWall,
+    FixedTemperature,
+    FlatWall,
+    ThermalConductor,
 )
 from hydrogen.paramspec import merged_param_specs
 from hydrogen.serialization import (
@@ -669,11 +671,11 @@ def test_missing_required_package_is_reported():
 def test_value_spec_roundtrip_wall_layer():
     """A `WallLayer` (material + permeation flux + transport fit + permeant)
     round-trips through the value-spec codec, value-for-value."""
-    from hydrogen import (
-        AISI_316,
+    from hydrogen.components.materials import AISI_316
+    from hydrogen.components.thermofluid.assemblies import WallLayer
+    from hydrogen.components.thermofluid.permeation import (
         H2_IN_AUSTENITIC,
         SteadyRichardson,
-        WallLayer,
     )
     from hydrogen.serialization.values import decode_value, encode_value
 
@@ -698,14 +700,12 @@ def test_value_spec_roundtrip_wall_layer():
 
 
 def _walled_pipe_net():
-    from hydrogen import (
-        AISI_316,
-        ClosedEnd,
+    from hydrogen.components.materials import AISI_316
+    from hydrogen.components.thermofluid.assemblies import Pipe, WallLayer
+    from hydrogen.components.thermofluid.flow import ClosedEnd, PressureSource
+    from hydrogen.components.thermofluid.permeation import (
         H2_IN_AUSTENITIC,
-        Pipe,
-        PressureSource,
         SteadyRichardson,
-        WallLayer,
     )
 
     med = CoolPropMedium("Hydrogen", disable_warnings=True)

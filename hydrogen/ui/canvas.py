@@ -94,8 +94,11 @@ class Canvas(QtWidgets.QGraphicsView):
         self._zoom = 1.0
         self._panning = False
         self._pan_start = QtCore.QPoint()
-        self._show_titles = True   # instance name + type label group
-        self._show_params = True   # ui_label parameter labels
+        self._prev_update_mode = None  # saved viewport mode during live drags
+        self._show_names = True       # instance-name label
+        self._show_types = True        # component-type label
+        self._show_params = True       # ui_label parameter labels
+        self._show_port_names = True   # per-port name labels
         self._scene = QtWidgets.QGraphicsScene(self)
         self._scene.setSceneRect(-2000, -2000, 6800, 5200)
         self.setScene(self._scene)
@@ -227,10 +230,29 @@ class Canvas(QtWidgets.QGraphicsView):
         self._counter += 1
         return f"{base}_{self._counter}"
 
+    def begin_live_update(self):
+        """Repaint the whole viewport for the duration of an interactive drag.
+
+        The default ``MinimalViewportUpdate`` under-repaints when a node's child
+        items (ports + labels) move during a resize/label drag, which leaves
+        ghost copies behind -- especially over X-forwarding / software
+        rendering.  Full updates while dragging guarantee a clean frame; the
+        previous mode is restored in :meth:`end_live_update`.
+        """
+        if self._prev_update_mode is None:
+            self._prev_update_mode = self.viewportUpdateMode()
+            self.setViewportUpdateMode(
+                QtWidgets.QGraphicsView.FullViewportUpdate)
+
+    def end_live_update(self):
+        if self._prev_update_mode is not None:
+            self.setViewportUpdateMode(self._prev_update_mode)
+            self._prev_update_mode = None
+            self.viewport().update()
+
     def add_node(self, entry: dict, scene_pos: QtCore.QPointF) -> NodeItem:
         node = NodeItem(entry, self._next_id(entry["name"]), self)
-        node.set_title_labels_visible(self._show_titles)
-        node.set_param_labels_visible(self._show_params)
+        self._apply_marker_visibility(node)
         r = node.rect()
         node.setPos(scene_pos.x() - r.width() / 2, scene_pos.y() - r.height() / 2)
         self._scene.addItem(node)
@@ -242,15 +264,31 @@ class Canvas(QtWidgets.QGraphicsView):
     def add_node_at_center(self, entry: dict) -> NodeItem:
         return self.add_node(entry, self.mapToScene(self.viewport().rect().center()))
 
-    def set_titles_visible(self, visible: bool):
-        self._show_titles = visible
+    def _apply_marker_visibility(self, node: NodeItem):
+        node.set_name_visible(self._show_names)
+        node.set_type_visible(self._show_types)
+        node.set_param_labels_visible(self._show_params)
+        node.set_port_labels_visible(self._show_port_names)
+
+    def set_names_visible(self, visible: bool):
+        self._show_names = visible
         for node in self.nodes():
-            node.set_title_labels_visible(visible)
+            node.set_name_visible(visible)
+
+    def set_types_visible(self, visible: bool):
+        self._show_types = visible
+        for node in self.nodes():
+            node.set_type_visible(visible)
 
     def set_params_visible(self, visible: bool):
         self._show_params = visible
         for node in self.nodes():
             node.set_param_labels_visible(visible)
+
+    def set_port_names_visible(self, visible: bool):
+        self._show_port_names = visible
+        for node in self.nodes():
+            node.set_port_labels_visible(visible)
 
     def refresh_catalog(self, by_type: dict[str, dict]):
         """Rebind every placed node to fresh catalogue metadata.
@@ -324,8 +362,7 @@ class Canvas(QtWidgets.QGraphicsView):
             node._mirror_x = bool(nd.get("mirror_x", False))
             node._mirror_y = bool(nd.get("mirror_y", False))
             node.set_ports_locked(bool(nd.get("ports_locked", node.ports_locked)))
-            node.set_title_labels_visible(self._show_titles)
-            node.set_param_labels_visible(self._show_params)
+            self._apply_marker_visibility(node)
             node.apply_transform()
             self._scene.addItem(node)
             by_id[node.comp_id] = node

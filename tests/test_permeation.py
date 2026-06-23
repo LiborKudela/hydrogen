@@ -23,28 +23,24 @@ import math
 import numpy as np
 import pytest
 
-from hydrogen import (
+from hydrogen import CoolPropMedium, Model
+from hydrogen.components.materials import AISI_304, AISI_316, R_GAS, WallMaterial
+from hydrogen.components.thermofluid.assemblies import Pipe, WallLayer
+from hydrogen.components.thermofluid.flow import (
+    ClosedEnd,
+    PressureSource,
+    StraightPipe,
+)
+from hydrogen.components.thermofluid.permeation import (
     H2,
     H2_IN_AUSTENITIC,
     HELIUM,
-    AISI_304,
-    AISI_316,
-    ClosedEnd,
-    CoolPropMedium,
-    CylindricalWall,
     FixedPartialPressure,
-    FixedTemperature,
-    Model,
-    Pipe,
-    PressureSource,
     SteadyRichardson,
-    StraightPipe,
     TransientDiffusion,
     TransportFit,
-    WallLayer,
-    WallMaterial,
 )
-from hydrogen.components.materials import R_GAS
+from hydrogen.components.thermofluid.walls import CylindricalWall, FixedTemperature
 
 #: Thermal wall material + matching hydrogen transport fit used by the rigs.
 MAT = AISI_316

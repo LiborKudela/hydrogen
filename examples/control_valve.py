@@ -32,17 +32,17 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from hydrogen import (  # noqa: E402
-    CompressibleValve,
+from hydrogen import CoolPropMedium, Model, plot_results  # noqa: E402
+from hydrogen.components.control.control_components import (  # noqa: E402
     Constant,
-    CoolPropMedium,
-    IncompressibleValve,
     Limiter,
-    Model,
+    Ramp,
+)
+from hydrogen.components.thermofluid.flow import (  # noqa: E402
+    CompressibleValve,
+    IncompressibleValve,
     PressureOutlet,
     PressureSource,
-    Ramp,
-    plot_results,
 )
 
 WATER = CoolPropMedium('water', disable_warnings=True)

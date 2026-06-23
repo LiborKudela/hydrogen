@@ -25,6 +25,17 @@ if str(_PROJECT_ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 import hydrogen as hd  # noqa: E402
+from hydrogen.components.control.control_components import Ramp  # noqa: E402
+from hydrogen.components.materials import AISI_316  # noqa: E402
+from hydrogen.components.thermofluid.assemblies import Pipe, WallLayer  # noqa: E402
+from hydrogen.components.thermofluid.flow import (  # noqa: E402
+    ClosedEnd,
+    PressureSource,
+)
+from hydrogen.components.thermofluid.permeation import (  # noqa: E402
+    H2_IN_AISI_304,
+    TransientDiffusion,
+)
 
 SPEC_PATH = _HERE / "system.json"
 
@@ -63,11 +74,11 @@ class PressurizedPipe(hd.Model):
 
     def declare_components(self):
         # Supply-pressure command: ramp 1 bar -> 20 MPa over T_RAMP, then flat.
-        self.add_component("p_cmd", hd.components.control.Ramp(
+        self.add_component("p_cmd", Ramp(
             height=P_FULL - P_START, duration=T_RAMP, start_time=0.0,
             offset=P_START, unit="Pa"))
         # Pressure source driven by the ramp through its `p_set` signal input.
-        self.add_component("source", hd.components.thermofluid.PressureSource(
+        self.add_component("source", PressureSource(
             H2, p_source=P_START, T_source=T_OP, A=A_BORE, p_control=True))
         # The walled pipe: a flow pipe wrapped per segment in a permeable
         # AISI-316 wall (transient diffusion), held isothermal and venting to a
@@ -83,18 +94,18 @@ class PressurizedPipe(hd.Model):
         # the system stays well-posed.  With `T_ext = T_OP` the surface sits at
         # 150 C just like `fixed` would (the thermal side carries no driving
         # gradient here -- the physics of interest is the wall permeation).
-        self.add_component("pipe", hd.components.thermofluid.Pipe(
+        self.add_component("pipe", Pipe(
             H2, D=2 * R_IN, L=L_PIPE, epsilon=1e-6, z_in=0.0, z_out=0.0,
             n_segments=N_SEG,
-            layers=[hd.components.thermofluid.WallLayer(
-                hd.components.materials.AISI_316, R_OUT - R_IN,
-                permeation=hd.components.thermofluid.TransientDiffusion(
-                    hd.components.thermofluid.H2_IN_AISI_304, n_nodes=N_NODES),
+            layers=[WallLayer(
+                AISI_316, R_OUT - R_IN,
+                permeation=TransientDiffusion(
+                    H2_IN_AISI_304, n_nodes=N_NODES),
                 dynamic=True)],
             outer_thermal="convective", h_ext=1.0e5, T_ext=T_OP, p_ext=P_EXT,
             T_wall_init=T_OP, p_init=P_START))
         # Far end sealed -> the only outflow is the wall permeation.
-        self.add_component("cap", hd.components.thermofluid.ClosedEnd(
+        self.add_component("cap", ClosedEnd(
             H2, p_init=P_START, T_init=T_OP))
 
     def declare_equations(self):

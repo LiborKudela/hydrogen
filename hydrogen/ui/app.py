@@ -16,9 +16,11 @@ from hydrogen.serialization import SCHEMA_VERSION
 
 from .canvas import Canvas
 from .catalog import ComponentTree
+from .home import HomeScreen
 from .items import NodeItem
 from .project import is_project, make_project
 from .qt import QtCore, QtGui, QtWidgets, exec_
+from .recent import add_recent_file, recent_files, remove_recent_file
 from .simulate import SimulateDialog, default_sim_options
 
 __all__ = ["MainWindow", "main"]
@@ -73,24 +75,43 @@ class MainWindow(QtWidgets.QMainWindow):
         fit.setToolTip("Zoom/pan so all placed components fit the view.")
         fit.clicked.connect(self._canvas.fit_view)
 
-        self._show_names = QtWidgets.QCheckBox("Names")
-        self._show_names.setToolTip("Show the instance name + type label group.")
-        self._show_names.setChecked(True)
-        self._show_names.toggled.connect(self._canvas.set_titles_visible)
+        markers = QtWidgets.QToolButton()
+        markers.setText("Markers ▾")
+        markers.setToolTip("Choose which on-canvas markers are shown.")
+        markers.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        markers_menu = QtWidgets.QMenu(markers)
+        for label, tip, slot in (
+            ("Names", "Instance-name labels",
+             self._canvas.set_names_visible),
+            ("Types", "Component-type labels",
+             self._canvas.set_types_visible),
+            ("Labels", "ui_label parameter labels",
+             self._canvas.set_params_visible),
+            ("Port names", "Per-port name labels",
+             self._canvas.set_port_names_visible),
+        ):
+            act = markers_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(True)
+            act.setToolTip(tip)
+            act.toggled.connect(slot)
+        markers_menu.setToolTipsVisible(True)
+        markers.setMenu(markers_menu)
+        self._markers_btn = markers
 
-        self._show_labels = QtWidgets.QCheckBox("Labels")
-        self._show_labels.setToolTip("Show the ui_label parameter labels.")
-        self._show_labels.setChecked(True)
-        self._show_labels.toggled.connect(self._canvas.set_params_visible)
+        home_btn = QtWidgets.QToolButton()
+        home_btn.setText("⌂ Home")
+        home_btn.setToolTip("Back to the start screen (recent projects).")
+        home_btn.clicked.connect(self._show_home)
 
         right = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(right)
         rl.setContentsMargins(6, 6, 6, 6)
         bar = QtWidgets.QHBoxLayout()
+        bar.addWidget(home_btn)
         bar.addWidget(QtWidgets.QLabel("<b>Canvas</b>"))
         bar.addWidget(fit)
-        bar.addWidget(self._show_names)
-        bar.addWidget(self._show_labels)
+        bar.addWidget(self._markers_btn)
         bar.addStretch(1)
         bar.addWidget(simulate)
         bar.addWidget(clear)
@@ -103,9 +124,20 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([280, 720])
-        self.setCentralWidget(splitter)
+
+        # Central area: a start screen (recent projects) over the editor.
+        self._home = HomeScreen()
+        self._home.newRequested.connect(self._new_project)
+        self._home.openRequested.connect(self._open_project)
+        self._home.openRecentRequested.connect(self._open_path)
+
+        self._stack = QtWidgets.QStackedWidget()
+        self._stack.addWidget(self._home)     # index 0
+        self._stack.addWidget(splitter)       # index 1
+        self.setCentralWidget(self._stack)
 
         self.statusBar().showMessage("Ready")
+        self._show_home()
 
     # --- File menu / project persistence ----------------------------------- #
     def _build_menu(self):
@@ -118,6 +150,12 @@ class MainWindow(QtWidgets.QMainWindow):
         open_act = file_menu.addAction("&Open…")
         open_act.setShortcut(QtGui.QKeySequence.Open)
         open_act.triggered.connect(self._open_project)
+
+        self._recent_menu = file_menu.addMenu("Open &Recent")
+        self._recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
+
+        home_act = file_menu.addAction("&Home")
+        home_act.triggered.connect(self._show_home)
 
         file_menu.addSeparator()
         save_act = file_menu.addAction("&Save")
@@ -185,22 +223,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if event.type() == QtCore.QEvent.WindowStateChange:
             self._sync_window_controls()
 
+    def _show_home(self):
+        self._home.refresh()
+        self._stack.setCurrentWidget(self._home)
+        self.setWindowTitle("hydrogen — start")
+        self._set_status("Ready")
+
+    def _show_editor(self):
+        self._stack.setCurrentIndex(1)
+
     def _new_project(self):
         self._canvas.clear_nodes()
         self._sim_options = default_sim_options()
         self._path = None
+        self._show_editor()
         self._update_title()
         self._set_status("New project")
 
     def _open_project(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Open project", "", "Hydrogen UI project (*.json);;All files (*)")
-        if not path:
-            return
+        if path:
+            self._open_path(path)
+
+    def _open_path(self, path: str):
+        """Load a project from ``path`` (shared by the dialog + recent list)."""
         try:
             data = json.loads(Path(path).read_text())
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Open failed", str(exc))
+            remove_recent_file(path)
+            self._home.refresh()
             return
         if not is_project(data):
             QtWidgets.QMessageBox.warning(
@@ -209,7 +262,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._canvas.load_project(data.get("canvas", {}))
         self._sim_options = data.get("sim_options") or default_sim_options()
         self._path = path
+        add_recent_file(path)
+        self._show_editor()
         self._update_title()
+
+    def _rebuild_recent_menu(self):
+        self._recent_menu.clear()
+        files = recent_files()
+        if not files:
+            empty = self._recent_menu.addAction("(no recent projects)")
+            empty.setEnabled(False)
+            return
+        for path in files:
+            act = self._recent_menu.addAction(path)
+            act.triggered.connect(lambda _=False, p=path: self._open_path(p))
+        self._recent_menu.addSeparator()
+        clear_act = self._recent_menu.addAction("Clear recent")
+        clear_act.triggered.connect(self._clear_recent)
+
+    def _clear_recent(self):
+        from .recent import clear_recent_files
+        clear_recent_files()
+        self._home.refresh()
 
     def _save_project(self):
         if self._path is None:
@@ -234,6 +308,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
             return
+        add_recent_file(path)
         self._update_title()
         self._set_status(f"Saved project to {path}")
 
@@ -331,6 +406,8 @@ class MainWindow(QtWidgets.QMainWindow):
 def main(argv: list[str] | None = None):
     argv = list(sys.argv if argv is None else argv)
     app = QtWidgets.QApplication(argv)
+    app.setOrganizationName("hydrogen")
+    app.setApplicationName("hydrogen-ui")
     win = MainWindow()
     win.resize(1040, 720)            # sensible size if restored from fullscreen
     win.showFullScreen()

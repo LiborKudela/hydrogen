@@ -20,15 +20,11 @@ import warnings
 import numpy as np
 import pytest
 
-from hydrogen import (
-    AmbientInlet,
-    ConjugatePipe,
-    CoolPropMedium,
-    FixedTemperature,
-    Model,
-    StraightPipe,
-)
-from hydrogen.components.thermofluid import ThermalPort_TQ
+from hydrogen import CoolPropMedium, Model
+from hydrogen.components.power.power_components import ConjugatePipe
+from hydrogen.components.thermofluid.flow import AmbientInlet, StraightPipe
+from hydrogen.components.thermofluid.ports import ThermalPort_TQ
+from hydrogen.components.thermofluid.walls import FixedTemperature
 from hydrogen.ports import PortNotConnectedWarning
 
 # One shared medium for the whole module (CoolProp table build is expensive).

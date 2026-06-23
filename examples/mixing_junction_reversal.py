@@ -55,13 +55,13 @@ import sympy as sp  # noqa: E402
 
 from hydrogen import (  # noqa: E402
     CoolPropMedium,
-    MixingJunction,
     Model,
     Parameter,
     Variable,
     local_results_path,
     plot_results,
 )
+from hydrogen.components.thermofluid.flow import MixingJunction  # noqa: E402
 
 # --- Physical / numerical parameters ----------------------------------------
 

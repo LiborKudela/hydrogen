@@ -25,15 +25,13 @@ import CoolProp.CoolProp as CP
 import numpy as np
 import pytest
 
-from hydrogen import (
+from hydrogen import CoolPropMedium, Model, NewtonConvergenceFailure
+from hydrogen.components.thermofluid.flow import (
     AmbientInlet,
-    CoolPropMedium,
-    FixedHeatFlow,
-    Model,
-    NewtonConvergenceFailure,
     StraightPipe,
+    TwoPortSegment,
 )
-from hydrogen.components.thermofluid.flow import TwoPortSegment
+from hydrogen.components.thermofluid.walls import FixedHeatFlow
 
 # --- shared operating point ---------------------------------------------------
 FLUID = "Water"

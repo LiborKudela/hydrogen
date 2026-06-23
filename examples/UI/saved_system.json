@@ -7,8 +7,8 @@
       {
         "comp_id": "pipe_1",
         "type": "hydrogen.thermofluid.Pipe",
-        "x": 1291.7177690883652,
-        "y": 449.60954058132677,
+        "x": 1043.7928761741418,
+        "y": 272.7307665812617,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -31,7 +31,25 @@
                 "k": 15.0
               },
               "thickness": 0.002,
-              "permeation": null,
+              "permeation": {
+                "__type__": "TransientDiffusion",
+                "transport_fit": {
+                  "__type__": "TransportFit",
+                  "permeant": {
+                    "__type__": "Permeant",
+                    "name": "H2",
+                    "M": 0.00201588,
+                    "solubility_exponent": 2.0
+                  },
+                  "Phi0": 5.285149e-08,
+                  "E_Phi": 59800.0,
+                  "D0": 6.180331e-07,
+                  "E_D": 53900.0,
+                  "name": "H2 in AISI 316"
+                },
+                "n_nodes": 5,
+                "C_init": 0.0
+              },
               "dynamic": true
             }
           ],
@@ -42,21 +60,56 @@
           "T_outer": 293.15,
           "p_ext": 0.0,
           "T_wall_init": 293.15,
-          "p_init": 101325.0
+          "p_init": 101325.0,
+          "count": 1
         },
-        "ports": {
-          "wall_outer_0": [
-            67.98504817024195,
-            0.0,
-            -1
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            -4.108829568788451,
+            5.53798767967146
+          ],
+          "params": [
+            -19.82956878850098,
+            -1.7864476386036472
           ]
-        }
+        },
+        "ports": {}
       },
       {
-        "comp_id": "pressuresource_2",
+        "comp_id": "ramp_2",
+        "type": "hydrogen.control.Ramp",
+        "x": 639.414109877329,
+        "y": 199.40381568451045,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": null,
+        "params": {
+          "height": 1000000.0,
+          "duration": 1.0,
+          "start_time": 0.0,
+          "offset": 101325.0,
+          "unit": null
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.0,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {}
+      },
+      {
+        "comp_id": "pressuresource_3",
         "type": "hydrogen.thermofluid.PressureSource",
-        "x": 1043.4323057968504,
-        "y": 452.6845417665279,
+        "x": 840.3933837173046,
+        "y": 272.6893142612126,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -67,51 +120,103 @@
           "A": 0.001,
           "p_control": true
         },
-        "ports": {}
-      },
-      {
-        "comp_id": "ramp_3",
-        "type": "hydrogen.control.Ramp",
-        "x": 814.3492199318832,
-        "y": 442.9155536953646,
-        "rot": 0,
-        "mirror_x": false,
-        "mirror_y": false,
-        "medium": null,
-        "params": {
-          "height": 10000000.0,
-          "duration": 100.0,
-          "start_time": 0.0,
-          "offset": 101325.0,
-          "unit": "Pa"
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.0,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
         },
-        "ports": {}
+        "ports": {},
+        "w": 150.0,
+        "h": 78.0
       },
       {
-        "comp_id": "closedend_4",
-        "type": "hydrogen.thermofluid.ClosedEnd",
-        "x": 1539.2228815222054,
-        "y": 449.6684553848596,
-        "rot": 0,
+        "comp_id": "tank_4",
+        "type": "hydrogen.thermofluid.Tank",
+        "x": 1174.427355109124,
+        "y": 145.98222487895129,
+        "rot": -90,
         "mirror_x": false,
         "mirror_y": false,
         "medium": "Hydrogen",
-        "params": null,
+        "params": {
+          "volume": 0.05,
+          "diameter": 0.3,
+          "layers": [
+            {
+              "__type__": "WallLayer",
+              "material": {
+                "__type__": "WallMaterial",
+                "name": "AISI 316/316L",
+                "rho": 7990.0,
+                "cp": 500.0,
+                "k": 15.0
+              },
+              "thickness": 0.002,
+              "permeation": {
+                "__type__": "TransientDiffusion",
+                "transport_fit": {
+                  "__type__": "TransportFit",
+                  "permeant": {
+                    "__type__": "Permeant",
+                    "name": "H2",
+                    "M": 0.00201588,
+                    "solubility_exponent": 2.0
+                  },
+                  "Phi0": 5.285149e-08,
+                  "E_Phi": 59800.0,
+                  "D0": 6.180331e-07,
+                  "E_D": 53900.0,
+                  "name": "H2 in AISI 316"
+                },
+                "n_nodes": 5,
+                "C_init": 0.0
+              },
+              "dynamic": true
+            }
+          ],
+          "h_inner": 50.0,
+          "count": 1,
+          "outer_thermal": "adiabatic",
+          "h_ext": 10.0,
+          "T_ext": 293.15,
+          "T_outer": 293.15,
+          "p_ext": 0.0,
+          "T_wall_init": 293.15,
+          "p_init": 101325.0,
+          "T_init": 293.15
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.0,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
         "ports": {}
       }
     ],
     "connections": [
       {
-        "from": "ramp_3.y",
-        "to": "pressuresource_2.p_set"
+        "from": "pressuresource_3.outlet",
+        "to": "pipe_1.inlet"
+      },
+      {
+        "from": "ramp_2.y",
+        "to": "pressuresource_3.p_set"
       },
       {
         "from": "pipe_1.outlet",
-        "to": "closedend_4.inlet"
-      },
-      {
-        "from": "pressuresource_2.outlet",
-        "to": "pipe_1.inlet"
+        "to": "tank_4.inlet"
       }
     ]
   },
@@ -132,11 +237,10 @@
     },
     "simulate": {
       "strategy": "richardson",
-      "stop_time": 1000.0,
-      "dt": 0.1,
+      "stop_time": 1.0,
       "dt_start": 0.0001,
       "dt_min": 1e-09,
-      "dt_max": 100.0,
+      "dt_max": 1.0,
       "grow": 1.5,
       "shrink": 0.5,
       "max_retries": 20,

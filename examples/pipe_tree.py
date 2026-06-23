@@ -51,14 +51,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from hydrogen import (  # noqa: E402
-    CoolPropMedium,
-    Model,
+from hydrogen import CoolPropMedium, Model, plot_results  # noqa: E402
+from hydrogen.components.thermofluid.flow import (  # noqa: E402
     PressureOutlet,
     PressureSource,
     Splitter,
     StraightPipe,
-    plot_results,
 )
 
 

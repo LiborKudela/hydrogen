@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hydrogen.components import LoopBuffer
+from hydrogen.components.thermofluid.flow import LoopBuffer
 from hydrogen.medium import CoolPropMedium
 from hydrogen.model import Model, Parameter, Variable
 
@@ -140,7 +140,7 @@ def _trace(record, suffix: str) -> np.ndarray:
 def test_loop_buffer_subclasses_mixing_junction():
     """`LoopBuffer` must inherit from `MixingJunction` (so any code that
     isinstance-checks `MixingJunction` also accepts `LoopBuffer`)."""
-    from hydrogen.components import MixingJunction
+    from hydrogen.components.thermofluid.flow import MixingJunction
     assert issubclass(LoopBuffer, MixingJunction)
 
 

@@ -6,10 +6,8 @@ ships the `ConjugatePipe`: a fluid `StraightPipe` whose every segment is
 wrapped in a `CylindricalWall` with real metal thermal mass, plus a
 configurable outer boundary.  See `README.md` in this folder for the full
 domain overview.
+
+Imported from its defining module (no flat re-export)::
+
+    from hydrogen.components.power.power_components import ConjugatePipe
 """
-
-from .power_components import ConjugatePipe
-
-__all__ = [
-    "ConjugatePipe",
-]
