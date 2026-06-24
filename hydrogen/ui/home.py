@@ -8,12 +8,19 @@ editor, ...).
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 from .qt import QtCore, QtGui, QtWidgets, Signal
 from .recent import recent_files
+from .thumbnail import render_canvas_thumbnail
 
 __all__ = ["HomeScreen"]
+
+#: Recent-card thumbnail size (logical px); rendered at 2x for crispness.
+_THUMB_W = 132
+_THUMB_H = 76
 
 
 # Palette shared across the home screen's stylesheet.
@@ -31,7 +38,8 @@ class _RecentCard(QtWidgets.QFrame):
 
     clicked = Signal(str)
 
-    def __init__(self, path: str, exists: bool, parent=None):
+    def __init__(self, path: str, exists: bool, thumb: QtGui.QPixmap | None = None,
+                 parent=None):
         super().__init__(parent)
         self._path = path
         self.setObjectName("recentCard")
@@ -42,32 +50,37 @@ class _RecentCard(QtWidgets.QFrame):
         name = os.path.basename(path) or path
         folder = os.path.dirname(path) or "—"
 
-        icon = QtWidgets.QLabel("●")
-        icon.setObjectName("recentIcon")
-        icon.setFixedWidth(20)
-        icon.setAlignment(QtCore.Qt.AlignCenter)
-        icon.setStyleSheet(
-            f"color: {_ACCENT if exists else '#f59e0b'}; font-size: 12px;")
+        thumb_label = QtWidgets.QLabel()
+        thumb_label.setObjectName("recentThumb")
+        thumb_label.setProperty("missing", not exists)
+        thumb_label.setFixedSize(_THUMB_W, _THUMB_H)
+        thumb_label.setAlignment(QtCore.Qt.AlignCenter)
+        if thumb is not None and not thumb.isNull():
+            thumb_label.setPixmap(thumb)
+        else:
+            thumb_label.setText("missing" if not exists else "empty")
 
         title = QtWidgets.QLabel(name if exists else f"{name}  ·  missing")
         title.setObjectName("recentTitle")
         sub = QtWidgets.QLabel(folder)
         sub.setObjectName("recentSub")
         sub.setTextInteractionFlags(QtCore.Qt.NoTextInteraction)
+        sub.setWordWrap(True)
 
         text = QtWidgets.QVBoxLayout()
         text.setContentsMargins(0, 0, 0, 0)
-        text.setSpacing(1)
+        text.setSpacing(2)
         text.addWidget(title)
         text.addWidget(sub)
+        text.addStretch(1)
 
         chevron = QtWidgets.QLabel("›")
         chevron.setObjectName("recentChevron")
 
         row = QtWidgets.QHBoxLayout(self)
-        row.setContentsMargins(12, 9, 14, 9)
-        row.setSpacing(10)
-        row.addWidget(icon)
+        row.setContentsMargins(10, 9, 14, 9)
+        row.setSpacing(12)
+        row.addWidget(thumb_label)
         row.addLayout(text, 1)
         row.addWidget(chevron)
 
@@ -91,8 +104,11 @@ class HomeScreen(QtWidgets.QWidget):
     #: Open a specific recent project (carries its absolute path).
     openRecentRequested = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, by_type: dict | None = None, parent=None):
         super().__init__(parent)
+        self._by_type = by_type or {}
+        # path -> (mtime, pixmap); avoids rebuilding the scene on every visit.
+        self._thumb_cache: dict[str, tuple[float, QtGui.QPixmap]] = {}
         self.setObjectName("homeScreen")
         self.setStyleSheet(self._stylesheet())
 
@@ -171,6 +187,12 @@ class HomeScreen(QtWidgets.QWidget):
 
         self.refresh()
 
+    def set_catalog(self, by_type: dict):
+        """Update the type→entry map used to render thumbnails (called when the
+        component catalogue is reloaded)."""
+        self._by_type = by_type or {}
+        self._thumb_cache.clear()      # symbols/colours may have changed
+
     def refresh(self):
         """Repopulate the recent-projects list from the persistent store."""
         # Drop the existing cards (keep the trailing stretch at the end).
@@ -182,13 +204,41 @@ class HomeScreen(QtWidgets.QWidget):
 
         files = recent_files()
         for path in files:
-            card = _RecentCard(path, os.path.exists(path))
+            exists = os.path.exists(path)
+            thumb = self._thumbnail_for(path) if exists else None
+            card = _RecentCard(path, exists, thumb=thumb)
             card.clicked.connect(self.openRecentRequested)
             self._list_layout.insertWidget(self._list_layout.count() - 1, card)
 
         has_items = bool(files)
         self._list_host.setVisible(has_items)
         self._empty.setVisible(not has_items)
+
+    def _thumbnail_for(self, path: str) -> QtGui.QPixmap | None:
+        """Render a layout preview of the project at ``path`` (``None`` on any
+        read/parse error), memoised by file mtime."""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        cached = self._thumb_cache.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        try:
+            data = json.loads(Path(path).read_text())
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        canvas_state = data.get("canvas", {})
+        dpr = 2.0          # render crisp; the label shows it at logical size
+        pm = render_canvas_thumbnail(
+            canvas_state,
+            QtCore.QSize(int(_THUMB_W * dpr), int(_THUMB_H * dpr)),
+            self._by_type)
+        pm.setDevicePixelRatio(dpr)
+        self._thumb_cache[path] = (mtime, pm)
+        return pm
 
     @staticmethod
     def _stylesheet() -> str:
@@ -254,6 +304,14 @@ class HomeScreen(QtWidgets.QWidget):
             border: 1px solid {_ACCENT};
         }}
         #recentCard[missing="true"] {{ background: #fbfbfc; }}
+        #recentThumb {{
+            background: #f8fafc;
+            border: 1px solid {_BORDER};
+            border-radius: 7px;
+            color: #94a3b8;
+            font-size: 10px;
+        }}
+        #recentThumb[missing="true"] {{ color: #f59e0b; }}
         #recentTitle {{ color: {_INK}; font-size: 13px; font-weight: 600; }}
         #recentSub {{ color: {_MUTED}; font-size: 11px; }}
         #recentIcon {{ font-size: 15px; }}

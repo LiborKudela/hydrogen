@@ -45,6 +45,11 @@ _SPEC_Z_OUT = ParamSpec("Elevation of the outlet face (gravity head).",
 _SPEC_EPSILON = ParamSpec("Absolute wall roughness (friction).", unit="m",
                           default=1e-6)
 _SPEC_L = ParamSpec("Flow length.", unit="m", default=1.0)
+_SPEC_COUNT = ParamSpec(
+    "Number of identical parallel segments this one component represents "
+    "(multiplicity >= 1).  A live Parameter (NOT structural): retuning it "
+    "scales the extensive flow / heat / leak by the new multiplicity without "
+    "re-instantiating the model.", unit="1", default=1.0)
 
 
 class AmbientInlet(Model):
@@ -312,6 +317,7 @@ class TwoPortSegment(Model):
         multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
         heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
         leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        count: Annotated[float, _SPEC_COUNT] = 1.0,
     ):
         self.medium = medium
         if multiphase not in self._MULTIPHASE_MODES:
@@ -320,6 +326,13 @@ class TwoPortSegment(Model):
         self.multiphase = multiphase
         self.heat_port = bool(heat_port)  # adds radial heat transfer term
         self.leaky = bool(leaky)          # adds radial permeation mass-flow term
+        # Multiplicity: this one segment stands in for `count` identical parallel
+        # segments.  A live `Parameter` (not baked into `A`/`P`) so the parallel
+        # multiplicity can be retuned without re-instantiating: its symbol scales
+        # the EXTENSIVE terms only -- the `m_dot = rho*A*w` face closures and the
+        # convective contact area -- leaving every intensive quantity (velocity,
+        # Re, friction, specific enthalpy, hydraulic diameter) unchanged.
+        self.count = count
         self.A_in = A_in
         self.A_out = A_out
         self.P_in = P_in
@@ -355,6 +368,7 @@ class TwoPortSegment(Model):
         self.add_component('mu_out', Variable(self._mu_std,   "Pa*s"))
         self.add_component('k_in',   Variable(self._k_std,    "W/m/K"))
         self.add_component('k_out',  Variable(self._k_std,    "W/m/K"))
+        self.add_component('count', Parameter(self.count, **spec['count'].param_kwargs()))
         self.add_component('A_in', Parameter(self.A_in, **spec['A_in'].param_kwargs()))
         self.add_component('A_out', Parameter(self.A_out, **spec['A_out'].param_kwargs()))
         self.add_component('P_in', Parameter(self.P_in, **spec['P_in'].param_kwargs()))
@@ -454,11 +468,19 @@ class TwoPortSegment(Model):
         if self.leaky:
             eq_continuity = eq_continuity + self['m_dot_leak'].symbol
 
+        # `count` parallel segments: the SAME per-segment velocity `w` flows
+        # through `count` times the single-segment area, so the EXTENSIVE mass
+        # flow scales by `count` while `w` (and hence Re, friction, Dh) stays
+        # the per-pipe intensive value.  Scaling the face closures here (rather
+        # than baking `count` into `A`) keeps `count` a live, re-tunable
+        # Parameter.
+        count = self['count'].symbol
+
         # m_dot <-> w closures as equations 
         # adds variables but these vars are used multiple times so it reduces
         # complexity of many expresions -> simulations speeds up.
-        eq_w_in = m_dot_in - rho_in * self['A_in'].symbol * w_in
-        eq_w_out = m_dot_out + rho_out * self['A_out'].symbol * w_out
+        eq_w_in = m_dot_in - count * rho_in * self['A_in'].symbol * w_in
+        eq_w_out = m_dot_out + count * rho_out * self['A_out'].symbol * w_out
 
         # Momentum conservation equation.
         # Hook allows to resuse this class to implement different components
@@ -471,7 +493,10 @@ class TwoPortSegment(Model):
             m_dot_avg=m_dot_avg, f_avg=f_avg, Dh_avg=Dh_avg,
         )
 
-        area_conv = P_avg * self['L'].symbol
+        # Total wall-contact area over the `count` parallel segments, so the
+        # radial heat `q` scales by `count` too -- keeping the SPECIFIC heat
+        # `q_specific = q / m_dot` (and the energy balance) intensive.
+        area_conv = count * P_avg * self['L'].symbol
 
         #TODO: comment this section.
         q = self.q_inflow_func(
@@ -558,11 +583,14 @@ class StraightPipe(Model):
 
     A pipe may be heated, leaky, both, or neither.
 
-    `count=N` simulates `N` identical pipes in parallel as one component: the
-    flow area and wetted perimeter scale by `N` (keeping the hydraulic diameter,
-    so velocity / Reynolds number / friction / per-pipe pressure drop are
-    unchanged), while the total mass flow, wall heat, and permeation scale by
-    `N`.  Wire walls / boundaries with the matching `count` (see `Pipe`).
+    `count=N` simulates `N` identical pipes in parallel as one component: every
+    segment scales its extensive flow / heat / leak by the shared `count`
+    Parameter (keeping the hydraulic diameter, so velocity / Reynolds number /
+    friction / per-pipe pressure drop are unchanged), while the total mass flow,
+    wall heat, and permeation scale by `N`.  `count` is a LIVE Parameter -- it
+    can be retuned (`set_param`) without re-instantiating -- and may be a plain
+    scalar or a parent-owned Parameter shared with the matching walls /
+    boundaries (see `Pipe`).
     """
 
     def __init__(
@@ -576,7 +604,8 @@ class StraightPipe(Model):
         z_in: Annotated[float, _SPEC_Z_IN],
         z_out: Annotated[float, _SPEC_Z_OUT],
         n_segments: Annotated[int, ParamSpec("Number of equal-length finite-"
-                             "volume segments (>= 1).", unit="1")] = 3,
+                             "volume segments (>= 1).", unit="1",
+                             structural=True)] = 3,
         heat_port: Annotated[bool, ParamSpec("If true, each segment exposes a "
                             "thermal `wall` port for conjugate heat transfer.",
                             structural=True)] = False,
@@ -586,13 +615,14 @@ class StraightPipe(Model):
         multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
         leaky: Annotated[bool, ParamSpec("If true, each segment exposes a "
                         "permeation `leak` port.", structural=True)] = False,
-        count: Annotated[int, ParamSpec("Number of identical parallel pipes "
+        count: Annotated[float, ParamSpec("Number of identical parallel pipes "
                         "this one component represents (multiplicity >= 1); "
                         "scales the flow area and wetted perimeter by N so the "
                         "hydraulic diameter, velocity, friction and per-pipe "
                         "pressure drop are unchanged while the total mass flow / "
                         "heat / leak scale by N -- N pipes for one pipe's "
-                        "equations.", unit="1", default=1)] = 1,
+                        "equations.  A live Parameter: retunable without a "
+                        "rebuild.", unit="1", default=1.0)] = 1.0,
     ):
         self.medium = medium
         if multiphase not in TwoPortSegment._MULTIPHASE_MODES:
@@ -601,9 +631,13 @@ class StraightPipe(Model):
                 f"got {multiphase!r}")
         if n_segments < 1:
             raise ValueError(f"n_segments must be >= 1, got {n_segments!r}")
-        if int(count) != count or count < 1:
+        # `count` may be a plain scalar or a parent-owned `Parameter` (the `Pipe`
+        # assembly shares ONE `count` symbol across the pipe, its walls and its
+        # boundaries); validate against the underlying numeric value.
+        count_num = getattr(count, 'value', count)
+        if not (count_num >= 1):
             raise ValueError(
-                f"StraightPipe: count must be an integer >= 1, got {count!r}")
+                f"StraightPipe: count must be >= 1, got {count!r}")
         # Forwarded verbatim to every segment so the whole pipe shares one
         # thermodynamic-property mode (see `TwoPortSegment.multiphase`).
         self.multiphase = multiphase
@@ -649,11 +683,13 @@ class StraightPipe(Model):
         # `heat_port` -- a pipe may be heated, leaky, both, or neither.
         self.leaky = bool(leaky)
         # Multiplicity: this one pipe stands in for `count` identical parallel
-        # pipes.  Realised by scaling the flow area `A` and wetted perimeter `P`
-        # by `count` in `declare_components` (keeps Dh = 4A/P = D), so velocity,
-        # Reynolds number, friction factor and per-pipe pressure drop are
-        # unchanged while m_dot / heat / leak scale by `count`.
-        self.count = int(count)
+        # pipes.  `count` is a live `Parameter` (own, or shared from the `Pipe`
+        # assembly): it is passed down to every `TwoPortSegment`, whose face
+        # closures scale the extensive `m_dot` / heat / leak by it while keeping
+        # `Dh = 4A/P = D`, velocity, Re, friction and per-pipe pressure drop
+        # unchanged.  Because it is a Parameter (not baked into `A`/`P`), the
+        # multiplicity can be retuned without re-instantiating the model.
+        self.count = count
         super().__init__()
 
     def get_churchill_f_factor(self, Re, epsilon, D):
@@ -726,13 +762,18 @@ class StraightPipe(Model):
         # leaves: the per-segment friction / momentum / energy expression
         # trees stay shallow, and the equation-dedup signature comparison
         # is a single-symbol hash rather than a full subtree walk.
-        # `count` parallel pipes -> scale the flow area and wetted perimeter by
-        # N.  Dh = 4A/P = D is unchanged, so every intensive flow quantity is
-        # the same as a single pipe and only the extensive m_dot / heat / leak
-        # scale by N.
-        A_value = self.count * np.pi * self.D ** 2 / 4
-        P_value = self.count * np.pi * self.D
+        # SINGLE-pipe flow area and wetted perimeter.  The `count` multiplicity
+        # is NOT folded in here (that would bake it into a constant `Parameter`
+        # leaf and force a rebuild to change it); instead each segment scales
+        # its extensive terms by the shared `count` Parameter below.  Keeping
+        # `A`/`P` per-pipe leaves `Dh = 4A/P = D` and every intensive quantity
+        # identical to a single pipe.
+        A_value = np.pi * self.D ** 2 / 4
+        P_value = np.pi * self.D
         L_segment_value = self.L / self.n_segments
+        # Multiplicity shared by every segment (own fresh Parameter, or an alias
+        # into the parent assembly's `count` when one was passed down).
+        self.add_component('count', Parameter(self.count, **spec['count'].param_kwargs()))
         self.add_component('A', Parameter(A_value, "m^2"))
         self.add_component('P', Parameter(P_value, "m"))
         self.add_component('L_segment', Parameter(L_segment_value, "m"))
@@ -797,6 +838,7 @@ class StraightPipe(Model):
                     multiphase=self.multiphase,
                     heat_port=self.heat_port,
                     leaky=self.leaky,
+                    count=self['count'],
                 ),
             )
 
@@ -1465,6 +1507,7 @@ class PressureVessel(Model):
                             "pressure as partial pressure and feeds the mass / "
                             "energy balance); 0 = none.", unit="1",
                             structural=True)] = 0,
+        count: Annotated[float, _SPEC_COUNT] = 1.0,
     ):
         if int(heat_ports) < 0 or int(leak_ports) < 0:
             raise ValueError(
@@ -1478,17 +1521,27 @@ class PressureVessel(Model):
         self.leaky = bool(leaky)
         self.heat_ports = int(heat_ports)
         self.leak_ports = int(leak_ports)
+        # Multiplicity: this one vessel stands in for `count` identical parallel
+        # vessels.  A live `Parameter` (own, or shared from the `Tank` assembly)
+        # that scales the stored control volume `V` -- and hence the extensive
+        # mass / energy -- by N, leaving the intensive (p, h, T) states
+        # unchanged.  Retunable without re-instantiating.
+        self.count = count
         # Pre-compute thermodynamically consistent initial conditions so the t=0 Newton
-        # solve starts near a converged state.
+        # solve starts near a converged state.  Seed the extensive states (m, U)
+        # at the N-vessel scale so the Newton start is consistent with `V_total`.
+        count_num = getattr(count, 'value', count)
+        V_total = count_num * V
         self.h_init = float(medium.eval_h_pT(p_init, T_init))
         self.rho_init = float(medium.eval_rho_ph(p_init, self.h_init))
-        self.m_init = self.rho_init * V
-        self.U_init = self.m_init * self.h_init - p_init * V  # U = m*u = m*h - p*V
+        self.m_init = self.rho_init * V_total
+        self.U_init = self.m_init * self.h_init - p_init * V_total  # U = m*u = m*h - p*V
         super().__init__()
 
     def declare_components(self):
         spec = merged_param_specs(type(self))
         self.add_component('V', Parameter(self.V, **spec['V'].param_kwargs()))
+        self.add_component('count', Parameter(self.count, **spec['count'].param_kwargs()))
         self.add_component('A_in', Parameter(self.A_in, **spec['A_in'].param_kwargs()))
 
         # Differential states (auto-attaches `der_m`, `der_U` companions).
@@ -1547,7 +1600,10 @@ class PressureVessel(Model):
         U = self['U'].symbol
         p = self['p'].symbol
         h = self['h'].symbol
-        V = self['V'].symbol
+        # `count` parallel vessels share the same intensive (p, h) state but
+        # store `count` times the volume, so the EXTENSIVE control volume that
+        # closes (m, U) <-> (p, h) is `count * V`.
+        V = self['count'].symbol * self['V'].symbol
         p_in = self['p_in'].symbol
         h_in = self['h_in'].symbol
 

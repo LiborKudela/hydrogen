@@ -71,19 +71,25 @@ class ConjugatePipe(Pipe):
                          "conductivity.", unit="W/(m*K)", default=15.0)],
         T_wall_init=293.15,
         outer: Annotated[str, ParamSpec("Outer-surface thermal termination.",
-                        choices=("adiabatic", "convective", "expose"))]
-               = "adiabatic",
+                        choices=("adiabatic", "convective", "expose"),
+                        structural=True)] = "adiabatic",
         h_ext=10.0,
         T_ext=293.15,
         wall_dynamic: Annotated[bool, ParamSpec("If true the wall carries "
                                "thermal mass (heat-up transient); if false it "
-                               "conducts quasi-statically.")] = True,
+                               "conducts quasi-statically.", structural=True)]
+                      = True,
     ):
         if wall_thickness <= 0:
             raise ValueError(
                 f"ConjugatePipe: wall_thickness must be > 0; got {wall_thickness}"
             )
         material = WallMaterial(name="conjugate wall", rho=rho_wall, cp=cp_wall, k=k_wall)
+        # Kept as attributes (not just forwarded) so the structural cache key
+        # can read them back -- `collect_equations` resolves every structural /
+        # literal flag via ``getattr(self, name)``.
+        self.outer = outer
+        self.wall_dynamic = wall_dynamic
         super().__init__(
             medium, D, L, epsilon, z_in, z_out, n_segments,
             layers=[WallLayer(material, wall_thickness, dynamic=wall_dynamic)],

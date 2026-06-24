@@ -5,3 +5,4 @@ local_results/
 hydrogen.egg-info/
 site/
 .venv/*
+venv/*

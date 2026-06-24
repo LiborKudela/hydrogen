@@ -618,6 +618,43 @@ class Model:
                 return True
         return False
 
+    def differential_variables(self, _prefix=""):
+        """Dotted names of every `DifferentialVariable` in this model's subtree.
+
+        A model with NONE is *quasi-static* -- its state is purely algebraic,
+        so it has no time-integrated memory; a model with one or more is
+        *dynamic* -- it carries state that evolves in time (a thermal mass, a
+        stored gas inventory, a diffusion front, ...).
+
+        Walks the constructed component tree, so it works on any built instance
+        WITHOUT a full `instantiate()` (handy for UI categorisation).  Each
+        differential state is reported once: a `DifferentialVariable` named
+        ``x`` adds an algebraic ``der_x`` companion, which is a plain
+        `Variable` and so is not double-counted.
+        """
+        found = []
+        for name, c in self.components.items():
+            path = f"{_prefix}.{name}" if _prefix else name
+            if isinstance(c, DifferentialVariable):
+                found.append(path)
+            elif isinstance(c, Model) and c.is_composite():
+                found.extend(c.differential_variables(_prefix=path))
+        return found
+
+    def is_dynamic(self):
+        """``True`` if this model carries any `DifferentialVariable` (dynamic);
+        ``False`` if it is purely algebraic (quasi-static).
+
+        Short-circuits on the first differential state found; see
+        `differential_variables` for the full list.
+        """
+        for c in self.components.values():
+            if isinstance(c, DifferentialVariable):
+                return True
+            if isinstance(c, Model) and c.is_composite() and c.is_dynamic():
+                return True
+        return False
+
     def _iter_ports(self):
         """Yield every `Port` registered anywhere in this Model's subtree."""
         for p in getattr(self, "ports", {}).values():
@@ -1992,10 +2029,15 @@ class Model:
 
         print("Instantiating model")
 
+        _t_instantiate_start = time.time()
+        # Ordered (phase_name, seconds) records, rendered as a timing table at
+        # the end of instantiation.
+        _timings = []
         start_time = time.time()
         _t0 = time.time()
         vars, prev_vars, params, vars_map, params_map = self.assign_symbols(top_level=True)
         _t_assign = time.time() - _t0
+        _timings.append(("assign_symbols", _t_assign, []))
         _t0 = time.time()
         # `collect_equations` consults `_eq_cache_var` (set by `instantiate`)
         # so that only the first 1-2 instances of each `Model` subclass build
@@ -2004,6 +2046,7 @@ class Model:
         # per eq.
         self.all_raw_equations = self.collect_equations()
         _t_collect = time.time() - _t0
+        _timings.append(("collect_equations", _t_collect, []))
         # Connections are now resolved (`connect()` ran inside the
         # `declare_equations` walk above), so port wiring state is final:
         # warn about any port that asked to be connected but wasn't.
@@ -2138,20 +2181,25 @@ class Model:
             if deferred_eqs:
                 self.improved_equations = list(self.improved_equations) + deferred_eqs
             n_signed = sum(1 for _, _, s in connections if s == -1)
+            _t_uf = time.time() - uf_start
             print(f"add_connection short-circuited {len(connection_subs)} symbols "
                   f"from {len(connections)} pairs "
                   f"({n_signed} sign-flipped, {len(deferred_eqs)} deferred) "
-                  f"in {time.time() - uf_start:.2f} s")
+                  f"in {_t_uf:.2f} s")
+            _timings.append(("add_connection short-circuit", _t_uf, []))
 
         if max_remove_trival_passes > 0:
             print("Removing trivial equations")
             curent_size = len(self.improved_vars)
             print(f"Original variables: {curent_size}")
             start_time = time.time()
+            _trivial_pass_times = []
 
             for i in range(max_remove_trival_passes):
                 print(f"Removing trivial pass {i+1}")
+                _t_pass = time.time()
                 self.improved_equations, self.all_improved_symbols, pass_subs = self.remove_trivial_equations(self.improved_equations, self.all_improved_symbols)
+                _trivial_pass_times.append(time.time() - _t_pass)
                 # Accumulate substitutions across passes ONLY when this pass produced
                 # new substitutions: the inner xreplace below would otherwise be 1k+
                 # no-op `xreplace({})` calls (each one allocates / boxes / returns).
@@ -2196,6 +2244,7 @@ class Model:
             self.improved_vars = [s for s in self.raw_var_symbols if s in improved_symbols_set]
             stop_time = time.time()
             print(f"Removed equations and variables: {len(self.raw_var_symbols) - len(self.improved_vars)} in {stop_time - start_time} s")
+            _timings.append(("remove trivial equations", stop_time - start_time, _trivial_pass_times))
 
         # Duplicate-equation reduction.  Runs AFTER trivial reduction so the
         # equation list is in its most-reduced form (which only helps when
@@ -2217,13 +2266,16 @@ class Model:
             dup_start = time.time()
             before_n = len(self.improved_equations)
             total_subs = 0
+            _dup_pass_times = []
             for pass_idx in range(max_remove_duplicate_passes):
                 print(f"Duplicate-equation pass {pass_idx + 1}")
                 pass_before_n = len(self.improved_equations)
+                _t_pass = time.time()
                 self.improved_equations, self.all_improved_symbols, dup_subs = (
                     self.remove_duplicate_equations(
                         self.improved_equations, self.all_improved_symbols)
                 )
+                _dup_pass_times.append(time.time() - _t_pass)
                 if not dup_subs:
                     break
                 # Stitch the new substitutions into the running improve_subs
@@ -2237,11 +2289,13 @@ class Model:
             improved_symbols_set = set(self.all_improved_symbols)
             self.improved_vars = [s for s in self.raw_var_symbols if s in improved_symbols_set]
             after_n = len(self.improved_equations)
+            _t_dup = time.time() - dup_start
             print(
                 f"Duplicate-equation reduction: {before_n - after_n} equation(s) / "
                 f"{total_subs} substitution(s) over {pass_idx + 1} pass(es) in "
-                f"{time.time() - dup_start:.2f} s"
+                f"{_t_dup:.2f} s"
             )
+            _timings.append(("remove duplicate equations", _t_dup, _dup_pass_times))
 
         # Multi-variable linear-block elimination.  Extends the trivial
         # reducer (2-var) to any-N-var linear equations: mass balances at
@@ -2255,13 +2309,16 @@ class Model:
             lb_start = time.time()
             before_n = len(self.improved_equations)
             total_lb_subs = 0
+            _lb_pass_times = []
             for pass_idx in range(max_remove_linear_block_passes):
                 print(f"Linear-block pass {pass_idx + 1}")
                 pass_before_n = len(self.improved_equations)
+                _t_pass = time.time()
                 self.improved_equations, self.all_improved_symbols, lb_subs = (
                     self.remove_linear_block_equations(
                         self.improved_equations, self.all_improved_symbols)
                 )
+                _lb_pass_times.append(time.time() - _t_pass)
                 if not lb_subs:
                     break
                 for prev_key in list(self.improve_subs.keys()):
@@ -2274,11 +2331,13 @@ class Model:
             self.improved_vars = [s for s in self.raw_var_symbols
                                   if s in improved_symbols_set]
             after_n = len(self.improved_equations)
+            _t_lb = time.time() - lb_start
             print(
                 f"Linear-block reduction: {before_n - after_n} equation(s) / "
                 f"{total_lb_subs} substitution(s) over {pass_idx + 1} pass(es) "
-                f"in {time.time() - lb_start:.2f} s"
+                f"in {_t_lb:.2f} s"
             )
+            _timings.append(("remove linear-block equations", _t_lb, _lb_pass_times))
 
         self.n_v = len(self.improved_vars)
         self.n_p = len(self.raw_param_symbols)
@@ -2616,6 +2675,7 @@ class Model:
               f"({n_templates} templates, {self._n_instances} instances, "
               f"{self._jac_nnz} nonzeros, "
               f"{100.0 * self._jac_nnz / max(1, self.n_v * n_eq):.2f}% dense)")
+        _timings.append(("per-template lambdify", elapsed, []))
 
         # ---- BLT decomposition + block-wise solve plan (Pass: BLT) ---------
         # Splits the post-dedup Jacobian into strongly-connected blocks and
@@ -2642,16 +2702,20 @@ class Model:
                 n_large = int((bn > 32).sum())
                 largest = int(bn.max())
                 mode = self._blt_plan['solve_mode']
+                _t_blt = time.time() - t_blt
                 print(
                     f"BLT decomposition: {n_blocks} block(s) over {self.n_v} "
                     f"variables (1x1: {n_scalar}, 2..32: {n_small}, >32: "
                     f"{n_large}; largest block {largest}; solve_mode={mode}) "
-                    f"in {time.time() - t_blt:.2f} s"
+                    f"in {_t_blt:.2f} s"
                 )
+                _timings.append(("BLT decomposition", _t_blt, []))
                 if largest > 1:
                     t_tear = time.time()
                     self._compute_tearing()
-                    print(f"  tearing analysis in {time.time() - t_tear:.2f} s")
+                    _t_tear = time.time() - t_tear
+                    print(f"  tearing analysis in {_t_tear:.2f} s")
+                    _timings.append(("tearing analysis", _t_tear, []))
             else:
                 print("BLT skipped: no perfect matching (structurally singular)")
         elif enable_blt:
@@ -2931,6 +2995,34 @@ class Model:
                     self._input_refs.append((inp, i_cur, i_prev))
 
         gc.collect()
+
+        _t_total = time.time() - _t_instantiate_start
+        _measured = sum(s for _, s, _ in _timings)
+        _timings.append(("other", max(_t_total - _measured, 0.0), []))
+
+        def _pct(secs):
+            return 100.0 * secs / _t_total if _t_total > 0 else 0.0
+
+        # Build display rows first so the name column can be sized to fit the
+        # indented per-pass sub-rows too.
+        _rows = []  # (label, seconds, pct)
+        for name, secs, runs in _timings:
+            _rows.append((name, secs, _pct(secs)))
+            if len(runs) > 1:
+                for _i, _rt in enumerate(runs):
+                    _rows.append((f"  pass {_i + 1}", _rt, _pct(_rt)))
+
+        _name_w = max([len(lbl) for lbl, _, _ in _rows] + [len("Total")])
+        _sep = "+" + "-" * (_name_w + 2) + "+----------+--------+"
+        print("\nInstantiation timing breakdown")
+        print(_sep)
+        print(f"| {'Phase'.ljust(_name_w)} | {'Time [s]':>8} | {'%':>5}  |")
+        print(_sep)
+        for lbl, secs, pct in _rows:
+            print(f"| {lbl.ljust(_name_w)} | {secs:8.2f} | {pct:5.1f}  |")
+        print(_sep)
+        print(f"| {'Total'.ljust(_name_w)} | {_t_total:8.2f} | {100.0:5.1f}  |")
+        print(_sep)
 
     def _lambdify_with_cache(self, label, args, expr, modules, cse):
         """Disk-cached `lambdify_compat`.

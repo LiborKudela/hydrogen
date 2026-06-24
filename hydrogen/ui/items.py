@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from hydrogen.components.icons import icon_path
 
-from .introspect import introspect_ports
+from .introspect import introspect, introspect_ports
 from .qt import QtCore, QtGui, QtSvg, QtWidgets
 from .style import domain_color, kind_color, port_on_right
 
@@ -328,6 +328,10 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._label_drag_start_scene: QtCore.QPointF | None = None
         self._label_drag_start_offset: QtCore.QPointF | None = None
         self.port_items: list[PortItem] = []
+        # Quasi-static vs dynamic categorisation (recomputed whenever the params
+        # change): a component carrying any DifferentialVariable is *dynamic*.
+        self._is_dynamic: bool = False
+        self._diff_vars: list[str] = []
         # Custom port placements: pname -> (x, y, side); empty = use defaults.
         self._port_layout: dict[str, tuple] = {}
         # Visual transform state (applied around the node's centre).
@@ -402,10 +406,16 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
                 conn.remove()
             if scene is not None:
                 scene.removeItem(pi)      # takes its label child with it
+            else:
+                pi.setParentItem(None)    # not in a scene yet -> detach from node
         self.port_items = []
 
         if specs is None:
-            specs = introspect_ports(self.type_name, self.medium, self.params)
+            # One build gives both the ports and the dynamic/quasi-static
+            # categorisation, so node creation / load / param edits don't pay
+            # for two introspection builds.
+            _ok, specs, is_dyn, diffs = introspect(self.type_name, self.medium, self.params)
+            self._set_dynamics(is_dyn, diffs)
         left = [s for s in specs if not port_on_right(s[0])]
         right = [s for s in specs if port_on_right(s[0])]
 
@@ -530,13 +540,50 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
 
     def sync_ports(self) -> bool:
         """Re-derive ports after a parameter edit; rebuild only if the port set
-        actually changed (so ordinary edits keep existing wires)."""
+        actually changed (so ordinary edits keep existing wires).  The
+        dynamic/quasi-static badge is refreshed either way -- a param can flip
+        a component dynamic (e.g. a wall's `dynamic` toggle) without changing
+        its ports."""
         self.refresh_param_labels()
-        new = introspect_ports(self.type_name, self.medium, self.params)
+        ok, new, is_dyn, diffs = introspect(self.type_name, self.medium, self.params)
+        if not ok:
+            # The new params yield a component the model refuses to build (e.g. a
+            # Pipe stripped of every wall layer).  Keep the existing ports + wires
+            # and the previous dynamic badge rather than wiping them -- the edit
+            # is simply not valid yet.
+            return False
+        self._set_dynamics(is_dyn, diffs)
         if {(p.pname, p.kind) for p in self.port_items} == set(new):
             return False
         self.rebuild_ports(new)
         return True
+
+    # --- dynamic / quasi-static categorisation ----------------------------- #
+    @property
+    def is_dynamic(self) -> bool:
+        """Whether this component carries any differential state."""
+        return self._is_dynamic
+
+    def _set_dynamics(self, is_dynamic: bool, diff_vars: list[str]):
+        """Record the dynamic categorisation, refresh the tooltip and repaint
+        the badge."""
+        self._is_dynamic = bool(is_dynamic)
+        self._diff_vars = list(diff_vars)
+        self._update_dynamic_tooltip()
+        self.update()
+
+    def _update_dynamic_tooltip(self):
+        base = f"{self.entry['type']}\n\n{self.entry.get('summary', '')}".rstrip()
+        if self._is_dynamic:
+            n = len(self._diff_vars)
+            shown = self._diff_vars[:12]
+            lines = "\n".join(f"  \u2022 {d}" for d in shown)
+            more = "" if n <= len(shown) else f"\n  \u2026 (+{n - len(shown)} more)"
+            base += (f"\n\n\u25cf Dynamic \u2014 {n} differential "
+                     f"state{'s' if n != 1 else ''}:\n{lines}{more}")
+        else:
+            base += "\n\n\u25cb Quasi-static (no differential states)"
+        self.setToolTip(base)
 
     def set_name_visible(self, visible: bool):
         self._name_visible = visible
@@ -1004,6 +1051,21 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         return QtCore.QRectF(into.left() + (into.width() - fw) / 2,
                              into.top() + (into.height() - fh) / 2, fw, fh)
 
+    def _draw_dynamic_badge(self, painter, rect):
+        """A tiny teal dot in the top-right corner marking a *dynamic*
+        component (one carrying differential state); quasi-static nodes get no
+        mark.  A bare dot is orientation-agnostic, so it reads correctly even
+        on rotated/mirrored nodes.  Hover the node for the state list."""
+        if not self._is_dynamic:
+            return
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        center = QtCore.QPointF(rect.right() - 11.0, rect.top() + 11.0)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 1.4))
+        painter.setBrush(QtGui.QColor("#0a9396"))
+        painter.drawEllipse(center, 4.5, 4.5)
+        painter.restore()
+
     def _draw_resize_handles(self, painter):
         if self._hover_corner is None and self._resize_corner is None:
             return
@@ -1045,6 +1107,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
                 if body is not None:
                     self._icon.render(painter, body)
                     self._draw_pressure_source_control_guide(painter, body)
+                self._draw_dynamic_badge(painter, rect)
                 self._draw_resize_handles(painter)
                 return
 
@@ -1061,12 +1124,14 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             body = self._visual_icon_rect(self._icon.defaultSize())
             if body is not None:
                 self._icon.render(painter, body)
+            self._draw_dynamic_badge(painter, rect)
             self._draw_resize_handles(painter)
             return
 
         painter.setPen(QtGui.QPen(color, w))
         painter.setBrush(self._fill.lighter(106) if self._hovered else self._fill)
         painter.drawRoundedRect(rect, 9, 9)
+        self._draw_dynamic_badge(painter, rect)
         self._draw_resize_handles(painter)
 
 

@@ -160,16 +160,23 @@ class ConvectiveBoundary(Model):
                     default=1.0)],
         T_inf: Annotated[float, ParamSpec("Far-field fluid temperature.",
                         unit="K")] = 293.15,
+        count: Annotated[float, ParamSpec("Number of identical parallel "
+                        "surfaces this boundary represents (multiplicity >= 1); "
+                        "scales the exchange area, hence the heat, by N.  A live "
+                        "Parameter (not structural).", unit="1",
+                        default=1.0)] = 1.0,
     ):
         self.h = h
         self.A = A
         self.T_inf = T_inf
+        self.count = count
         super().__init__()
 
     def declare_components(self):
         spec = merged_param_specs(type(self))
         self.add_component('h', Parameter(self.h, **spec['h'].param_kwargs()))
         self.add_component('A', Parameter(self.A, **spec['A'].param_kwargs()))
+        self.add_component('count', Parameter(self.count, **spec['count'].param_kwargs()))
         self.add_component('T_inf', Parameter(self.T_inf, **spec['T_inf'].param_kwargs()))
         self.add_component('T_port', Variable(self.T_inf, "K"))
         self.add_component('Q_dot_port', Variable(0.0, "W"))
@@ -182,12 +189,14 @@ class ConvectiveBoundary(Model):
     def declare_equations(self):
         h = self['h'].symbol
         A = self['A'].symbol
+        count = self['count'].symbol
         T_inf = self['T_inf'].symbol
         T_port = self['T_port'].symbol
         Q_dot_port = self['Q_dot_port'].symbol
-        # Q delivered to the partner = h*A*(T_inf - T_port); the boundary's
-        # own "into me" Q_dot is the negation of that.
-        return [Q_dot_port - h * A * (T_port - T_inf)]
+        # Q delivered to the partner = h*(count*A)*(T_inf - T_port); the
+        # boundary's own "into me" Q_dot is the negation of that.  `count`
+        # scales the area so N parallel surfaces exchange N times the heat.
+        return [Q_dot_port - h * count * A * (T_port - T_inf)]
 
 
 # ---------------------------------------------------------------------------
@@ -224,14 +233,20 @@ class ThermalConductor(Model):
                     "for a contact resistance).", unit="W/K", default=1.0)],
         T_init: Annotated[float, ParamSpec("Initial face-temperature guess.",
                          unit="K")] = 293.15,
+        count: Annotated[float, ParamSpec("Number of identical parallel "
+                        "conductors this one represents (multiplicity >= 1); "
+                        "scales the conductance by N.  A live Parameter (not "
+                        "structural).", unit="1", default=1.0)] = 1.0,
     ):
         self.G = G
         self.T_init = T_init
+        self.count = count
         super().__init__()
 
     def declare_components(self):
-        self.add_component('G', Parameter(self.G,
-                                          **merged_param_specs(type(self))['G'].param_kwargs()))
+        spec = merged_param_specs(type(self))
+        self.add_component('G', Parameter(self.G, **spec['G'].param_kwargs()))
+        self.add_component('count', Parameter(self.count, **spec['count'].param_kwargs()))
         self.add_component('T_a', Variable(self.T_init, "K"))
         self.add_component('T_b', Variable(self.T_init, "K"))
         self.add_component('Q_dot_a', Variable(0.0, "W"))
@@ -249,11 +264,13 @@ class ThermalConductor(Model):
 
     def declare_equations(self):
         G = self['G'].symbol
+        count = self['count'].symbol
         T_a = self['T_a'].symbol
         T_b = self['T_b'].symbol
         Q_dot_a = self['Q_dot_a'].symbol
         Q_dot_b = self['Q_dot_b'].symbol
-        eq_law = Q_dot_a - G * (T_a - T_b)
+        # `count` parallel conductors -> total conductance is N*G.
+        eq_law = Q_dot_a - count * G * (T_a - T_b)
         eq_balance = Q_dot_a + Q_dot_b
         return [eq_law, eq_balance]
 
@@ -707,7 +724,7 @@ class CylindricalWall(TwoNodeWall):
                 f"CylindricalWall requires 0 < angle_fraction <= 1; got "
                 f"angle_fraction={angle_fraction}"
             )
-        if not (count >= 1):
+        if not (getattr(count, 'value', count) >= 1):
             raise ValueError(
                 f"CylindricalWall requires count >= 1; got count={count}")
         self.rho = rho
@@ -854,7 +871,7 @@ class SphericalWall(TwoNodeWall):
                 f"SphericalWall requires 0 < angle_fraction <= 1; got "
                 f"angle_fraction={angle_fraction}"
             )
-        if not (count >= 1):
+        if not (getattr(count, 'value', count) >= 1):
             raise ValueError(
                 f"SphericalWall requires count >= 1; got count={count}")
         self.rho = rho

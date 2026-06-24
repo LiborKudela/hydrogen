@@ -894,6 +894,25 @@ class HostService:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
 
+    def terminate(self, timeout=5.0):
+        """Force-kill the host process immediately, without a graceful round-trip.
+
+        Used to *abort* an in-flight, non-interruptible call (e.g. a long
+        ``instantiate``): the host handles one command at a time, so it can't
+        read a ``shutdown``/``stop`` while it is busy compiling.  Closing the
+        socket wakes any blocked client call (it returns a connection error),
+        and killing the process stops the compute.
+        """
+        self._conn.close()        # wakes blocked call()s with a connection error
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+        try:
+            self._proc.wait(timeout=timeout)
+        except Exception:
+            pass
+
     def __enter__(self):
         return self
 

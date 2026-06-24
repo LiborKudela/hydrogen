@@ -31,7 +31,7 @@ from typing import Annotated
 import numpy as np
 
 from ...medium import CoolPropMedium
-from ...model import Model
+from ...model import Model, Parameter
 from ...paramspec import ParamSpec
 from ..materials import WallMaterial
 from .flow import PressureVessel, StraightPipe
@@ -206,14 +206,20 @@ class Pipe(Model):
         z_out: Annotated[float, ParamSpec("Elevation of the outlet.",
                         unit="m", default=0.0)],
         n_segments: Annotated[int, ParamSpec("Number of axial finite-volume "
-                             "segments.", unit="1", default=1)],
+                             "segments.", unit="1", default=1,
+                             structural=True)],
         layers: Annotated[list[WallLayer], ParamSpec("Radial wall stack, "
-                         "innermost first; inner radius of layer 0 is D/2.")],
+                         "innermost first; inner radius of layer 0 is D/2.  "
+                         "Empty (no layers) = a bare pipe: the chosen "
+                         "`outer_thermal` boundary acts directly on the fluid "
+                         "surface and permeation is disabled.")],
         multiphase: Annotated[str, ParamSpec("Thermodynamic-property mode of "
-                             "the flow.", choices=("single", "HEM"))] = "single",
+                             "the flow.", choices=("single", "HEM"),
+                             structural=True)] = "single",
         outer_thermal: Annotated[str, ParamSpec("Thermal termination of the "
                                 "outermost wall surface.",
-                                choices=_OUTER_THERMAL_MODES)] = "adiabatic",
+                                choices=_OUTER_THERMAL_MODES,
+                                structural=True)] = "adiabatic",
         h_ext: Annotated[float, ParamSpec("External convection coefficient.",
                         unit="W/(m^2*K)",
                         relevant_when={"outer_thermal": "convective"})] = 10.0,
@@ -248,8 +254,10 @@ class Pipe(Model):
             raise ValueError(
                 f"Pipe: count must be an integer >= 1; got {count!r}")
         layers = list(layers)
-        if not layers:
-            raise ValueError("Pipe: `layers` must contain at least one WallLayer.")
+        # `layers == []` is a *bare* pipe: no wall stack at all.  The segment's
+        # internal convective film still carries heat, the chosen `outer_thermal`
+        # boundary is applied directly to the fluid surface, and permeation is
+        # implicitly disabled (there is no layer that could be permeable).
         for k, layer in enumerate(layers):
             if layer.thickness <= 0:
                 raise ValueError(
@@ -295,8 +303,15 @@ class Pipe(Model):
         # pipe with every EXTENSIVE quantity scaled by N: the flow area / wetted
         # perimeter (via StraightPipe's `count`), the per-segment wall mass /
         # conductance / permeation (via the walls' `count`), and the outer
-        # convective area.  Intensive states (p, h, T, velocity) are N-invariant.
-        N = self.count
+        # convective area (via the boundary's `count`).  Intensive states
+        # (p, h, T, velocity) are N-invariant.
+        #
+        # ONE shared `count` Parameter is owned here and aliased into every
+        # sub-component, so the multiplicity is a single live knob: `set_param`
+        # on `count` retunes all of them at once with NO re-instantiation.
+        self.add_component('count', Parameter(float(self.count), unit="1",
+                           description="Number of identical parallel pipes."))
+        N = self['count']
 
         self.add_component('pipe', StraightPipe(
             self.medium, D=self.D, L=self.L, epsilon=self.epsilon,
@@ -306,7 +321,22 @@ class Pipe(Model):
 
         K = len(self.layers)
         r = self.radii
-        A_outer = N * 2.0 * np.pi * r[K] * self.L_segment
+        # Per-pipe outer area; the `count` multiplicity is applied inside the
+        # convective boundary (shared Parameter), not baked in here.  For a bare
+        # pipe (K == 0) r[K] == r[0] == D/2, so this is the bore surface area --
+        # the boundary acts straight on the fluid's inner wall.
+        A_outer = 2.0 * np.pi * r[K] * self.L_segment
+
+        def _surface(i):
+            """(T, Q_dot) variables of the outermost solid surface for segment
+            `i`: the last layer's outer face, or -- for a bare pipe -- the fluid
+            segment's own inner-wall node."""
+            if K > 0:
+                w = self[f'wall_{i}_{K - 1}']
+                return w['T_b'], w['Q_dot_b']
+            seg = self['pipe'][f'pipe_segment_{i}']
+            return seg['T_wall'], seg['q_inflow']
+
         for i in range(self.n_segments):
             for k, layer in enumerate(self.layers):
                 self.add_component(f'wall_{i}_{k}', CylindricalWall(
@@ -318,18 +348,25 @@ class Pipe(Model):
                     permeation_flux=layer.permeation,
                     p_in_init=self.p_init, p_out_init=self.p_ext))
 
-            # Outer-surface thermal termination on the outermost layer.
+            # Outer-surface thermal termination (on the outermost layer, or
+            # directly on the fluid segment when there are no layers).
             if self.outer_thermal == 'adiabatic':
                 self.add_component(f'outer_{i}', FixedHeatFlow(0.0, T_init=self.T_wall_init))
             elif self.outer_thermal == 'convective':
-                self.add_component(f'outer_{i}', ConvectiveBoundary(self.h_ext, A_outer, T_inf=self.T_ext))
+                self.add_component(f'outer_{i}', ConvectiveBoundary(self.h_ext, A_outer, T_inf=self.T_ext, count=N))
             elif self.outer_thermal == 'fixed':
                 self.add_component(f'outer_{i}', FixedTemperature(T_set=self.T_outer))
             else:  # 'expose'
+                if K == 0:
+                    # The exposed port aliases the segment's own (T_wall,
+                    # q_inflow); the caller closes them by wiring `wall_outer_{i}`
+                    # to a boundary, so the segment's require_connection warning
+                    # would be misleading -- silence it.
+                    self['pipe'][f'pipe_segment_{i}'].ports['wall'].require_connection = False
+                T_s, Q_s = _surface(i)
                 self.add_port(f'wall_outer_{i}', ThermalPort_TQ(
                     self,
-                    channels={'T': self[f'wall_{i}_{K - 1}']['T_b'],
-                              'Q_dot': self[f'wall_{i}_{K - 1}']['Q_dot_b']},
+                    channels={'T': T_s, 'Q_dot': Q_s},
                     flow_orientation='in',
                 ))
 
@@ -356,9 +393,20 @@ class Pipe(Model):
     def declare_equations(self):
         K = len(self.layers)
         for i in range(self.n_segments):
+            seg_wall = self['pipe'].segment_wall_ports[i]
+
+            if K == 0:
+                # Bare pipe: the boundary acts on the fluid segment directly (its
+                # internal convective film is the only heat resistance).  'expose'
+                # is served by the re-exposed `wall_outer_{i}` port declared
+                # above, so there is nothing to wire internally.  No layers means
+                # no permeation either, so we are done with this segment.
+                if self.outer_thermal != 'expose':
+                    self.connect(seg_wall, self[f'outer_{i}'].ports['heat'])
+                continue
+
             # --- thermal chain: fluid -> layer 0 -> ... -> layer K-1 -> outer ---
-            self.connect(self['pipe'].segment_wall_ports[i],
-                         self[f'wall_{i}_0'].ports['port_a'])
+            self.connect(seg_wall, self[f'wall_{i}_0'].ports['port_a'])
             for k in range(K - 1):
                 self.connect(self[f'wall_{i}_{k}'].ports['port_b'],
                              self[f'wall_{i}_{k + 1}'].ports['port_a'])
@@ -495,7 +543,9 @@ class Tank(Model):
                            "caps.", unit="m", default=0.3, ui_label=True)],
         layers: Annotated[list[WallLayer], ParamSpec("Radial wall stack, "
                          "innermost first; inner radius of layer 0 is "
-                         "diameter/2.")],
+                         "diameter/2.  Empty (no layers) = a bare tank: the "
+                         "chosen `outer_thermal` boundary acts directly on the "
+                         "inner film's outer face and permeation is disabled.")],
         h_inner: Annotated[float, ParamSpec("Internal convective film "
                           "coefficient (gas <-> wall inner surface).",
                           unit="W/(m^2*K)", default=50.0)],
@@ -508,7 +558,8 @@ class Tank(Model):
                         unit="1", default=1, ui_label=True)] = 1,
         outer_thermal: Annotated[str, ParamSpec("Thermal termination of the "
                                 "outermost wall surface.",
-                                choices=_OUTER_THERMAL_MODES)] = "adiabatic",
+                                choices=_OUTER_THERMAL_MODES,
+                                structural=True)] = "adiabatic",
         h_ext: Annotated[float, ParamSpec("External convection coefficient.",
                         unit="W/(m^2*K)",
                         relevant_when={"outer_thermal": "convective"})] = 10.0,
@@ -539,8 +590,10 @@ class Tank(Model):
             raise ValueError(
                 f"Tank: count must be an integer >= 1; got {count!r}")
         layers = list(layers)
-        if not layers:
-            raise ValueError("Tank: `layers` must contain at least one WallLayer.")
+        # `layers == []` is a *bare* tank: no wall stack on either shell.  The
+        # inner convective film still carries heat, the chosen `outer_thermal`
+        # boundary is applied directly to the film's outer face, and permeation
+        # is implicitly disabled (there is no layer that could be permeable).
         for k, layer in enumerate(layers):
             if layer.thickness <= 0:
                 raise ValueError(
@@ -594,7 +647,7 @@ class Tank(Model):
         layer = self.layers[k]
         common = dict(
             T_init=self.T_wall_init, dynamic=layer.dynamic,
-            angle_fraction=1.0, count=self.count,
+            angle_fraction=1.0, count=self['count'],
             leaky=layer.permeation is not None,
             permeation_flux=layer.permeation,
             p_in_init=self.p_init, p_out_init=self.p_ext,
@@ -612,53 +665,77 @@ class Tank(Model):
         K = len(self.layers)
 
         # `count` identical tanks in parallel are simulated as one representative
-        # tank with every EXTENSIVE quantity scaled by N: the stored gas volume,
-        # the wall mass / conductance / permeation (via the walls' `count`), the
-        # inner films, and the outer exchange areas.  Intensive states (p, h, T,
-        # partial pressures) are N-invariant, so the equation set never grows.
-        N = self.count
+        # tank with every EXTENSIVE quantity scaled by N: the stored gas volume
+        # (via the vessel's `count`), the wall mass / conductance / permeation
+        # (via the walls' `count`), the inner films (via the conductor's `count`)
+        # and the outer exchange areas (via the boundary's `count`).  Intensive
+        # states (p, h, T, partial pressures) are N-invariant.
+        #
+        # ONE shared `count` Parameter is owned here and aliased into every
+        # sub-component, so the multiplicity is a single live knob: `set_param`
+        # on `count` retunes all of them at once with NO re-instantiation.
+        self.add_component('count', Parameter(float(self.count), unit="1",
+                           description="Number of identical parallel tanks."))
+        N = self['count']
 
-        # Single lumped-gas control volume (N tanks' worth); one conjugate heat
-        # port per shell shape, plus one permeation port per shape when leaky.
+        # Single lumped-gas control volume (N tanks' worth, applied inside the
+        # vessel via the shared `count`); one conjugate heat port per shell
+        # shape, plus one permeation port per shape when leaky.
         self.add_component('gas', PressureVessel(
-            self.medium, V=N * self.volume, A_in=N * np.pi * r[0] ** 2,
+            self.medium, V=self.volume, A_in=np.pi * r[0] ** 2,
             p_init=self.p_init, T_init=self.T_init,
             leaky=False,
             heat_ports=len(self._SHAPES),
-            leak_ports=len(self._SHAPES) if self.any_leaky else 0))
+            leak_ports=len(self._SHAPES) if self.any_leaky else 0,
+            count=N))
 
-        # Inner-surface convective-film conductance (G = N * h_inner * A_inner).
+        # Inner-surface convective-film conductance (per-tank G = h_inner *
+        # A_inner; the N multiplicity is applied inside the conductor).
         A_in_cyl = 2.0 * np.pi * r[0] * self.L_cyl
         A_in_sph = 4.0 * np.pi * r[0] ** 2
         self.add_component('film_cyl', ThermalConductor(
-            N * self.h_inner * A_in_cyl, T_init=self.T_init))
+            self.h_inner * A_in_cyl, T_init=self.T_init, count=N))
         self.add_component('film_sph', ThermalConductor(
-            N * self.h_inner * A_in_sph, T_init=self.T_init))
+            self.h_inner * A_in_sph, T_init=self.T_init, count=N))
 
-        # Outer-surface areas (outermost layer, N tanks) for the convective term.
-        A_out = {'cyl': N * 2.0 * np.pi * r[K] * self.L_cyl,
-                 'sph': N * 4.0 * np.pi * r[K] ** 2}
+        # Per-tank outer-surface areas; for a bare tank (K == 0) r[K] == r[0] is
+        # the inner radius, so these equal the inner-film areas -- the boundary
+        # acts straight on the film's outer face.  The N multiplicity is applied
+        # inside the convective boundary.
+        A_out = {'cyl': 2.0 * np.pi * r[K] * self.L_cyl,
+                 'sph': 4.0 * np.pi * r[K] ** 2}
+
+        def _surface(shape):
+            """(T, Q_dot) variables of the outermost solid surface for `shape`:
+            the last layer's outer face, or -- for a bare tank -- the inner
+            film's outer face (the wetted surface itself)."""
+            if K > 0:
+                w = self[f'wall_{shape}_{K - 1}']
+                return w['T_b'], w['Q_dot_b']
+            f = self[f'film_{shape}']
+            return f['T_b'], f['Q_dot_b']
 
         for shape in self._SHAPES:
             for k in range(K):
                 self.add_component(f'wall_{shape}_{k}',
                                    self._make_wall(shape, k, r[k], r[k + 1]))
 
-            # Outer-surface thermal termination on the outermost layer.
+            # Outer-surface thermal termination (on the outermost layer, or
+            # directly on the inner film's outer face when there are no layers).
             if self.outer_thermal == 'adiabatic':
                 self.add_component(f'outer_{shape}',
                                    FixedHeatFlow(0.0, T_init=self.T_wall_init))
             elif self.outer_thermal == 'convective':
                 self.add_component(f'outer_{shape}', ConvectiveBoundary(
-                    self.h_ext, A_out[shape], T_inf=self.T_ext))
+                    self.h_ext, A_out[shape], T_inf=self.T_ext, count=N))
             elif self.outer_thermal == 'fixed':
                 self.add_component(f'outer_{shape}',
                                    FixedTemperature(T_set=self.T_outer))
             else:  # 'expose'
+                T_s, Q_s = _surface(shape)
                 self.add_port(f'wall_outer_{shape}', ThermalPort_TQ(
                     self,
-                    channels={'T': self[f'wall_{shape}_{K - 1}']['T_b'],
-                              'Q_dot': self[f'wall_{shape}_{K - 1}']['Q_dot_b']},
+                    channels={'T': T_s, 'Q_dot': Q_s},
                     flow_orientation='in',
                 ))
 
@@ -683,6 +760,17 @@ class Tank(Model):
             # --- conjugate heat: gas -[film]-> layer 0 -> ... -> outer ---
             self.connect(self['gas'].ports[f'heat_{j}'],
                          self[films[shape]].ports['heat_a'])
+
+            if K == 0:
+                # Bare tank: the inner film's outer face IS the wetted surface;
+                # apply the boundary to it directly (or, for 'expose', it is
+                # re-exposed as wall_outer_{shape}).  No layers => no permeation,
+                # so this shell is done.
+                if self.outer_thermal != 'expose':
+                    self.connect(self[films[shape]].ports['heat_b'],
+                                 self[f'outer_{shape}'].ports['heat'])
+                continue
+
             self.connect(self[films[shape]].ports['heat_b'],
                          self[f'wall_{shape}_0'].ports['port_a'])
             for k in range(K - 1):

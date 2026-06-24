@@ -206,6 +206,21 @@ class FieldsForm(QtWidgets.QWidget):
         for _, _, editor, _ in self._rows:
             editor.setEnabled(enabled)
 
+    def mark_structural(self, names):
+        """Colour each row's label by parameter class: red for a *structural*
+        parameter (its value changes the equation structure -> needs a model
+        rebuild) and green for a *pure* one (a live-updatable numeric knob).
+
+        ``names`` is the set of structural parameter names for this scope.
+        """
+        for f, toggles, _, _ in self._rows:
+            color = "#b00020" if f.get("name") in names else "#1b7a31"
+            head = toggles[0] if toggles else None
+            if isinstance(head, QtWidgets.QGroupBox):
+                head.setStyleSheet(f"QGroupBox::title {{ color: {color}; }}")
+            elif head is not None:
+                head.setStyleSheet(f"color: {color};")
+
 
 class ObjectEditor(QtWidgets.QWidget):
     """Editor for an ``object`` field: concrete ``value_spec``, abstract

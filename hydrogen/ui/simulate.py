@@ -6,19 +6,25 @@ kwargs.
     knobs (and their defaults) the UI persists and replays,
   * :class:`OptionsForm` renders one descriptor list as a typed form,
   * :class:`LogPanel` is the filterable host/run log,
-  * :class:`SimulateDialog` ties it together: tabs of options + spec JSON +
-    logs, and the run loop that streams host events back.
+  * :class:`SimSettingsDialog` edits the three option groups (+ spec JSON
+    preview) -- the *settings*, split out from the run action,
+  * :class:`SimulateDialog` is the *run window*: it drives a long-lived
+    :class:`~hydrogen.ui.session.SimulationSession`, building the model only
+    when its structure changed and reusing it otherwise.
 """
 
 from __future__ import annotations
 
 import json
 
-import hydrogen as hd
+from .qt import QtCore, QtWidgets, Signal
+from .session import SimulationSession
 
-from .qt import QtCore, QtWidgets
-
-__all__ = ["OptionsForm", "LogPanel", "SimulateDialog", "default_sim_options"]
+__all__ = [
+    "OptionsForm", "LogPanel", "SimSettingsDialog", "SimulateDialog",
+    "default_sim_options", "instantiate_kwargs", "initialise_kwargs",
+    "run_kwargs",
+]
 
 #: Field descriptors for the Simulate window's option tabs.  Each entry is
 #: ``{name, type, default, tip}`` (type in bool / int / float / choice); a blank
@@ -109,6 +115,32 @@ def default_sim_options() -> dict:
         "initialise": _opts_defaults(_INITIALISE_OPTS),
         "simulate": _opts_defaults(_SIMULATE_OPTS),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Option dicts (as persisted) -> host call kwargs.
+# --------------------------------------------------------------------------- #
+def instantiate_kwargs(options: dict) -> dict:
+    return dict(options.get("instantiate", {}))
+
+
+def initialise_kwargs(options: dict) -> dict:
+    return dict(options.get("initialise", {}))
+
+
+def run_kwargs(options: dict) -> dict:
+    """Translate the ``simulate`` option group into :meth:`SystemProxy.run`
+    kwargs: split the stepping strategy + its params from the run-length
+    (``stop_time`` / ``dt``) and the adaptive controller knobs."""
+    sim = dict(options.get("simulate", {}))
+    strat = {"name": sim.pop("strategy", "richardson")}
+    for key in _STRATEGY_PARAMS:
+        val = sim.pop(key, None)
+        if val is not None and strat["name"] == "richardson":
+            strat[key] = val
+    top = {key: sim.pop(key) for key in list(sim) if key in _RUN_TOPLEVEL}
+    # Whatever remains are the adaptive controller knobs.
+    return {"strategy": strat, "adaptive": sim, "stream": False, **top}
 
 
 class OptionsForm(QtWidgets.QWidget):
@@ -251,25 +283,33 @@ class LogPanel(QtWidgets.QWidget):
                 self._view.appendPlainText(text)
 
 
-class SimulateDialog(QtWidgets.QDialog):
-    """Assemble the canvas into a system spec and run it on a hydrogen host.
+def _scroll(widget: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
+    area = QtWidgets.QScrollArea()
+    area.setWidgetResizable(True)
+    area.setWidget(widget)
+    return area
 
-    Instantiation / initialisation / simulation options each get their own tab
-    (mapping straight onto the host's `instantiate` / `initialise` / `run`
-    kwargs); further tabs show the spec JSON and the filterable host log.
+
+class SimSettingsDialog(QtWidgets.QDialog):
+    """Edit the simulation *settings* -- the instantiate / initialise / simulate
+    option groups -- separately from launching a run.
+
+    Each group gets its own tab (mapping straight onto the host's
+    `instantiate` / `initialise` / `run` kwargs); a final tab previews the spec
+    JSON that would be shipped.  ``options()`` returns the edited groups for the
+    caller to persist.
     """
 
-    def __init__(self, system: dict, options: dict | None = None, parent=None):
+    def __init__(self, options: dict | None = None, system: dict | None = None,
+                 parent=None):
         super().__init__(parent)
-        self._system = system
-        self.setWindowTitle("Simulate via hydrogen service")
+        self.setWindowTitle("Simulation settings")
 
         outer = QtWidgets.QVBoxLayout(self)
-        n = len(system["components"])
-        c = len(system["connections"])
         header = QtWidgets.QLabel(
-            f"<b>System spec</b> &mdash; {n} component(s), {c} connection(s) "
-            f"shipped to a hydrogen host as JSON.")
+            "<b>Simulation settings</b> &mdash; these drive the host's "
+            "instantiate / initialise / run calls. They are saved with the "
+            "project and reused on every run.")
         header.setWordWrap(True)
         outer.addWidget(header)
 
@@ -281,37 +321,31 @@ class SimulateDialog(QtWidgets.QDialog):
             self._init_form.set_values(options.get("initialise", {}))
             self._sim_form.set_values(options.get("simulate", {}))
 
-        self._json = QtWidgets.QPlainTextEdit()
-        self._json.setReadOnly(True)
-        self._json.setPlainText(json.dumps(system, indent=2))
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(_scroll(self._inst_form), "Instantiation")
+        tabs.addTab(_scroll(self._init_form), "Initialisation")
+        tabs.addTab(_scroll(self._sim_form), "Simulation")
+        if system is not None:
+            spec = QtWidgets.QPlainTextEdit()
+            spec.setReadOnly(True)
+            spec.setPlainText(json.dumps(system, indent=2))
+            tabs.addTab(spec, "Spec JSON")
+        outer.addWidget(tabs, 1)
 
-        self._logs = LogPanel()
+        note = QtWidgets.QLabel(
+            "Changing an <b>instantiation</b> option re-compiles the model on "
+            "the next run; initialise / simulate options apply without a "
+            "rebuild.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666;")
+        outer.addWidget(note)
 
-        self._tabs = QtWidgets.QTabWidget()
-        self._tabs.addTab(self._scroll(self._inst_form), "Instantiation")
-        self._tabs.addTab(self._scroll(self._init_form), "Initialisation")
-        self._tabs.addTab(self._scroll(self._sim_form), "Simulation")
-        self._tabs.addTab(self._json, "Spec JSON")
-        self._tabs.addTab(self._logs, "Logs")
-        outer.addWidget(self._tabs, 3)
-
-        bar = QtWidgets.QHBoxLayout()
-        self._run_btn = QtWidgets.QPushButton("Run on hydrogen service")
-        self._run_btn.clicked.connect(self._run)
-        bar.addWidget(self._run_btn)
-        bar.addStretch(1)
-        close = QtWidgets.QPushButton("Close")
-        close.clicked.connect(self.accept)
-        bar.addWidget(close)
-        outer.addLayout(bar)
-        self.resize(760, 820)
-
-    @staticmethod
-    def _scroll(widget: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
-        area = QtWidgets.QScrollArea()
-        area.setWidgetResizable(True)
-        area.setWidget(widget)
-        return area
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+        self.resize(620, 720)
 
     def options(self) -> dict:
         """The three option groups as plain dicts (for persistence / reuse)."""
@@ -321,81 +355,253 @@ class SimulateDialog(QtWidgets.QDialog):
             "simulate": self._sim_form.values(),
         }
 
-    # --- option assembly ---------------------------------------------------- #
-    def _instantiate_kwargs(self) -> dict:
-        return self._inst_form.values()
 
-    def _initialise_kwargs(self) -> dict:
-        return self._init_form.values()
+class _SessionWorker(QtCore.QThread):
+    """Runs one blocking session operation off the GUI thread.
 
-    def _run_kwargs(self) -> dict:
-        sim = self._sim_form.values()
-        strat = {"name": sim.pop("strategy", "richardson")}
-        for key in _STRATEGY_PARAMS:
-            val = sim.pop(key, None)
-            if val is not None and strat["name"] == "richardson":
-                strat[key] = val
-        top = {key: sim.pop(key) for key in list(sim) if key in _RUN_TOPLEVEL}
-        # Whatever remains are the adaptive controller knobs.
-        kwargs = {"strategy": strat, "adaptive": sim, "stream": False, **top}
-        return kwargs
+    The hydrogen host does the heavy compute in its *own* process, but the
+    client calls (``load_json`` / ``instantiate`` / ``run``) block the calling
+    thread until the host replies. Calling them on the GUI thread freezes the
+    event loop -- so this thread makes the call (mostly parked in ``recv``, which
+    releases the GIL) and marshals log lines, the result and any error back to
+    the GUI thread via queued signals.
+    """
 
-    # --- run loop ----------------------------------------------------------- #
-    def _append(self, line: str, level: str = "status"):
-        self._logs.add(line, level)
-        QtWidgets.QApplication.processEvents()
+    logged = Signal(str, str)     # (message, level) -> LogPanel
+    done = Signal(object)         # the operation's return value
+    failed = Signal(str, str)     # (exception type name, message)
 
-    def _drain(self, sysp):
-        for ev in sysp.poll_events():
-            if ev.get("type") == "log":
-                message = ev["message"]
-                level = ev.get("level") or ""
-                if "warn" in level.lower() or "warning" in message.lower():
-                    self._append(f"  [host warning] {message}", "warning")
-                else:
-                    self._append(f"  [host] {message}", "host")
-            elif ev.get("type") == "error":
-                self._append(f"  [host error] {ev.get('kind')}: {ev.get('message')}",
-                             "error")
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn             # fn(log) -> result, where log(message, level)
 
-    def _run(self):
-        self._run_btn.setEnabled(False)
-        self._logs.clear()
-        self._tabs.setCurrentWidget(self._logs)   # surface the log while running
+    def run(self):
         try:
-            self._do_run()
-        except Exception as exc:  # surface any host/validation failure in the UI
-            self._append(f"\nFAILED: {type(exc).__name__}: {exc}", "error")
-        finally:
-            self._run_btn.setEnabled(True)
+            result = self._fn(lambda m, level="status": self.logged.emit(m, level))
+        except Exception as exc:                       # report, don't crash the thread
+            self.failed.emit(type(exc).__name__, str(exc))
+        else:
+            self.done.emit(result)
 
-    def _do_run(self):
-        inst_kw = self._instantiate_kwargs()
-        init_kw = self._initialise_kwargs()
-        run_kw = self._run_kwargs()
+
+class SimulateDialog(QtWidgets.QDialog):
+    """The *run window*: build / run the canvas against a long-lived host model.
+
+    It does not own the settings (those live in :class:`SimSettingsDialog`); it
+    pulls a fresh system spec + the saved options through callables each time,
+    and drives a :class:`~hydrogen.ui.session.SimulationSession` that keeps the
+    instantiated model alive between runs -- re-instantiating only when the
+    structure changed.
+    """
+
+    def __init__(self, session: SimulationSession, build_system, get_options,
+                 parent=None):
+        super().__init__(parent)
+        self._session = session
+        self._build_system = build_system   # () -> system spec dict
+        self._get_options = get_options     # () -> persisted options dict
+        self._worker: _SessionWorker | None = None
+        self._op_label = "build"            # current operation, for the cancel label
+        self._cancelling = False            # an abort is in flight
+        self._close_after = False           # close the window once the worker stops
+        self.setWindowTitle("Simulate via hydrogen service")
+
+        outer = QtWidgets.QVBoxLayout(self)
+        self._status = QtWidgets.QLabel()
+        self._status.setWordWrap(True)
+        outer.addWidget(self._status)
+
+        self._logs = LogPanel()
+        outer.addWidget(self._logs, 1)
+
+        bar = QtWidgets.QHBoxLayout()
+        self._build_label = "Build / update model"
+        self._build_btn = QtWidgets.QPushButton(self._build_label)
+        self._build_btn.setToolTip(
+            "Instantiate the model on the host (only re-compiles if the "
+            "structure changed; pushes changed numeric parameters live). While "
+            "building this becomes 'Cancel build'.")
+        self._build_btn.clicked.connect(self._on_build_clicked)
+        bar.addWidget(self._build_btn)
+
+        self._run_btn = QtWidgets.QPushButton("▶ Run")
+        self._run_btn.setToolTip(
+            "Build the model if needed, then initialise and run it.")
+        self._run_btn.clicked.connect(self._on_run)
+        bar.addWidget(self._run_btn)
+
+        bar.addStretch(1)
+        self._close_btn = QtWidgets.QPushButton("Close")
+        self._close_btn.setToolTip(
+            "Close this window (cancels a build in progress first). The built "
+            "model otherwise stays alive on the host.")
+        self._close_btn.clicked.connect(self._on_close_clicked)
+        bar.addWidget(self._close_btn)
+        outer.addLayout(bar)
+        self.resize(760, 640)
+        self._refresh_status()
+
+    # --- helpers ----------------------------------------------------------- #
+    def _refresh_status(self):
+        if self._session.built:
+            self._status.setText(
+                "<b>Model status:</b> built and kept alive on the host. A run "
+                "reuses it; structural edits trigger a rebuild automatically.")
+        else:
+            self._status.setText(
+                "<b>Model status:</b> not built yet. Build or run to "
+                "instantiate it on the host.")
+
+    def _log(self, message: str, level: str = "status"):
+        self._logs.add(message, level)
+
+    def _busy(self, busy: bool):
+        # While busy the Build button turns into a Cancel control; Run is
+        # disabled (only one operation at a time).
+        self._run_btn.setEnabled(not busy)
+        if busy:
+            self._build_btn.setText(f"■ Cancel {self._op_label}")
+            self._build_btn.setToolTip(
+                f"Cancel the {self._op_label} in progress (tears down the host).")
+        else:
+            self._build_btn.setText(self._build_label)
+            self._build_btn.setEnabled(True)
+            self._build_btn.setToolTip(
+                "Instantiate the model on the host (only re-compiles if the "
+                "structure changed; pushes changed numeric parameters live). "
+                "While building this becomes 'Cancel build'.")
+
+    def _is_busy(self) -> bool:
+        return self._worker is not None and self._worker.isRunning()
+
+    # --- worker plumbing --------------------------------------------------- #
+    def _start_worker(self, task, on_done, op_label: str):
+        """Run ``task(log)`` on a background thread (so the host calls don't
+        freeze the UI); ``on_done(result)`` runs on the GUI thread on success."""
+        self._op_label = op_label
+        self._cancelling = False
+        self._busy(True)
+        worker = _SessionWorker(task)
+        worker.logged.connect(self._log)                       # queued: GUI thread
+        worker.done.connect(lambda result: self._worker_finished(on_done, result))
+        worker.failed.connect(self._worker_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+
+    def _on_build_clicked(self):
+        """Build, or -- if a build/run is in flight -- cancel it."""
+        if self._is_busy():
+            self._cancel()
+        else:
+            self._on_build()
+
+    def _cancel(self):
+        """Abort the in-flight operation by tearing down the host; the worker
+        then unblocks and finalises via :meth:`_worker_failed`."""
+        if not self._is_busy() or self._cancelling:
+            return
+        self._cancelling = True
+        self._build_btn.setEnabled(False)   # avoid a double-cancel while tearing down
+        self._log(f"\ncancelling {self._op_label} — tearing down the host …",
+                  "status")
+        self._session.abort()
+
+    def _worker_finished(self, on_done, result):
+        if self._cancelling:
+            self._log(f"\n{self._op_label} cancelled.", "status")
+        else:
+            try:
+                on_done(result)
+            except Exception as exc:
+                self._log(f"\nFAILED: {type(exc).__name__}: {exc}", "error")
+        self._finalize_worker()
+
+    def _worker_failed(self, kind: str, message: str):
+        if self._cancelling:
+            self._log(f"\n{self._op_label} cancelled.", "status")
+        else:
+            self._log(f"\nFAILED: {kind}: {message}", "error")
+        self._finalize_worker()
+
+    def _finalize_worker(self):
+        self._worker = None
+        self._cancelling = False
+        self._refresh_status()
+        self._busy(False)
+        if self._close_after:
+            self._close_after = False
+            QtWidgets.QDialog.accept(self)
+
+    # --- actions ----------------------------------------------------------- #
+    def _on_build(self):
+        try:
+            system = self._build_system()
+        except Exception as exc:
+            self._log(f"\nFAILED building spec: {type(exc).__name__}: {exc}",
+                      "error")
+            return
+        inst_kw = instantiate_kwargs(self._get_options())
+
+        def task(log):
+            return self._session.ensure_built(system, inst_kw, log)
+
+        self._start_worker(
+            task, lambda outcome: self._log(f"\nready ({outcome})."),
+            op_label="build")
+
+    def _on_run(self):
+        options = self._get_options()
+        run_kw = run_kwargs(options)
         if run_kw.get("stop_time") is None:
-            self._append("Set a stop_time first — the run is driven by it.")
+            self._log("Set a stop_time first — the run is driven by it.")
             return
-        if run_kw.get("strategy", {}).get("name") == "fixed" and run_kw.get("dt") is None:
-            self._append("strategy='fixed' needs a dt (it marches dt until stop_time).")
+        if (run_kw.get("strategy", {}).get("name") == "fixed"
+                and run_kw.get("dt") is None):
+            self._log("strategy='fixed' needs a dt (it marches dt until "
+                      "stop_time).")
             return
-
-        text = json.dumps(self._system)
-        self._append("starting hydrogen host…")
-        service = hd.start_host(workers=1)
         try:
-            sysp = service.load_json(text)
-            self._append(f"loaded JSON; instantiating with {inst_kw} …")
-            sysp.instantiate(**inst_kw)
-            self._drain(sysp)
-            self._append(f"initialising with {init_kw} …")
-            sysp.initialise(**init_kw)
-            self._drain(sysp)
-            self._append(f"running with {run_kw} …")
-            summary = sysp.run(**run_kw)
-            self._drain(sysp)
-            self._append(f"\nOK — run summary: {summary}")
-            sysp.close()
-        finally:
-            service.shutdown()
-            self._append("host shut down.")
+            system = self._build_system()
+        except Exception as exc:
+            self._log(f"\nFAILED building spec: {type(exc).__name__}: {exc}",
+                      "error")
+            return
+        inst_kw = instantiate_kwargs(options)
+        init_kw = initialise_kwargs(options)
+
+        def task(log):
+            outcome = self._session.ensure_built(system, inst_kw, log)
+            log(f"model {outcome}; starting run …", "status")
+            return self._session.run(init_kw, run_kw, log)
+
+        self._start_worker(
+            task, lambda summary: self._log(f"\nOK — run summary: {summary}"),
+            op_label="run")
+
+    # --- lifecycle --------------------------------------------------------- #
+    def _on_close_clicked(self):
+        self._request_close()
+
+    def _request_close(self):
+        """Close now if idle; otherwise cancel the in-flight operation and close
+        once the worker has actually stopped (so its slots aren't torn down
+        mid-flight)."""
+        if self._is_busy():
+            self._close_after = True
+            self._cancel()
+            return
+        QtWidgets.QDialog.accept(self)
+
+    def closeEvent(self, event):
+        if self._is_busy() or self._close_after:
+            event.ignore()           # defer until the worker stops, then close
+            self._request_close()
+            return
+        super().closeEvent(event)
+
+    def reject(self):
+        self._request_close()        # Esc / window close -> same as the Close button
+
+    def accept(self):
+        self._request_close()

@@ -9,6 +9,7 @@ import hydrogen as hd
 
 from .forms import FieldsForm
 from .qt import QtCore, QtWidgets
+from .session import structural_param_names
 
 __all__ = ["PropertiesDialog"]
 
@@ -52,11 +53,20 @@ class PropertiesDialog(QtWidgets.QDialog):
         self._params = FieldsForm(self._spec["parameters"])
         if node.params:
             self._params.set_values(node.params)
+        self._params.mark_structural(structural_param_names(node.type_name))
         self._params.changed.connect(self._refresh_preview)
         body_layout.addWidget(self._params)
         body_layout.addStretch(1)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
+
+        legend = QtWidgets.QLabel(
+            "<span style='color:#1b7a31'>&#9632; pure</span> "
+            "(updated live on the running model) &nbsp;&nbsp; "
+            "<span style='color:#b00020'>&#9632; structural</span> "
+            "(changing it re-instantiates the model)")
+        legend.setWordWrap(True)
+        outer.addWidget(legend)
 
         # JSON preview: hidden behind a toggle (not shown inline).
         self._toggle = QtWidgets.QPushButton("Show JSON")
