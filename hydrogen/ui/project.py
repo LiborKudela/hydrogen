@@ -15,17 +15,23 @@ __all__ = ["PROJECT_FORMAT", "PROJECT_VERSION", "make_project", "is_project"]
 
 #: Marker for the editor's own save files (canvas + properties + sim settings).
 PROJECT_FORMAT = "hydrogen-ui-project"
-PROJECT_VERSION = 1
+#: v2 adds the project-level ``media`` table (shared CoolProp fluid definitions).
+#: v1 files have no table; the editor synthesises one from the components' medium
+#: names on load, so older projects open unchanged.
+PROJECT_VERSION = 2
 
 
-def make_project(canvas_state: dict, sim_options: dict) -> dict:
-    """Wrap a canvas state + simulation options into the on-disk envelope."""
+def make_project(canvas_state: dict, sim_options: dict,
+                 media: dict | None = None) -> dict:
+    """Wrap a canvas state + simulation options + media table into the on-disk
+    envelope."""
     return {
         "format": PROJECT_FORMAT,
         "version": PROJECT_VERSION,
         "hydrogen_version": hd.__version__,
         "canvas": canvas_state,
         "sim_options": sim_options,
+        "media": media or {},
     }
 
 

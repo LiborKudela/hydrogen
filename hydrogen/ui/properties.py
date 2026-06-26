@@ -23,7 +23,7 @@ class PropertiesDialog(QtWidgets.QDialog):
     instead of being shown inline.
     """
 
-    def __init__(self, node, parent=None):
+    def __init__(self, node, media_keys=None, parent=None):
         super().__init__(parent)
         self.node = node
         self._spec = hd.component_spec(node.type_name)
@@ -44,9 +44,17 @@ class PropertiesDialog(QtWidgets.QDialog):
         if self._spec["needs_medium"]:
             mrow = QtWidgets.QWidget()
             mform = QtWidgets.QFormLayout(mrow)
-            self._medium = QtWidgets.QLineEdit(node.medium or "Hydrogen")
-            self._medium.setToolTip("CoolProp fluid name (also the media key).")
-            self._medium.textChanged.connect(self._refresh_preview)
+            self._medium = QtWidgets.QComboBox()
+            self._medium.setEditable(True)            # allow typing a brand-new key
+            keys = list(media_keys or [])
+            self._medium.addItems(keys)
+            current = node.medium or (keys[0] if keys else "Hydrogen")
+            self._medium.setCurrentText(current)
+            self._medium.setToolTip(
+                "Medium key (the shared fluid this component uses). Manage "
+                "fluids, backends and caches in the Media dialog; type a new "
+                "key here to create one with default settings.")
+            self._medium.currentTextChanged.connect(self._refresh_preview)
             mform.addRow("medium *", self._medium)
             body_layout.addWidget(mrow)
 
@@ -91,7 +99,7 @@ class PropertiesDialog(QtWidgets.QDialog):
         template = dict(self._spec["template"])
         template["params"] = self._params.value()
         if self._medium is not None:
-            template["medium"] = self._medium.text().strip() or None
+            template["medium"] = self._medium.currentText().strip() or None
         return template
 
     def _on_toggle(self, checked: bool):
@@ -106,5 +114,5 @@ class PropertiesDialog(QtWidgets.QDialog):
     def _accept(self):
         self.node.params = self._params.value()
         if self._medium is not None:
-            self.node.medium = self._medium.text().strip() or None
+            self.node.medium = self._medium.currentText().strip() or None
         self.accept()

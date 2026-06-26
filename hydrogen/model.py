@@ -16,9 +16,11 @@ Time stepping uses Crank-Nicolson on every `DifferentialVariable`.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import gc
 import itertools
+import math
 import os
 import time
 
@@ -26,6 +28,7 @@ import line_profiler
 import multiprocessing as _mp
 import numpy as np
 import sympy as sp
+from sympy.functions.elementary.miscellaneous import MinMaxBase
 
 from .caching import (
     lambda_cache_default_dir,
@@ -36,6 +39,59 @@ from .caching import (
 from .numerics import (fast_error_norm, fast_linear_solve, fast_sparse_solve,
                         fast_sparse_solve_cached, lambdify_compat)
 from .paramspec import cache_key_flag_names
+
+
+def _cheap_minmax_is_connected(cls, x, y):
+    """Drop-in for `MinMaxBase._is_connected` that omits the expensive
+    `factor_terms(x - y)` symbolic-domination retry.
+
+    `Min`/`Max` canonicalisation calls `_is_connected` pairwise on every
+    argument to discard provably-dominated ones.  Its best-effort second pass
+    runs `factor_terms` (which calls `gcd_terms`) on the difference of two
+    arguments -- and for the large choked-flow `Min`/`Max` closures in a
+    discretised pipe that single call dominates the *entire* `instantiate()`
+    (every `xreplace` that rebuilds such a node re-triggers it).
+
+    We keep the cheap, exact checks -- argument equality and the direct
+    relational comparison (which still collapses numeric and obviously-ordered
+    args) -- and only skip the costly `factor_terms` simplification retry.
+    Skipping it is always safe: sympy itself notes the retry is a conservative
+    best-effort, so omitting it can only leave a `Min`/`Max` *less* simplified,
+    never wrong.  Applied uniformly across a whole `instantiate()` so every
+    equation is canonicalised consistently.
+    """
+    if x == y:
+        return True
+    t, f = Max, Min
+    for op in "><":
+        for _ in range(2):
+            try:
+                v = x >= y if op == ">" else x <= y
+            except TypeError:
+                return False  # non-real arg
+            if not v.is_Relational:
+                return t if v else f
+            t, f = f, t
+            x, y = y, x
+        x, y = y, x
+    return False
+
+
+# Bound names used by the cheap `_is_connected` above.
+Min = sp.Min
+Max = sp.Max
+
+
+@contextlib.contextmanager
+def _cheap_minmax_simplification():
+    """Temporarily patch `MinMaxBase._is_connected` to skip its expensive
+    `factor_terms` retry for the duration of an `instantiate()`."""
+    orig = MinMaxBase.__dict__["_is_connected"]
+    MinMaxBase._is_connected = classmethod(_cheap_minmax_is_connected)
+    try:
+        yield
+    finally:
+        MinMaxBase._is_connected = orig
 
 
 class NewtonConvergenceFailure(RuntimeError):
@@ -57,6 +113,18 @@ class NewtonConvergenceFailure(RuntimeError):
         self.n_iters = n_iters
         self.max_iter = max_iter
         self.tol = tol
+
+
+# Exceptions raised when a Newton iterate lands in a thermodynamically
+# invalid state and the property back-end / lambdified residual cannot be
+# evaluated there.  CoolProp surfaces out-of-domain inputs (e.g. an enthalpy
+# below the medium's minimum after a step overshoots) as plain `ValueError`;
+# `ArithmeticError` / `FloatingPointError` cover overflow / divide-by-zero in
+# the numeric residual itself.  `custom_solve` catches these during the
+# Jacobian/residual evaluation and converts them into a
+# `NewtonConvergenceFailure`, so the adaptive stepper rejects the step and
+# retries at a smaller `dt` instead of aborting the whole run.
+PropertyEvaluationError = (ValueError, ArithmeticError, FloatingPointError)
 
 
 # Module-globals seeded by `_init_lambdify_worker` (only used in worker
@@ -301,10 +369,25 @@ class Model:
     # thousands of variables was thousands of unused sympy `Symbol` objects on
     # the heap.  Sympy's `Symbol` cache makes these structurally identical, but
     # holding distinct Python objects per variable still wastes memory.
+    # The first three entries are the time triplet `(t, t_prev, dt)`.  The four
+    # trailing entries are GLOBAL integration-scheme coefficients shared by every
+    # `DifferentialVariable` closure (see `DifferentialVariable.declare_equations`):
+    #
+    #     x = sch_p0 * x_prev + dt * sch_a * der + (sch_p1 + dt * sch_b) * der_prev
+    #
+    # They live in the `t`-block (not the parameter block) because, like `dt`,
+    # they are model-wide runtime scalars the stepper rewrites per stage rather
+    # than per-component compile-time constants.  Crank-Nicolson is the default
+    # (`sch_p0, sch_p1, sch_a, sch_b = 1, 0, 1/2, 1/2`); the TR-BDF2 stepper
+    # temporarily swaps in its trapezoidal / BDF2 stage coefficients.
     t_symbols = [
         sp.symbols('t', real=True),
         sp.symbols('t_prev', real=True),
         sp.symbols('dt', real=True),
+        sp.symbols('sch_p0', real=True),
+        sp.symbols('sch_p1', real=True),
+        sp.symbols('sch_a', real=True),
+        sp.symbols('sch_b', real=True),
     ]
 
     # Step B: per-Model-subclass cache of the SYMBOLIC OUTPUT of
@@ -368,6 +451,15 @@ class Model:
             'state': [],
             'vars_names': [],
             'subs': [],
+            # Per-recorded-step solver diagnostics, kept index-aligned with
+            # `time` / `state`.  `step_wall_time` is the wall-clock seconds the
+            # adaptive solver spent producing that step (including any rejected
+            # retries); `step_error` is the controller's accepted local-error
+            # estimate for that step.  Entries that don't correspond to a solved
+            # step -- the initial state from `initialise()` and any manual
+            # `next_step()` call -- are recorded as `nan`.
+            'step_wall_time': [],
+            'step_error': [],
         }
 
     @property
@@ -407,6 +499,23 @@ class Model:
 
     def declare_equations(self):
         """Override to return a list of sympy expressions, each implicitly == 0."""
+        return []
+
+    def declare_events(self):
+        """Override to declare *explicit time events* for this component.
+
+        Return a list of absolute model times (floats) at which this component's
+        driving signal is non-smooth -- a value jump (e.g. a `Step`) or a slope
+        kink (e.g. the corners of a `Ramp`).  The integrator clips its step size
+        so it never integrates *across* such an instant; instead it lands just
+        before it (``t* - event_eps``) and just after it (``t* + event_eps``),
+        so each committed step stays on a single smooth branch of the signal.
+
+        This is what lets the adaptive controller keep a clean local-error
+        estimate at a discontinuity instead of stalling / rejecting on the kink.
+        Times outside the run's ``[t_start, stop_time]`` window are ignored.
+        Default: no events.
+        """
         return []
 
     def add_port(self, name, port):
@@ -1966,16 +2075,23 @@ class Model:
         # regardless of whether `instantiate()` returns or raises.
         _eq_cache_token = _eq_cache_var.set({})
         try:
-            return self._instantiate_impl(
-                cse=cse,
-                aditional_modules=aditional_modules,
-                max_remove_trival_passes=max_remove_trival_passes,
-                lambda_cache_dir=lambda_cache_dir,
-                max_remove_duplicate_passes=max_remove_duplicate_passes,
-                enable_blt=enable_blt,
-                max_remove_linear_block_passes=max_remove_linear_block_passes,
-                enable_var_scaling=enable_var_scaling,
-            )
+            # Patch `Min`/`Max` canonicalisation to skip its costly
+            # `factor_terms` domination retry for the whole call.  All Min/Max
+            # nodes (built by `declare_equations`, rewritten by the reduction
+            # passes, regrouped by the lambdify classifier) are then simplified
+            # consistently, so structural template invariants hold while the
+            # per-`xreplace` re-canonicalisation cost collapses.
+            with _cheap_minmax_simplification():
+                return self._instantiate_impl(
+                    cse=cse,
+                    aditional_modules=aditional_modules,
+                    max_remove_trival_passes=max_remove_trival_passes,
+                    lambda_cache_dir=lambda_cache_dir,
+                    max_remove_duplicate_passes=max_remove_duplicate_passes,
+                    enable_blt=enable_blt,
+                    max_remove_linear_block_passes=max_remove_linear_block_passes,
+                    enable_var_scaling=enable_var_scaling,
+                )
         finally:
             _eq_cache_var.reset(_eq_cache_token)
 
@@ -2344,6 +2460,11 @@ class Model:
         self.n_t = len(self.t_symbols)
         print(f"Remaining variables and equations: {self.n_v}")
         self.values = np.zeros(2 * self.n_v + self.n_p + self.n_t)
+        # Default the global integration scheme to Crank-Nicolson so every solve
+        # (including `initialise`'s t=0 consistency solve) sees a well-posed
+        # closure.  The TR-BDF2 stepper overrides these per stage and restores
+        # them afterwards.
+        self.set_scheme_coeffs(*_CN_COEFFS)
         self.delta_values = np.zeros(self.n_v)
         # Bind each surviving Parameter to its slot in `self.values` so that
         # `Parameter.set_value()` can write a single index directly.  Slot
@@ -2994,6 +3115,12 @@ class Model:
                 if i_cur is not None and i_prev is not None:
                     self._input_refs.append((inp, i_cur, i_prev))
 
+        # --- explicit time events ----------------------------------------------
+        # Aggregate every component's `declare_events()` (signal jumps / kinks)
+        # so `iter_run` can clip the step size to land just before/after each
+        # instant instead of integrating across the discontinuity.
+        self._event_times = self._collect_events()
+
         gc.collect()
 
         _t_total = time.time() - _t_instantiate_start
@@ -3113,6 +3240,33 @@ class Model:
     def dt(self):
         return self.t_symbols[2]
 
+    # --- integration-scheme coefficient symbols (shared by every diff closure) --
+    @property
+    def sch_p0(self):
+        return self.t_symbols[3]
+
+    @property
+    def sch_p1(self):
+        return self.t_symbols[4]
+
+    @property
+    def sch_a(self):
+        return self.t_symbols[5]
+
+    @property
+    def sch_b(self):
+        return self.t_symbols[6]
+
+    def set_scheme_coeffs(self, p0, p1, a, b):
+        """Write the four global integration-scheme coefficients into the
+        `t`-block.  See `DifferentialVariable.declare_equations` for the closure
+        they parameterise; `_CN_COEFFS` restores Crank-Nicolson."""
+        base = 2 * self.n_v + self.n_p
+        self.values[base + 3] = p0
+        self.values[base + 4] = p1
+        self.values[base + 5] = a
+        self.values[base + 6] = b
+
     def get_dt_value(self):
         return self.values[2 * self.n_v + self.n_p + 2]
 
@@ -3148,6 +3302,29 @@ class Model:
 
         _walk(self)
         return found
+
+    def _collect_events(self):
+        """Aggregate every component's `declare_events()` over the subtree.
+
+        Walks the whole component tree (depth-first, like `_collect_inputs`),
+        calling `declare_events()` on each `Model` node and flattening the
+        returned event times into one sorted, de-duplicated list.  Coincident
+        events (within `event_eps`) collapse to one so two components that kink
+        at the same instant only create one pair of step boundaries.
+        """
+        times = []
+
+        def _walk(node):
+            for t_ev in node.declare_events():
+                t_ev = float(t_ev)
+                if math.isfinite(t_ev):
+                    times.append(t_ev)
+            for c in node.components.values():
+                if isinstance(c, Model):
+                    _walk(c)
+
+        _walk(self)
+        return sorted(times)
 
     def _refresh_inputs(self):
         """Re-sample every `Input` at the current `(t, t_prev)` and write the
@@ -3234,17 +3411,19 @@ class Model:
             full_state[self._raw_sub_dst] = sub_vals
         return full_state
 
-    def record_state(self):
+    def record_state(self, step_wall_time=np.nan, step_error=np.nan):
         self.record['time'].append(self.get_t_value())
         full_state = self.lambdified_raw_vars(*self.values)
         self.record['state'].append(full_state)
+        self.record['step_wall_time'].append(float(step_wall_time))
+        self.record['step_error'].append(float(step_error))
 
-    def next_step(self):
+    def next_step(self, step_wall_time=np.nan, step_error=np.nan):
         self.set_prev_vars_values(self.get_vars_values())
         self.set_t_prev(self.get_t_value())
         # Note: `solve_dae_step` already advanced `t` by `dt`. Advancing here too would
         # double-count, so we deliberately do not call `set_t` again.
-        self.record_state()
+        self.record_state(step_wall_time=step_wall_time, step_error=step_error)
 
     # --- recorded-state access (shared with the service layer) ------------
 
@@ -3377,6 +3556,58 @@ class Model:
             raise KeyError(f"no recorded variable matching {name!r}")
         sl = slice(start, stop, max(1, stride or 1))
         return np.asarray(state_all)[sl][:, idx].astype(float)
+
+    def interp_series(self, name, t, *, left=np.nan, right=np.nan,
+                      start=0, stop=None, stride=1):
+        """Linearly resample the recorded timeseries of the *first* variable
+        matching ``name`` onto arbitrary query time(s) ``t``.
+
+        An adaptive run lands on a non-uniform time grid that differs between
+        runs / strategies, so to compare whole *trajectories* -- not just the
+        final state -- resample each onto a shared grid first::
+
+            tq = np.linspace(t0, t1, 501)
+            p_a = run_a.interp_series("tank_3.gas.p", tq)
+            p_b = run_b.interp_series("tank_3.gas.p", tq)
+            max_abs = np.max(np.abs(p_a - p_b))
+
+        ``t`` may be a scalar (returns ``float``) or array-like (returns an
+        ndarray).  Query times outside the recorded span yield ``left`` /
+        ``right`` (default ``nan``) instead of being silently clamped to the
+        end values.  Raises ``KeyError`` if nothing is recorded yet or no
+        variable matches.
+        """
+        tp = self.record_time(start, stop, stride)
+        fp = self.series(name, start, stop, stride)
+        t_arr = np.asarray(t, dtype=float)
+        out = np.interp(t_arr, tp, fp, left=left, right=right)
+        return float(out) if t_arr.ndim == 0 else out
+
+    def interp_state(self, t, vars=None, *, left=np.nan, right=np.nan,
+                     start=0, stop=None, stride=1):
+        """Linearly resample many recorded variables onto query time(s) ``t``.
+
+        The timeseries analogue of :meth:`get_state`: where ``get_state``
+        returns each requested variable's *latest* value, this returns each one
+        resampled onto ``t``.  Returns ``{display_name: values}`` where
+        ``values`` is a ``float`` (scalar ``t``) or ndarray (array-like ``t``);
+        ``vars=None`` resamples every recorded variable.  Matching and
+        out-of-range semantics follow :meth:`interp_series`.
+        """
+        tp = self.record_time(start, stop, stride)
+        state_all = self.record.get('state', [])
+        if not state_all:
+            raise KeyError(
+                "no recorded state yet; call initialise() (or next_step()) first")
+        sl = slice(start, stop, max(1, stride or 1))
+        arr = np.asarray(state_all)[sl].astype(float)
+        t_arr = np.asarray(t, dtype=float)
+        scalar = t_arr.ndim == 0
+        out = {}
+        for disp, i in self.resolve_vars(vars):
+            vals = np.interp(t_arr, tp, arr[:, i], left=left, right=right)
+            out[disp] = float(vals) if scalar else vals
+        return out
 
     def expand_names(self, template, *index_specs):
         """Expand a ``str.format`` template into an ordered list of variable
@@ -3712,7 +3943,21 @@ class Model:
             inv_scales = self._var_inv_scales
             buf = self._scaled_delta_buf
         while error_norm > tol and i < max_iter:
-            self.update_delta()
+            try:
+                self.update_delta()
+            except PropertyEvaluationError as exc:
+                # A Newton iterate drove the state outside the medium's valid
+                # thermodynamic domain (e.g. CoolProp cannot flash an enthalpy
+                # below its minimum), so the Jacobian/residual evaluation
+                # raised.  Treat this exactly like Newton non-convergence:
+                # record the failure so `raise_on_no_convergence` callers
+                # (every adaptive strategy) reject the step and retry at a
+                # smaller dt instead of crashing the whole run.
+                self._last_solve_error_norm = np.inf
+                self._last_solve_iters = i
+                if raise_on_no_convergence:
+                    raise NewtonConvergenceFailure(np.inf, i, max_iter, tol) from exc
+                return guess
             delta = self.delta_values
             # (Scaled) norm of the FULL Newton step, computed before any
             # damping; the actual step taken is `lam * delta`.
@@ -3828,6 +4073,35 @@ class Model:
         self._diff_var_index_pairs_cache = pairs
         return pairs
 
+    def _get_diff_state_indices(self):
+        """Returns the state-vector indices of EVERY `DifferentialVariable`
+        whose state survived reduction, regardless of whether its derivative
+        companion was eliminated.  Cached after first call.
+
+        Unlike `_get_diff_var_index_pairs` (which needs the *derivative* slot
+        too, e.g. for the predictor-corrector estimate), this is the set the
+        TR-BDF2 stepper must advance: the BDF2 stage rewrites each diff state's
+        `prev` slot, which is well-defined even when the trivial-equation
+        reducer inlined the derivative definition."""
+        if getattr(self, "_diff_state_index_cache", None) is not None:
+            return self._diff_state_index_cache
+        refs = self.active_vars_references
+        id_to_idx = {id(v): i for i, v in enumerate(refs)}
+        idxs = []
+
+        def _walk(node):
+            if isinstance(node, DifferentialVariable):
+                state_idx = id_to_idx.get(id(node))
+                if state_idx is not None:
+                    idxs.append(state_idx)
+            if isinstance(node, Model):
+                for child in node.components.values():
+                    _walk(child)
+
+        _walk(self)
+        self._diff_state_index_cache = np.array(idxs, dtype=int)
+        return self._diff_state_index_cache
+
     def _get_var_atols(self, fallback_atol):
         """Per-variable absolute tolerance vector aligned with `active_vars_references`.
         Falls back to `fallback_atol` (the strategy's global value) for any
@@ -3838,10 +4112,89 @@ class Model:
             dtype=float,
         )
 
+    def _tr_bdf2_step(self, dt, snap, diff_state_idx, pair_state_idx, pair_der_idx,
+                      relaxation, tol, max_iter, line_search):
+        """Take ONE TR-BDF2 step of size `dt` from the snapshot `snap` (state
+        `x_n` at time `t_n`).  Returns ``(est, est_state_idx)`` where `est` is
+        the embedded local-error estimate aligned with `est_state_idx`.
+
+        TR-BDF2 is a two-stage, L-stable, stiffly-accurate, second-order
+        one-step method:
+
+          1. Trapezoidal sub-step of size ``gamma*dt`` to ``t_n + gamma*dt``
+             (`gamma = 2 - sqrt(2)`), reusing the Crank-Nicolson closure.
+          2. BDF2 sub-step to ``t_n + dt`` using the start value `x_n` and the
+             stage value `x_gamma`.
+
+        Both implicit stages share the diagonal coefficient ``1 - sqrt(2)/2``
+        (the SDIRK property), so the Newton Jacobian structure is identical
+        across stages.  Raises `NewtonConvergenceFailure` if either stage solve
+        fails to converge, so the caller can reject and shrink `dt`.
+
+        The BDF2 stage is expressed through the generalised closure WITHOUT a
+        second history slot: it sets the scheme coefficients to ``(1, 0, d, 0)``
+        -- which zeroes EVERY differential variable's `der_prev` term -- and
+        folds the BDF2 history combination ``c2*x_n + c1*x_gamma`` into each diff
+        state's `prev` slot.  Because it only ever writes the (always-surviving)
+        state `prev` slot, it is correct whether or not the trivial-equation
+        reducer inlined a variable's derivative definition.
+        """
+        nv = self.n_v
+        g = _TRBDF2_GAMMA
+        # Start every (re)try from the clean pre-step state: x_n in cur AND prev,
+        # t == t_prev == t_n.
+        self._restore_state(snap)
+        t_n = snap["t"]
+        x_n = snap["values"][diff_state_idx].copy()
+
+        # ---- Stage 1: trapezoidal rule, sub-step of size gamma*dt -------------
+        self.set_scheme_coeffs(*_CN_COEFFS)
+        self.solve_dae_step(g * dt, relaxation=relaxation, tol=tol,
+                            max_iter=max_iter, raise_on_no_convergence=True,
+                            line_search=line_search)
+        x_gamma = self.values[diff_state_idx].copy()
+        # Capture the trapezoidal-stage slope for the embedded estimate (only
+        # for diff vars whose derivative companion survived reduction).
+        f_gamma = (self.values[pair_der_idx].copy()
+                   if pair_der_idx.size else None)
+
+        # ---- Stage 2: BDF2 to t_n + dt via prev-folding ----------------------
+        # Closure with (p0,p1,a,b) = (1, 0, d, 0) is  x = x_prev + d*dt*der;
+        # writing x_prev := c2*x_n + c1*x_gamma reproduces the BDF2 update
+        # x = c2*x_n + c1*x_gamma + d*dt*f_{n+1} for every diff state.
+        self.set_scheme_coeffs(1.0, 0.0, _TRBDF2_D, 0.0)
+        self.values[nv + diff_state_idx] = _TRBDF2_C2 * x_n + _TRBDF2_C1 * x_gamma
+        self.set_t_prev(t_n)                          # whole step starts at t_n
+        self.set_dt(dt)
+        self.set_t(t_n + dt)                          # resample inputs at t_{n+1}
+        self.custom_solve(tol=tol, max_iter=max_iter, relaxation=relaxation,
+                          raise_on_no_convergence=True, line_search=line_search)
+
+        # ---- Embedded local-error estimate -----------------------------------
+        if pair_der_idx.size:
+            # Proper TR-BDF2 estimate from the three stage slopes f_n, f_gamma,
+            # f_{n+1} (read straight from the derivative slots).  The weights
+            # are the second divided difference of f at nodes {0, gamma, 1},
+            # scaled by K so the estimate equals TR-BDF2's leading
+            # O(dt^3 * y''') truncation term.
+            f_n = snap["values"][pair_der_idx]
+            f_np1 = self.values[pair_der_idx]
+            est = _TRBDF2_K * dt * (
+                _TRBDF2_E0 * f_n + _TRBDF2_E1 * f_gamma + _TRBDF2_E2 * f_np1)
+            return est, pair_state_idx
+        # Fallback for the (degenerate) case where every derivative was inlined:
+        # recover f_{n+1} from the BDF2 increment and compare the order-2 result
+        # to a backward-Euler predictor x_n + dt*f_{n+1} (an O(dt^2) estimate).
+        x_np1 = self.values[diff_state_idx]
+        f_np1 = (x_np1 - _TRBDF2_C2 * x_n - _TRBDF2_C1 * x_gamma) / (_TRBDF2_D * dt)
+        est = x_np1 - (x_n + dt * f_np1)
+        return est, diff_state_idx
+
     def solve_adaptive_step(self, dt_target, strategy="predictor_corrector",
                             dt_min=1e-9, dt_max=None,
                             grow=1.5, shrink=0.5, max_retries=20,
-                            relaxation=1.0, tol=1e-6, max_iter=100):
+                            relaxation=1.0, tol=1e-6, max_iter=100,
+                            line_search=False):
         """Take one accepted adaptive step toward `dt_target`.
 
         Returns `(dt_used, info)` where `info` is a dict with at least
@@ -3870,16 +4223,33 @@ class Model:
         max_retries : int
             Hard cap on rejection-and-retry iterations within a single
             adaptive step.  Raises `RuntimeError` if exceeded.
-        relaxation, tol, max_iter
+        relaxation, tol, max_iter, line_search
             Forwarded to every internal `solve_dae_step` / `custom_solve`.
+            `line_search=True` enables feasibility-guarded backtracking, which
+            damps Newton overshoots into infeasible thermodynamic states (see
+            `custom_solve`) instead of relying on dt rejection alone.
+
+        Raises
+        ------
+        This method always raises when it cannot produce a converged accepted
+        step: `NewtonConvergenceFailure` for a `"fixed"` step (no dt to shrink),
+        or `RuntimeError` for an adaptive strategy that exhausts `max_retries`
+        or hits `dt_min`.  Callers (`run` / the service loop) decide whether to
+        propagate or report it.
         """
         if dt_max is None:
             dt_max = 4.0 * dt_target
 
         name, params = _normalise_adaptive_strategy(strategy)
         if name == "fixed":
+            # A fixed step has no `dt` to shrink, so Newton non-convergence is
+            # unrecoverable here -- raise it (like the adaptive strategies raise
+            # `RuntimeError` when they exhaust retries) rather than silently
+            # marching on an unconverged state.  The driver (`run` / the service
+            # loop) decides whether to propagate or report the failure.
             self.solve_dae_step(dt_target, relaxation=relaxation, tol=tol,
-                                max_iter=max_iter)
+                                max_iter=max_iter, line_search=line_search,
+                                raise_on_no_convergence=True)
             return dt_target, {"strategy": "fixed", "rejections": 0,
                                "metric": 0.0,
                                "n_iters": getattr(self, "_last_solve_iters", -1)}
@@ -3887,21 +4257,120 @@ class Model:
         return impl(self, dt_target=dt_target, dt_min=dt_min, dt_max=dt_max,
                     grow=grow, shrink=shrink, max_retries=max_retries,
                     relaxation=relaxation, tol=tol, max_iter=max_iter,
-                    params=params)
+                    line_search=line_search, params=params)
+
+    def iter_run(self, *, stop_time=None, strategy="richardson", dt=None,
+                 dt_min=1e-9, dt_max=None, dt_start=None,
+                 grow=1.5, shrink=0.5, max_retries=20,
+                 relaxation=1.0, tol=1e-6, max_iter=100, line_search=False,
+                 event_eps=1e-6):
+        """Generator kernel shared by `Model.run` and the service run loop.
+
+        Each `next()` selects this step's `dt` (the adaptive `_dt_hint` clipped
+        to `dt_max`, `stop_time` and the next pending event boundary, or the
+        fixed `dt`), takes ONE accepted step via `solve_adaptive_step`, commits
+        it with `next_step()` (recording the per-step wall time / error), and
+        yields the step `info` dict augmented with `{"dt", "step_wall_time"}`.
+
+        Explicit time events (signal jumps / kinks declared by components via
+        `declare_events`, e.g. a `Ramp`'s corners) become *step boundaries*: for
+        each event time ``te`` the adaptive stepper is forced to land at
+        ``te - event_eps`` and ``te + event_eps``, so no committed step ever
+        integrates across the discontinuity.  The tiny crossing step between
+        those two boundaries spans only ``~2*event_eps`` of the jump, which is
+        negligible.  Event clipping applies to the adaptive strategies only;
+        `"fixed"` stepping keeps its constant `dt`.
+
+        The generator is intentionally OPEN-ended: it never decides when to stop.
+        The driver loop owns ALL stop conditions (stop_time / steps / max_steps /
+        wall_budget / cooperative stop) and simply stops pulling from the
+        generator -- which is exactly what lets the service loop interleave
+        socket polling, pause, MPI lock-step, streaming and pacing around each
+        `next()` while `Model.run` keeps its own simpler bookkeeping.  Callers
+        MUST therefore apply their own stop check (e.g. `t >= stop_time`) BEFORE
+        each `next()`, so the final `dt` clip never produces a zero-length step.
+        """
+        name, _ = _normalise_adaptive_strategy(strategy)
+        is_fixed = (name == "fixed")
+        t_start = self.get_t_value()
+        if dt_max is None and not is_fixed:
+            if stop_time is not None:
+                dt_max = (stop_time - t_start) / 20.0
+            elif dt_start is not None or dt is not None:
+                dt_max = 4.0 * (dt_start if dt_start is not None else dt)
+        init_target = (dt if dt is not None
+                       else dt_start if dt_start is not None
+                       else dt_max if dt_max is not None else 1.0)
+
+        # Build the sorted list of event step boundaries (te +/- event_eps) that
+        # fall strictly inside the run window.  `guard` is used both to merge
+        # near-coincident boundaries (avoiding zero-length crossing steps) and
+        # to skip the boundary we have just landed on.
+        guard = event_eps * 1e-3
+        boundaries = []
+        if not is_fixed:
+            for te in (getattr(self, "_event_times", None) or []):
+                for b in (te - event_eps, te + event_eps):
+                    if b <= t_start:
+                        continue
+                    if stop_time is not None and b >= stop_time:
+                        continue
+                    boundaries.append(b)
+            boundaries.sort()
+            if boundaries:
+                merged = [boundaries[0]]
+                for b in boundaries[1:]:
+                    if b - merged[-1] > guard:
+                        merged.append(b)
+                boundaries = merged
+        bptr = 0
+
+        while True:
+            t = self.get_t_value()
+            if is_fixed:
+                dt_try = dt
+            else:
+                dt_try = getattr(self, "_dt_hint", init_target)
+                if dt_max is not None:
+                    dt_try = min(dt_try, dt_max)
+            if stop_time is not None:
+                dt_try = min(dt_try, stop_time - t)
+            # Clip to the next pending event boundary (advancing past any we
+            # have already reached).  `t` is monotonic across yields, so the
+            # pointer never has to rewind.
+            while bptr < len(boundaries) and boundaries[bptr] <= t + guard:
+                bptr += 1
+            if bptr < len(boundaries):
+                dt_try = min(dt_try, boundaries[bptr] - t)
+
+            adaptive_dt_max = dt_max if dt_max is not None else 4.0 * dt_try
+            t_step0 = time.perf_counter()
+            dt_used, info = self.solve_adaptive_step(
+                dt_try, strategy=strategy, dt_min=dt_min,
+                dt_max=adaptive_dt_max, grow=grow, shrink=shrink,
+                max_retries=max_retries, relaxation=relaxation, tol=tol,
+                max_iter=max_iter, line_search=line_search)
+            step_wall_time = time.perf_counter() - t_step0
+            self.next_step(step_wall_time=step_wall_time,
+                           step_error=info.get("metric", np.nan))
+            info = dict(info)
+            info["dt"] = dt_used
+            info["step_wall_time"] = step_wall_time
+            yield info
 
     def run(self, stop_time=None, *, steps=None, strategy="richardson",
             dt=None, dt_min=1e-9, dt_max=None, dt_start=None,
             grow=1.5, shrink=0.5, max_retries=20,
-            relaxation=1.0, tol=1e-6, max_iter=100,
+            relaxation=1.0, tol=1e-6, max_iter=100, line_search=False,
             max_steps=None, wall_budget=None, on_step=None,
-            raise_on_no_convergence=True):
+            raise_on_no_convergence=True, event_eps=1e-6):
         """Integrate from the current time, owning the whole step loop.
 
-        This is the single high-level driver for time integration: it picks
-        each step's `dt` (fixed or via an adaptive `strategy`), takes the step,
-        commits it with `next_step()`, and repeats until a stop condition is
-        met.  Scripts, examples, and the service all share it so the loop and
-        the dt controller are implemented once.
+        This is the high-level driver for scripts/examples: it pulls steps from
+        the shared `iter_run` generator (which picks each step's `dt`, takes the
+        step, and commits it with `next_step()`) and repeats until a stop
+        condition is met.  The service run loop drives the SAME `iter_run`
+        generator, so the per-step dt controller is implemented once.
 
         Stop conditions (give at least one; the loop ends on whichever trips
         first): advance until `t >= stop_time`, or until `steps` accepted steps
@@ -3940,6 +4409,10 @@ class Model:
         raise_on_no_convergence : bool
             If True, a Newton/adaptive failure propagates; if False the loop
             stops and the failure is reported in the returned summary.
+        event_eps : float
+            Half-width of the crossing step forced around each explicit time
+            event (see :meth:`iter_run`); the stepper lands at `te +/- event_eps`
+            so it never integrates across a declared discontinuity.
 
         Returns
         -------
@@ -3957,14 +4430,11 @@ class Model:
             raise ValueError("run(strategy='fixed', ...) requires a dt")
 
         t_start = self.get_t_value()
-        if dt_max is None and not is_fixed:
-            if stop_time is not None:
-                dt_max = (stop_time - t_start) / 20.0
-            elif dt_start is not None or dt is not None:
-                dt_max = 4.0 * (dt_start if dt_start is not None else dt)
-        init_target = (dt if dt is not None
-                       else dt_start if dt_start is not None
-                       else dt_max if dt_max is not None else 1.0)
+        steps_gen = self.iter_run(
+            stop_time=stop_time, strategy=strategy, dt=dt, dt_min=dt_min,
+            dt_max=dt_max, dt_start=dt_start, grow=grow, shrink=shrink,
+            max_retries=max_retries, relaxation=relaxation, tol=tol,
+            max_iter=max_iter, line_search=line_search, event_eps=event_eps)
 
         n_steps = 0
         n_rej = 0
@@ -3987,23 +4457,8 @@ class Model:
                 reason = "wall_budget"
                 break
 
-            if is_fixed:
-                dt_try = dt
-            else:
-                dt_try = getattr(self, "_dt_hint", init_target)
-                if dt_max is not None:
-                    dt_try = min(dt_try, dt_max)
-            if stop_time is not None:
-                dt_try = min(dt_try, stop_time - t)
-
-            adaptive_dt_max = dt_max if dt_max is not None else 4.0 * dt_try
             try:
-                dt_used, info = self.solve_adaptive_step(
-                    dt_try, strategy=strategy, dt_min=dt_min,
-                    dt_max=adaptive_dt_max, grow=grow, shrink=shrink,
-                    max_retries=max_retries, relaxation=relaxation, tol=tol,
-                    max_iter=max_iter)
-                self.next_step()
+                info = next(steps_gen)
             except (NewtonConvergenceFailure, RuntimeError) as e:
                 if raise_on_no_convergence:
                     raise
@@ -4015,7 +4470,8 @@ class Model:
             n_rej += int(info.get("rejections", 0))
             if on_step is not None:
                 cont = on_step(self, {
-                    "step": n_steps, "t": self.get_t_value(), "dt": dt_used,
+                    "step": n_steps, "t": self.get_t_value(),
+                    "dt": info.get("dt"),
                     "rejections": info.get("rejections", 0),
                     "metric": info.get("metric", 0.0), "strategy": name})
                 if cont is False:
@@ -4069,6 +4525,29 @@ class Model:
 # own multi-solve dance (full step + two half-steps) without contorting a
 # single-solve protocol that the simpler strategies would share.
 
+# --- Integration-scheme coefficients --------------------------------------------------
+#
+# Crank-Nicolson is the default closure; `(p0, p1, a, b)` parameterise
+# `DifferentialVariable.declare_equations`.  `set_scheme_coeffs(*_CN_COEFFS)`
+# restores it after the TR-BDF2 stepper borrows the coefficient slots.
+_CN_COEFFS = (1.0, 0.0, 0.5, 0.5)
+
+# TR-BDF2 (gamma = 2 - sqrt(2)).  Trapezoidal sub-step to gamma*dt, then a BDF2
+# sub-step `x = c2*x_n + c1*x_gamma + d*dt*f_{n+1}` to dt.  The trapezoidal and
+# BDF2 stages share the diagonal coefficient `d = 1 - sqrt(2)/2 = gamma/2` (SDIRK).
+_TRBDF2_GAMMA = 2.0 - 2.0 ** 0.5                # 0.5857864376...
+_TRBDF2_C1 = 0.5 + 2.0 ** 0.5 / 2.0            # 1.2071067811...  ( x_gamma )
+_TRBDF2_C2 = 0.5 - 2.0 ** 0.5 / 2.0            # -0.2071067811... ( x_n )
+_TRBDF2_D = 1.0 - 2.0 ** 0.5 / 2.0             # 0.2928932188...  ( dt * f_{n+1} )
+# Embedded error estimate `K * dt * (E0*f_n + E1*f_gamma + E2*f_{n+1})`.  The
+# divided-difference weights E0/E1/E2 and the scalar K are derived so the
+# estimate equals TR-BDF2's leading O(dt^3 * y''') local truncation term.
+_TRBDF2_E0 = 1.0 / _TRBDF2_GAMMA                                    #  1.7071067811...
+_TRBDF2_E1 = -1.0 / (_TRBDF2_GAMMA * (1.0 - _TRBDF2_GAMMA))         # -4.1213203435...
+_TRBDF2_E2 = 1.0 / (1.0 - _TRBDF2_GAMMA)                            #  2.4142135623...
+_TRBDF2_K = 2.0 ** 0.5 - 4.0 / 3.0                                  #  0.0807611844...
+
+
 _DEFAULT_STRATEGY_PARAMS = {
     # `derivative_limit`: 1% relative state change per step is a generous
     # default appropriate for engineering transients; a tighter `rel_tol`
@@ -4086,6 +4565,12 @@ _DEFAULT_STRATEGY_PARAMS = {
     # `richardson`: the half-vs-full mismatch IS the CN local error itself,
     # so `tol_local=1e-4` directly bounds local truncation per step.
     "richardson":         {"tol_local": 1e-4, "atol": 1e-8, "safety": 0.9, "order": 2},
+    # `tr_bdf2`: L-stable, stiffly-accurate second-order one-step method whose
+    # built-in embedded estimate IS the local truncation error, so `tol_local`
+    # bounds local error directly (same calibration as `richardson`) -- but at
+    # ~2 implicit solves/step instead of 3, and without CN's trapezoidal ringing
+    # on stiff/discontinuous transients.
+    "tr_bdf2":            {"tol_local": 1e-4, "atol": 1e-8, "safety": 0.9, "order": 2},
 }
 
 
@@ -4129,7 +4614,7 @@ def _adaptive_scale(x_pre, x_new, atols):
     return np.maximum(np.maximum(np.abs(x_pre), np.abs(x_new)), atols)
 
 
-def _try_step(model, dt, snap, relaxation, tol, max_iter):
+def _try_step(model, dt, snap, relaxation, tol, max_iter, line_search=False):
     """Restore `snap`, attempt a single solve at `dt`, return `(succeeded, dt)`.
 
     Always restores BEFORE attempting so the caller can pass the same `snap`
@@ -4140,14 +4625,16 @@ def _try_step(model, dt, snap, relaxation, tol, max_iter):
     model._restore_state(snap)
     try:
         model.solve_dae_step(dt, relaxation=relaxation, tol=tol,
-                             max_iter=max_iter, raise_on_no_convergence=True)
+                             max_iter=max_iter, raise_on_no_convergence=True,
+                             line_search=line_search)
         return True
     except NewtonConvergenceFailure:
         return False
 
 
 def _strategy_derivative_limit(model, *, dt_target, dt_min, dt_max, grow, shrink,
-                               max_retries, relaxation, tol, max_iter, params):
+                               max_retries, relaxation, tol, max_iter,
+                               line_search, params):
     """(B) Reject when any active variable's per-step relative change exceeds
     `rel_tol`.  Cheapest strategy: zero extra implicit solves per accepted step.
     Best for problems where engineers can express physical limits naturally
@@ -4159,7 +4646,7 @@ def _strategy_derivative_limit(model, *, dt_target, dt_min, dt_max, grow, shrink
     dt = max(dt_min, min(dt_target, dt_max))
     rejections = 0
     for _ in range(max_retries):
-        ok = _try_step(model, dt, snap, relaxation, tol, max_iter)
+        ok = _try_step(model, dt, snap, relaxation, tol, max_iter, line_search)
         if not ok:
             rejections += 1
             dt = max(dt_min, dt * shrink)
@@ -4194,7 +4681,8 @@ def _strategy_derivative_limit(model, *, dt_target, dt_min, dt_max, grow, shrink
 
 
 def _strategy_predictor_corrector(model, *, dt_target, dt_min, dt_max, grow, shrink,
-                                  max_retries, relaxation, tol, max_iter, params):
+                                  max_retries, relaxation, tol, max_iter,
+                                  line_search, params):
     """(P) Compare the implicit Crank-Nicolson result to a cheap explicit-Euler
     predictor `x_pred = x_pre + dt * der_pre` for every `DifferentialVariable`.
     The mismatch IS a calibrated O(dt^2) local-error estimator -- principled
@@ -4209,6 +4697,7 @@ def _strategy_predictor_corrector(model, *, dt_target, dt_min, dt_max, grow, shr
             model, dt_target=dt_target, dt_min=dt_min, dt_max=dt_max,
             grow=grow, shrink=shrink, max_retries=max_retries,
             relaxation=relaxation, tol=tol, max_iter=max_iter,
+            line_search=line_search,
             params={"rel_tol": params["tol_local"], "atol": params["atol"]})
     state_idx = np.array([p[0] for p in pairs])
     der_idx = np.array([p[1] for p in pairs])
@@ -4222,7 +4711,7 @@ def _strategy_predictor_corrector(model, *, dt_target, dt_min, dt_max, grow, shr
     dt = max(dt_min, min(dt_target, dt_max))
     rejections = 0
     for _ in range(max_retries):
-        ok = _try_step(model, dt, snap, relaxation, tol, max_iter)
+        ok = _try_step(model, dt, snap, relaxation, tol, max_iter, line_search)
         if not ok:
             rejections += 1
             dt = max(dt_min, dt * shrink)
@@ -4254,7 +4743,8 @@ def _strategy_predictor_corrector(model, *, dt_target, dt_min, dt_max, grow, shr
 
 
 def _strategy_richardson(model, *, dt_target, dt_min, dt_max, grow, shrink,
-                         max_retries, relaxation, tol, max_iter, params):
+                         max_retries, relaxation, tol, max_iter,
+                         line_search, params):
     """(R) Step-doubling: take one full step at `dt`, restore and take two
     half-steps at `dt/2`, compare.  Costs 3 implicit solves per accepted step
     (vs 1 for the simpler strategies) but gives a properly-calibrated
@@ -4275,7 +4765,7 @@ def _strategy_richardson(model, *, dt_target, dt_min, dt_max, grow, shrink,
     rejections = 0
     for _ in range(max_retries):
         # Full step at dt
-        ok_full = _try_step(model, dt, snap, relaxation, tol, max_iter)
+        ok_full = _try_step(model, dt, snap, relaxation, tol, max_iter, line_search)
         if not ok_full:
             rejections += 1
             dt = max(dt_min, dt * shrink)
@@ -4289,7 +4779,7 @@ def _strategy_richardson(model, *, dt_target, dt_min, dt_max, grow, shrink,
         # half-step we DON'T call next_step() -- we just reuse the existing
         # state as the prev_values for the second half.  This matches what
         # an outer fixed-dt/2 loop would do across two `solve_dae_step` calls.
-        ok1 = _try_step(model, dt / 2, snap, relaxation, tol, max_iter)
+        ok1 = _try_step(model, dt / 2, snap, relaxation, tol, max_iter, line_search)
         if not ok1:
             rejections += 1
             dt = max(dt_min, dt * shrink)
@@ -4301,7 +4791,8 @@ def _strategy_richardson(model, *, dt_target, dt_min, dt_max, grow, shrink,
         ok2 = False
         try:
             model.solve_dae_step(dt / 2, relaxation=relaxation, tol=tol,
-                                 max_iter=max_iter, raise_on_no_convergence=True)
+                                 max_iter=max_iter, raise_on_no_convergence=True,
+                                 line_search=line_search)
             ok2 = True
         except NewtonConvergenceFailure:
             pass
@@ -4338,10 +4829,88 @@ def _strategy_richardson(model, *, dt_target, dt_min, dt_max, grow, shrink,
         f"richardson: exceeded {max_retries} retries (last err={err:.3e})")
 
 
+def _strategy_tr_bdf2(model, *, dt_target, dt_min, dt_max, grow, shrink,
+                      max_retries, relaxation, tol, max_iter,
+                      line_search, params):
+    """(T) TR-BDF2: L-stable, stiffly-accurate, second-order one-step method.
+
+    Each accepted step is two implicit sub-solves (a trapezoidal stage to
+    `gamma*dt` then a BDF2 stage to `dt`); the method's built-in embedded
+    estimate gives a calibrated `O(dt^3)` local-error norm, so the controller
+    uses the standard `dt * safety * (tol/err)^(1/(p+1))` formula (`p=2`).
+
+    Unlike Crank-Nicolson (used by the other strategies), TR-BDF2 damps
+    high-frequency stiff modes monotonically (L-stability) instead of ringing,
+    which makes it the robust default for stiff or sharply-forced transients.
+    Requires at least one `DifferentialVariable`.
+    """
+    diff_state_idx = model._get_diff_state_indices()
+    if diff_state_idx.size == 0:
+        raise RuntimeError(
+            "tr_bdf2 requires at least one DifferentialVariable in the active "
+            "set; use 'predictor_corrector' or 'richardson' for purely "
+            "algebraic / derivative-limited control")
+    pairs = model._get_diff_var_index_pairs()
+    pair_state_idx = np.array([p[0] for p in pairs], dtype=int)
+    pair_der_idx = np.array([p[1] for p in pairs], dtype=int)
+    tol_local = params["tol_local"]
+    atol_global = params["atol"]
+    safety = params["safety"]
+    p = params["order"]                         # TR-BDF2 is order 2
+    atols = model._get_var_atols(atol_global)
+    snap = model._snapshot_state()
+    dt = max(dt_min, min(dt_target, dt_max))
+    rejections = 0
+    err = float("inf")
+    try:
+        for _ in range(max_retries):
+            try:
+                est, est_idx = model._tr_bdf2_step(
+                    dt, snap, diff_state_idx, pair_state_idx, pair_der_idx,
+                    relaxation, tol, max_iter, line_search)
+            except NewtonConvergenceFailure:
+                rejections += 1
+                dt = max(dt_min, dt * shrink)
+                if dt <= dt_min:
+                    raise RuntimeError(
+                        f"tr_bdf2: hit dt_min={dt_min} after Newton "
+                        f"non-convergence ({rejections} rejections)")
+                continue
+            x_pre = snap["values"][est_idx]
+            x_new = model.get_vars_values()[est_idx]
+            scale = _adaptive_scale(x_pre, x_new, atols[est_idx])
+            err = float(np.max(np.abs(est) / scale))
+            ratio = (tol_local / err) ** (1.0 / (p + 1)) if err > 0 else grow
+            dt_next = max(dt_min, min(dt_max, dt * safety * ratio))
+            if err <= tol_local:
+                # Accept.  Restore CN bookkeeping: prev_values must be the
+                # ORIGINAL pre-step state (the TR-BDF2 stage 2 overwrote the
+                # der prev slot with x_gamma).  `iter_run`/`run` then call
+                # `next_step()` to advance prev_values to the new state.
+                model.set_prev_vars_values(snap["prev_values"])
+                model.set_t_prev(snap["t_prev"])
+                model._dt_hint = dt_next
+                return dt, {"strategy": "tr_bdf2", "rejections": rejections,
+                            "metric": err, "n_iters": model._last_solve_iters}
+            rejections += 1
+            dt = max(dt_min, dt_next)           # use the controller's hint
+            if dt <= dt_min:
+                raise RuntimeError(
+                    f"tr_bdf2: hit dt_min={dt_min} with err={err:.3e} "
+                    f"still above tol_local={tol_local}")
+        raise RuntimeError(
+            f"tr_bdf2: exceeded {max_retries} retries (last err={err:.3e})")
+    finally:
+        # Always leave the model on the default Crank-Nicolson closure so any
+        # later solve (other strategies, `initialise`, fixed steps) is well-posed.
+        model.set_scheme_coeffs(*_CN_COEFFS)
+
+
 _ADAPTIVE_STRATEGIES = {
     "derivative_limit":    _strategy_derivative_limit,
     "predictor_corrector": _strategy_predictor_corrector,
     "richardson":          _strategy_richardson,
+    "tr_bdf2":             _strategy_tr_bdf2,
 }
 
 
@@ -4633,8 +5202,33 @@ class DifferentialVariable(Variable):
         self.der_variable = Variable(0.0, None)
 
     def declare_equations(self):
-        # TODO: support more multistep schemes; for now Crank-Nicolson only.
-        eq1 = self.symbol - (self.prev_symbol + 0.5 * self.dt * (self.der_variable.symbol + self.der_variable.prev_symbol))
+        # Generalised one-step closure parameterised by the four global scheme
+        # coefficients (`sch_p0, sch_p1, sch_a, sch_b`):
+        #
+        #     x = p0 * x_prev + dt * a * der + (p1 + dt * b) * der_prev
+        #
+        # This single compiled residual covers every supported integration
+        # method by changing only the runtime coefficient VALUES (and, for
+        # multi-stage methods, the value carried in `der_prev`):
+        #
+        #   Crank-Nicolson : (p0,p1,a,b) = (1, 0, 1/2, 1/2)
+        #   implicit Euler : (p0,p1,a,b) = (1, 0,   1,   0)
+        #   TR-BDF2 stage 1: (p0,p1,a,b) = (1, 0, 1/2, 1/2) with dt -> gamma*dt
+        #   TR-BDF2 stage 2: (p0,p1,a,b) = (c2, c1, d, 0), der_prev := x_gamma
+        #
+        # The TR-BDF2 BDF2 stage `x = c2*x_prev + c1*x_gamma + d*dt*der` reuses
+        # the (otherwise-unused-in-that-stage) `der_prev` slot to carry the
+        # trapezoidal stage value `x_gamma`; that keeps the closure to a single
+        # extra-history slot without growing the state vector.
+        x       = self.symbol
+        x_prev  = self.prev_symbol
+        der     = self.der_variable.symbol
+        der_prev = self.der_variable.prev_symbol
+        eq1 = x - (
+            self.sch_p0 * x_prev
+            + self.dt * self.sch_a * der
+            + (self.sch_p1 + self.dt * self.sch_b) * der_prev
+        )
         return [eq1]
 
     def get_derivative_variable(self):

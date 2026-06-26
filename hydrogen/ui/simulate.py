@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 
-from .qt import QtCore, QtWidgets, Signal
+from .qt import QtCore, QtGui, QtWidgets, Signal
 from .session import SimulationSession
 
 __all__ = [
@@ -53,6 +53,9 @@ _INITIALISE_OPTS = [
      "tip": "Newton convergence tolerance."},
     {"name": "max_iter", "type": "int", "default": 200,
      "tip": "Max Newton iterations."},
+    {"name": "line_search", "type": "bool", "default": False,
+     "tip": "Feasibility-guarded backtracking line search (damps Newton "
+            "overshoots into infeasible thermodynamic states)."},
 ]
 #: The Simulation tab mixes the stepping strategy, the `stop_time` that drives
 #: the run, and the adaptive controller knobs.  The run length is ALWAYS set by
@@ -61,8 +64,10 @@ _INITIALISE_OPTS = [
 #: `tol_local` / `atol` only apply to richardson.
 _SIMULATE_OPTS = [
     {"name": "strategy", "type": "choice", "default": "richardson",
-     "choices": ["richardson", "predictor_corrector", "derivative_limit", "fixed"],
-     "tip": "Time-stepping rule. 'fixed' needs dt; the others self-adapt."},
+     "choices": ["richardson", "tr_bdf2", "predictor_corrector",
+                 "derivative_limit", "fixed"],
+     "tip": "Time-stepping rule. 'tr_bdf2' is L-stable (robust on stiff "
+            "transients); 'fixed' needs dt; the others self-adapt."},
     {"name": "stop_time", "type": "float", "default": 1.0,
      "tip": "Integrate until model time reaches this [s]. Drives the run."},
     {"name": "dt", "type": "float", "default": None,
@@ -85,10 +90,13 @@ _SIMULATE_OPTS = [
      "tip": "Newton tolerance per internal solve."},
     {"name": "max_iter", "type": "int", "default": 200,
      "tip": "Max Newton iterations per internal solve."},
+    {"name": "line_search", "type": "bool", "default": False,
+     "tip": "Feasibility-guarded backtracking line search per internal solve "
+            "(damps Newton overshoots into infeasible thermodynamic states)."},
     {"name": "tol_local", "type": "float", "default": 1e-3,
-     "tip": "richardson: local error tolerance (relative)."},
+     "tip": "richardson / tr_bdf2: local error tolerance (relative)."},
     {"name": "atol", "type": "float", "default": 1.0,
-     "tip": "richardson: absolute error floor."},
+     "tip": "richardson / tr_bdf2: absolute error floor."},
 ]
 #: run() top-level kwargs vs. the `adaptive=` controller dict (everything else).
 _RUN_TOPLEVEL = {"stop_time", "dt"}
@@ -136,7 +144,7 @@ def run_kwargs(options: dict) -> dict:
     strat = {"name": sim.pop("strategy", "richardson")}
     for key in _STRATEGY_PARAMS:
         val = sim.pop(key, None)
-        if val is not None and strat["name"] == "richardson":
+        if val is not None and strat["name"] in ("richardson", "tr_bdf2"):
             strat[key] = val
     top = {key: sim.pop(key) for key in list(sim) if key in _RUN_TOPLEVEL}
     # Whatever remains are the adaptive controller knobs.
@@ -256,6 +264,11 @@ class LogPanel(QtWidgets.QWidget):
         self._view = QtWidgets.QPlainTextEdit()
         self._view.setReadOnly(True)
         self._view.setMaximumBlockCount(10000)   # cap memory on long runs
+        # Host output includes ASCII-aligned tables (e.g. the instantiation
+        # timing breakdown), which only line up in a fixed-width font.
+        self._view.setFont(
+            QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        self._view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         v.addWidget(self._view, 1)
 
     def _passes(self, level: str, text: str) -> bool:
@@ -404,6 +417,12 @@ class SimulateDialog(QtWidgets.QDialog):
         self._op_label = "build"            # current operation, for the cancel label
         self._cancelling = False            # an abort is in flight
         self._close_after = False           # close the window once the worker stops
+        # Polls the host's streamed log events (`instantiate` / `run` progress)
+        # onto the GUI thread while a worker thread is blocked in a host call,
+        # so the log fills continuously instead of in one burst at the end.
+        self._log_pump = QtCore.QTimer(self)
+        self._log_pump.setInterval(120)
+        self._log_pump.timeout.connect(self._pump_logs)
         self.setWindowTitle("Simulate via hydrogen service")
 
         outer = QtWidgets.QVBoxLayout(self)
@@ -488,6 +507,11 @@ class SimulateDialog(QtWidgets.QDialog):
         worker.finished.connect(worker.deleteLater)
         self._worker = worker
         worker.start()
+        self._log_pump.start()             # stream host logs while the worker blocks
+
+    def _pump_logs(self):
+        """Forward any host log events queued so far onto the GUI thread."""
+        self._session.poll_logs(self._log)
 
     def _on_build_clicked(self):
         """Build, or -- if a build/run is in flight -- cancel it."""
@@ -525,6 +549,8 @@ class SimulateDialog(QtWidgets.QDialog):
         self._finalize_worker()
 
     def _finalize_worker(self):
+        self._log_pump.stop()
+        self._pump_logs()                  # flush any stragglers since the last tick
         self._worker = None
         self._cancelling = False
         self._refresh_status()

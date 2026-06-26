@@ -632,11 +632,13 @@ class SystemProxy:
         """Compile the DAE (symbol assignment, lambdify, BLT). Heavy step."""
         return self._conn.call("instantiate", system_id=self.system_id, **options)
 
-    def initialise(self, n=1, relaxation=1.0, tol=1e-6, max_iter=100):
+    def initialise(self, n=1, relaxation=1.0, tol=1e-6, max_iter=100,
+                   line_search=False):
         """Solve to a Newton-consistent state at t = 0."""
         return self._conn.call(
             "initialise", system_id=self.system_id, n=n,
             relaxation=relaxation, tol=tol, max_iter=max_iter,
+            line_search=line_search,
         )
 
     def step(self, dt, **kw):
@@ -655,13 +657,15 @@ class SystemProxy:
         :meth:`Model.solve_adaptive_step`:
 
         * ``None`` / ``"fixed"`` -- classic fixed-``dt`` loop (``dt`` required).
-        * ``"richardson"`` / ``"derivative_limit"`` / ``"predictor_corrector"``
-          (or a ``{"name": ..., **params}`` dict) -- the host adapts ``dt``
-          internally; ``dt`` is only the first target.
+        * ``"richardson"`` / ``"tr_bdf2"`` / ``"predictor_corrector"`` /
+          ``"derivative_limit"`` (or a ``{"name": ..., **params}`` dict) -- the
+          host adapts ``dt`` internally; ``dt`` is only the first target.
+          ``"tr_bdf2"`` is the L-stable, stiffly-accurate method (robust on
+          stiff / sharply-forced transients where Crank-Nicolson rings).
 
         ``adaptive`` is an optional dict of controller knobs forwarded to the
         host: ``dt_min``, ``dt_max``, ``dt_start``, ``grow``, ``shrink``,
-        ``max_retries``, ``relaxation``, ``tol``, ``max_iter``.
+        ``max_retries``, ``relaxation``, ``tol``, ``max_iter``, ``line_search``.
 
         With ``stream=True`` the call returns immediately after the host
         acknowledges; ``status`` progress events then flow asynchronously

@@ -230,7 +230,13 @@ def serialize_medium(medium: CoolPropMedium) -> dict:
 
 
 def make_medium(spec: dict) -> CoolPropMedium:
-    """Rebuild a `CoolPropMedium` from a media-table entry."""
+    """Rebuild a `CoolPropMedium` from a media-table entry.
+
+    If the requested backend can't be built for the fluid (e.g. a tabular
+    ``BICUBIC&HEOS`` backend for a fluid CoolProp can't tabulate), fall back to
+    the reference ``HEOS`` solver rather than failing the whole instantiate --
+    correctness over speed.
+    """
     if "fluid" not in spec:
         raise KeyError("medium spec is missing the 'fluid' field")
     kwargs = {}
@@ -240,7 +246,13 @@ def make_medium(spec: dict) -> CoolPropMedium:
         kwargs["disable_warnings"] = bool(spec["disable_warnings"])
     if spec.get("scalar_cache_maxsize") is not None:
         kwargs["scalar_cache_maxsize"] = spec["scalar_cache_maxsize"]
-    return CoolPropMedium(spec["fluid"], **kwargs)
+    try:
+        return CoolPropMedium(spec["fluid"], **kwargs)
+    except Exception:
+        if kwargs.get("backend", "HEOS") == "HEOS":
+            raise
+        kwargs["backend"] = "HEOS"
+        return CoolPropMedium(spec["fluid"], **kwargs)
 
 
 def package_for_class(cls: type) -> str | None:

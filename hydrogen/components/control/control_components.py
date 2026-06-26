@@ -178,6 +178,10 @@ class Step(_TimeSource):
     def signal(self, t):
         return self.offset + (self.height if t >= self.start_time else 0.0)
 
+    def declare_events(self):
+        # The output jumps by `height` at `start_time`; integrate around it.
+        return [self.start_time]
+
 
 class Ramp(_TimeSource):
     """Ramp signal: flat ``offset``, linear rise of ``height`` over ``duration``, then flat."""
@@ -211,6 +215,11 @@ class Ramp(_TimeSource):
             return self.offset + self.height
         return self.offset + self.height * (t - self.start_time) / self.duration
 
+    def declare_events(self):
+        # Slope kinks at both ends of the linear rise (output is continuous but
+        # its derivative jumps), which is exactly where Richardson would stall.
+        return [self.start_time, self.start_time + self.duration]
+
 
 class Sine(_TimeSource):
     """Sine signal: ``y = offset + amplitude * sin(2*pi*freq*t + phase)`` for ``t >= start_time``."""
@@ -242,6 +251,75 @@ class Sine(_TimeSource):
             return self.offset
         return self.offset + self.amplitude * math.sin(
             2.0 * math.pi * self.freq * (t - self.start_time) + self.phase)
+
+    def declare_events(self):
+        # Switch-on at `start_time`: a kink (and a value jump if the initial
+        # phase is non-zero).  No event for the smooth sine that follows.
+        return [self.start_time]
+
+
+class SmoothRamp(_TimeSource):
+    """Ramp with rounded corners -- a C-infinity alternative to `Ramp`.
+
+    Same overall shape as `Ramp` (flat ``offset``, a rise of ``height`` spread
+    over ``duration`` from ``start_time``, then flat) but the two sharp corners
+    of the linear ramp are smoothed with a ``tanh`` blend of width ``corner``
+    (a fraction of ``duration``).  It is the integral of a smoothed boxcar rate
+    ``0.5*(height/duration)*[tanh((t-a)/w) - tanh((t-b)/w)]`` with
+    ``a=start_time``, ``b=start_time+duration`` and ``w=corner*duration``:
+
+        y(t) = offset + height/2
+               + 0.5*(height/duration)*w*[logcosh((t-a)/w) - logcosh((t-b)/w)]
+
+    Because it has no kinks, it needs **no events**: the adaptive controller
+    sails through it on a smooth local-error estimate.  Use it instead of a
+    `Ramp` when a slightly rounded command is acceptable and you would rather
+    avoid event handling entirely.  As ``corner -> 0`` it converges to `Ramp`.
+    """
+
+    UI_ICON = "ramp.svg"
+
+    def __init__(
+        self,
+        height: Annotated[float, ParamSpec("Total rise over the ramp.")] = 1.0,
+        duration: Annotated[float, ParamSpec("Time taken for the (rounded) "
+                           "rise (> 0).", unit="s")] = 1.0,
+        start_time: Annotated[float, ParamSpec("Time about which the rise "
+                             "begins.", unit="s")] = 0.0,
+        offset: Annotated[float, ParamSpec("Baseline output before the "
+                         "ramp.")] = 0.0,
+        corner: Annotated[float, ParamSpec("Corner-rounding width as a fraction "
+                         "of duration (0 < corner <= 0.5); smaller is sharper.")]
+        = 0.1,
+        unit=None,
+    ):
+        if duration <= 0.0:
+            raise ValueError("SmoothRamp duration must be > 0")
+        if not 0.0 < corner <= 0.5:
+            raise ValueError("SmoothRamp corner must be in (0, 0.5]")
+        self.height = height
+        self.duration = duration
+        self.start_time = start_time
+        self.offset = offset
+        self.corner = corner
+        self.unit = unit
+        super().__init__()
+
+    @staticmethod
+    def _logcosh(x):
+        # Numerically stable log(cosh(x)) = |x| + log((1 + exp(-2|x|))/2),
+        # avoiding cosh overflow for large |x|.
+        ax = abs(x)
+        return ax + math.log1p(math.exp(-2.0 * ax)) - math.log(2.0)
+
+    def signal(self, t):
+        w = self.corner * self.duration
+        a = self.start_time
+        b = self.start_time + self.duration
+        slope = self.height / self.duration
+        return (self.offset + 0.5 * self.height
+                + 0.5 * slope * w
+                * (self._logcosh((t - a) / w) - self._logcosh((t - b) / w)))
 
 
 # ---------------------------------------------------------------------------

@@ -548,7 +548,8 @@ class _Engine:
     def _cmd_initialise(self, req_id, args):
         rt = self._require(args["system_id"])
         n = args.get("n", 1)
-        kw = {k: args[k] for k in ("relaxation", "tol", "max_iter") if k in args}
+        kw = {k: args[k] for k in
+              ("relaxation", "tol", "max_iter", "line_search") if k in args}
         self._broadcast({"op": "initialise", "sid": rt.id, "n": n, "kw": kw})
         with _capture_logs(self._bus, rt.id, self._rank):
             rt.model.initialise(n=n, **kw)
@@ -832,18 +833,24 @@ class _Engine:
         model = rt.model
         is_fixed = (strategy is None or strategy == "fixed"
                     or (isinstance(strategy, dict) and strategy.get("name") == "fixed"))
-        # Controller knobs + the forward-carried dt target (mirrors Model.run).
+        # Controller knobs forwarded to the shared `Model.iter_run` generator;
+        # `dt_start` defaults to the fixed `dt` so an adaptive run started
+        # without an explicit target still has a sensible first step.
         dt_min = adaptive.get("dt_min", 1e-9)
         dt_max = adaptive.get("dt_max")
         dt_start = adaptive.get("dt_start", dt)
-        if dt_max is None and not is_fixed and stop_time is not None:
-            dt_max = (stop_time - _t_value(model)) / 20.0
-        init_target = (dt_start if dt_start is not None
-                       else dt_max if dt_max is not None
-                       else (dt if dt is not None else 1.0))
         extra = {k: adaptive[k] for k in
-                 ("grow", "shrink", "max_retries", "relaxation", "tol", "max_iter")
+                 ("grow", "shrink", "max_retries", "relaxation", "tol",
+                  "max_iter", "line_search")
                  if k in adaptive}
+        # Drive the SAME per-step kernel as `Model.run`; the service loop only
+        # adds the interleaved socket polling / pause / MPI lock-step /
+        # streaming / pacing around each `next()`.  `strategy is None` means a
+        # fixed run on the host, so normalise it to "fixed" for the generator
+        # (which otherwise reads None as the predictor-corrector default).
+        steps_gen = model.iter_run(
+            stop_time=stop_time, strategy=("fixed" if is_fixed else strategy),
+            dt=dt, dt_min=dt_min, dt_max=dt_max, dt_start=dt_start, **extra)
 
         # Poll the command socket between steps so `stop` is honoured at a step
         # boundary (never mid-solve). Only rank 0 owns the socket.
@@ -870,25 +877,12 @@ class _Engine:
                 if not go:
                     break
                 step_start = time.monotonic()
-                # Pick this step's dt: fixed, or the adaptive controller's
-                # forward hint, clipped so the last step lands on stop_time.
-                if is_fixed:
-                    dt_try = dt
-                else:
-                    dt_try = getattr(model, "_dt_hint", init_target)
-                    if dt_max is not None:
-                        dt_try = min(dt_try, dt_max)
-                if stop_time is not None:
-                    dt_try = min(dt_try, stop_time - _t_value(model))
+                # One accepted step from the shared kernel (dt selection +
+                # solve + commit live inside the generator).
                 try:
-                    if is_fixed:
-                        model.solve_dae_step(dt_try, raise_on_no_convergence=True)
-                    else:
-                        model.solve_adaptive_step(
-                            dt_try, strategy=strategy, dt_min=dt_min,
-                            dt_max=(dt_max if dt_max is not None else 4.0 * dt_try),
-                            **extra)
-                    model.next_step()
+                    next(steps_gen)
+                except StopIteration:
+                    break
                 except Exception as exc:  # noqa: BLE001
                     rt.phase = "error"
                     self._emit_error(rt, exc)

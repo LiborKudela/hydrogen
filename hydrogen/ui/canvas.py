@@ -87,6 +87,7 @@ class Canvas(QtWidgets.QGraphicsView):
         super().__init__()
         self._by_type = by_type
         self._on_status = on_status
+        self._media_provider = None        # () -> list[str] of defined media keys
         self._counter = 0
         self._connections: list[ConnectionItem] = []
         self._pending: PortItem | None = None   # source port of an in-flight wire
@@ -615,8 +616,14 @@ class Canvas(QtWidgets.QGraphicsView):
             self._on_status(f"Removed '{node.comp_id}'  "
                             f"({self.node_count()} on canvas)")
 
+    def set_media_provider(self, fn):
+        """Register a callable returning the project's defined media keys, used
+        to populate the medium selector in the per-node properties dialog."""
+        self._media_provider = fn
+
     def open_properties(self, node: NodeItem):
-        dlg = PropertiesDialog(node, parent=self)
+        media_keys = self._media_provider() if self._media_provider else None
+        dlg = PropertiesDialog(node, media_keys=media_keys, parent=self)
         if exec_(dlg):
             changed = node.sync_ports()
             self._on_status(

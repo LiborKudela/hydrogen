@@ -63,6 +63,11 @@ class SimulationSession:
     def __init__(self):
         self._service = None             # hd.HostService
         self._sysp = None                # hd.SystemProxy (the live model)
+        # The proxy of a build that is currently compiling on the host.  It is
+        # exposed (separately from `_sysp`, which is only set once the build
+        # commits) so `poll_logs` can stream the host's `instantiate` progress
+        # live while the worker thread is blocked in the call.
+        self._inflight = None
         self._sig: str | None = None     # structural signature of the built model
         self._params: dict = {}          # {comp_id: {pure_name: value}} as built
         self._inst_kw: dict | None = None
@@ -195,22 +200,30 @@ class SimulationSession:
 
         text = json.dumps(system)
         sysp = service.load_json(text)
-        log(f"instantiating model with {inst_kw} … (compiling DAE)", "status")
-        sysp.instantiate(**inst_kw)        # blocking; abort() kills the host -> raises
-
-        # Commit only if we weren't aborted/reset while compiling; otherwise the
-        # host is gone and this proxy is dead, so discard it.
+        # Publish the in-flight proxy so the UI's log pump can stream the host's
+        # `instantiate` diagnostics live while we block in the call below.
         with self._lock:
-            if self._gen != gen:
-                try:
-                    sysp.close()
-                except Exception:
-                    pass
-                raise RuntimeError("build cancelled")
-            self._sysp = sysp
-            self._sig = sig
-            self._inst_kw = dict(inst_kw)
-            self._params = self._pure_params(system)
+            self._inflight = sysp
+        try:
+            log(f"instantiating model with {inst_kw} … (compiling DAE)", "status")
+            sysp.instantiate(**inst_kw)    # blocking; abort() kills the host -> raises
+
+            # Commit only if we weren't aborted/reset while compiling; otherwise
+            # the host is gone and this proxy is dead, so discard it.
+            with self._lock:
+                if self._gen != gen:
+                    try:
+                        sysp.close()
+                    except Exception:
+                        pass
+                    raise RuntimeError("build cancelled")
+                self._sysp = sysp
+                self._sig = sig
+                self._inst_kw = dict(inst_kw)
+                self._params = self._pure_params(system)
+        finally:
+            with self._lock:
+                self._inflight = None
         self._drain(log)
         log("model built and kept alive on the host.", "status")
 
@@ -245,6 +258,7 @@ class SimulationSession:
                 except Exception:
                     pass
                 self._sysp = None
+            self._inflight = None
             self._sig = None
             self._params = {}
             self._inst_kw = None
@@ -273,6 +287,7 @@ class SimulationSession:
             svc = self._service
             self._service = None
             self._sysp = None
+            self._inflight = None
             self._sig = None
             self._params = {}
             self._inst_kw = None
@@ -283,12 +298,11 @@ class SimulationSession:
                 pass
 
     # --- events ------------------------------------------------------------ #
-    def _drain(self, log: LogFn):
-        """Forward any queued host events (logs / warnings / errors) to the
+    @staticmethod
+    def _forward_events(sysp, log: LogFn):
+        """Drain a proxy's queued host events (logs / warnings / errors) to the
         log sink, tagged by level."""
-        if self._sysp is None:
-            return
-        for ev in self._sysp.poll_events():
+        for ev in sysp.poll_events():
             if ev.get("type") == "log":
                 message = ev.get("message", "")
                 level = ev.get("level") or ""
@@ -299,3 +313,29 @@ class SimulationSession:
             elif ev.get("type") == "error":
                 log(f"  [host error] {ev.get('kind')}: {ev.get('message')}",
                     "error")
+
+    def _drain(self, log: LogFn):
+        """Forward queued host events for the committed model (if any)."""
+        if self._sysp is None:
+            return
+        self._forward_events(self._sysp, log)
+
+    def poll_logs(self, log: LogFn):
+        """Stream any host events queued so far for the active model -- the one
+        being built *or* the committed one.
+
+        Safe (and intended) to call repeatedly from the GUI thread while a
+        worker thread is blocked in a host call: the host emits its ``print``
+        diagnostics line-by-line over the wire, so polling here surfaces
+        ``instantiate`` / ``run`` progress *as it happens* instead of in one
+        burst when the blocking call finally returns.
+        """
+        with self._lock:
+            sysp = self._sysp or self._inflight
+        if sysp is None:
+            return
+        try:
+            self._forward_events(sysp, log)
+        except Exception:
+            # A teardown (abort) can close the proxy mid-poll; ignore.
+            pass

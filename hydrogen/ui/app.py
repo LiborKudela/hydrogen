@@ -18,6 +18,7 @@ from .canvas import Canvas
 from .catalog import ComponentTree
 from .home import HomeScreen
 from .items import NodeItem
+from .media import MediaManagerDialog, default_media_spec
 from .project import is_project, make_project
 from .qt import QtCore, QtGui, QtSvg, QtWidgets, exec_
 from .recent import add_recent_file, recent_files, remove_recent_file
@@ -65,6 +66,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._by_type = {e["type"]: e for e in catalog}
         self._path: str | None = None             # current project file
         self._sim_options = default_sim_options()  # persisted run settings
+        self._media = {"Hydrogen": default_media_spec("Hydrogen")}  # shared fluids
         self._session = SimulationSession()        # long-lived host + model
         self.setWindowTitle("hydrogen — component palette")
         self._build_menu()
@@ -96,8 +98,13 @@ class MainWindow(QtWidgets.QMainWindow):
         ll.addWidget(self._filter)
         ll.addWidget(self._tree, 1)
 
-        # Right: canvas + toolbar (Settings / Simulate / Clear).
+        # Right: canvas + toolbar (Media / Settings / Simulate / Clear).
         self._canvas = Canvas(self._by_type, self._set_status)
+        self._canvas.set_media_provider(lambda: list(self._media))
+        media_btn = QtWidgets.QPushButton("Media")
+        media_btn.setToolTip("Manage the shared CoolProp fluids (backend, cache) "
+                             "the components reference.")
+        media_btn.clicked.connect(self._edit_media)
         sim_settings = QtWidgets.QPushButton("⚙ Settings")
         sim_settings.setToolTip("Edit the instantiate / initialise / simulate "
                                 "options used by every run.")
@@ -146,6 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(fit)
         bar.addWidget(self._markers_btn)
         bar.addStretch(1)
+        bar.addWidget(media_btn)
         bar.addWidget(sim_settings)
         bar.addWidget(simulate)
         bar.addWidget(clear)
@@ -327,6 +335,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._canvas.clear_nodes()
         self._session.reset()
         self._sim_options = default_sim_options()
+        self._media = {"Hydrogen": default_media_spec("Hydrogen")}
         self._path = None
         self._show_editor()
         self._update_title()
@@ -354,6 +363,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._canvas.load_project(data.get("canvas", {}))
         self._session.reset()
         self._sim_options = data.get("sim_options") or default_sim_options()
+        # v2 persists the media table; v1 files don't, so synthesise one from the
+        # loaded components' medium names (fast defaults) for backward compat.
+        self._media = data.get("media") or self._media_from_nodes()
         self._path = path
         add_recent_file(path)
         self._show_editor()
@@ -395,7 +407,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._write_project(path)
 
     def _write_project(self, path: str):
-        project = make_project(self._canvas.to_project(), self._sim_options)
+        project = make_project(self._canvas.to_project(), self._sim_options,
+                               self._media)
         try:
             Path(path).write_text(json.dumps(project, indent=2))
         except Exception as exc:
@@ -472,9 +485,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if node.params is not None:
                 template["params"] = node.params
             if spec["needs_medium"]:
-                name = node.medium or "Hydrogen"
-                template["medium"] = name
-                media.setdefault(name, {"fluid": name})
+                key = node.medium or "Hydrogen"
+                template["medium"] = key
+                # Pull the shared definition from the project media table; a key
+                # the table doesn't know yet (e.g. typed straight into a node)
+                # gets the fast defaults.
+                media.setdefault(
+                    key, dict(self._media.get(key) or default_media_spec(key)))
             components[node.comp_id] = template
         connections = [
             {"from": f"{c.src.node.comp_id}.{c.src.pname}",
@@ -488,6 +505,38 @@ class MainWindow(QtWidgets.QMainWindow):
             "components": components,
             "connections": connections,
         }
+
+    # --- media table ------------------------------------------------------- #
+    def _referenced_media_keys(self) -> set[str]:
+        """Medium keys currently referenced by canvas components."""
+        keys: set[str] = set()
+        for node in self._canvas.nodes():
+            if hd.component_spec(node.type_name)["needs_medium"]:
+                keys.add(node.medium or "Hydrogen")
+        return keys
+
+    def _media_from_nodes(self) -> dict:
+        """Synthesise a media table from the components' medium names (used to
+        migrate v1 projects that predate the persisted table)."""
+        keys = self._referenced_media_keys()
+        if not keys:
+            return {"Hydrogen": default_media_spec("Hydrogen")}
+        return {k: default_media_spec(k) for k in sorted(keys)}
+
+    def _edit_media(self):
+        # Seed entries for any referenced-but-undefined key so the manager shows
+        # everything actually in use.
+        used = self._referenced_media_keys()
+        for key in used:
+            self._media.setdefault(key, default_media_spec(key))
+        if not self._media:
+            self._media = {"Hydrogen": default_media_spec("Hydrogen")}
+        dlg = MediaManagerDialog(self._media, used_keys=used, parent=self)
+        if exec_(dlg):
+            self._media = dlg.media()
+            # Media is part of the structural signature, so the next run rebuilds
+            # automatically; no manual session reset needed.
+            self._set_status("Media updated.")
 
     def _edit_sim_settings(self):
         nodes = self._canvas.nodes()
