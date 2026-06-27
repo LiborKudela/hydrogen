@@ -4,7 +4,7 @@ The top-level package exposes the modelling *framework* and tooling:
 
     from hydrogen import (
         Model, Parameter, Variable, DifferentialVariable, Input,  # framework
-        CoolPropMedium,                                          # medium
+        CoolPropMedium, FeosMedium,                              # media
         Interpolation1D, Interpolation2D,                        # interpolation utilities
         IntegrationTest, SimpleODE, InnerODE_1, InnerODE_2,      # ODE test sub-models
         plot_results,                                            # plotting
@@ -27,7 +27,7 @@ Lower-level helpers (`numpy_cache`, `lambdify_compat`, `fast_*`) live in their
 respective submodules; import directly from there if you need them.
 """
 
-from .medium import CoolPropMedium, get_symbolic_property_function
+from .medium import CoolPropMedium, FeosMedium, get_symbolic_property_function
 from .model import (
     DifferentialVariable,
     EquationCacheValidationError,
@@ -69,6 +69,7 @@ __all__ = [
     "set_equation_cache_validation",
     # medium
     "CoolPropMedium",
+    "FeosMedium",
     "get_symbolic_property_function",
     # port machinery (generic)
     "Port",

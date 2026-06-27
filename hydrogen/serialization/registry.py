@@ -27,7 +27,7 @@ import sys
 import types
 import typing
 
-from ..medium import CoolPropMedium
+from ..medium import CoolPropMedium, FeosMedium
 from ..model import Model
 from ..paramspec import cache_key_flag_names, merged_param_specs
 
@@ -219,8 +219,21 @@ def build_registry(spec: dict | None, errors: list) -> dict[str, type]:
 # --- media -----------------------------------------------------------------
 
 
-def serialize_medium(medium: CoolPropMedium) -> dict:
-    """Capture the constructor-relevant state of a `CoolPropMedium`."""
+def serialize_medium(medium) -> dict:
+    """Capture the constructor-relevant state of a medium.
+
+    The ``provider`` field selects the backend on rebuild (``"coolprop"`` or
+    ``"feos"``); it is omitted for the default CoolProp backend so existing
+    project files round-trip byte-for-byte.
+    """
+    if isinstance(medium, FeosMedium):
+        return {
+            "provider": "feos",
+            "fluid": medium.medium,
+            "disable_warnings": bool(getattr(medium, "disable_warnings", False)),
+            "scalar_cache_maxsize": getattr(medium, "scalar_cache_maxsize", None),
+            "transport": getattr(medium, "transport", "coolprop"),
+        }
     return {
         "fluid": medium.medium,
         "backend": medium.backend,
@@ -229,16 +242,29 @@ def serialize_medium(medium: CoolPropMedium) -> dict:
     }
 
 
-def make_medium(spec: dict) -> CoolPropMedium:
-    """Rebuild a `CoolPropMedium` from a media-table entry.
+def make_medium(spec: dict):
+    """Rebuild a medium from a media-table entry.
 
-    If the requested backend can't be built for the fluid (e.g. a tabular
-    ``BICUBIC&HEOS`` backend for a fluid CoolProp can't tabulate), fall back to
-    the reference ``HEOS`` solver rather than failing the whole instantiate --
-    correctness over speed.
+    Dispatches on the optional ``provider`` field (defaults to ``"coolprop"``).
+    For the CoolProp backend, if the requested backend can't be built for the
+    fluid (e.g. a tabular ``BICUBIC&HEOS`` backend for a fluid CoolProp can't
+    tabulate), fall back to the reference ``HEOS`` solver rather than failing the
+    whole instantiate -- correctness over speed.
     """
     if "fluid" not in spec:
         raise KeyError("medium spec is missing the 'fluid' field")
+
+    provider = (spec.get("provider") or "coolprop").lower()
+    if provider == "feos":
+        kwargs = {}
+        if "disable_warnings" in spec:
+            kwargs["disable_warnings"] = bool(spec["disable_warnings"])
+        if spec.get("scalar_cache_maxsize") is not None:
+            kwargs["scalar_cache_maxsize"] = spec["scalar_cache_maxsize"]
+        if spec.get("transport"):
+            kwargs["transport"] = spec["transport"]
+        return FeosMedium(spec["fluid"], **kwargs)
+
     kwargs = {}
     if "backend" in spec and spec["backend"] is not None:
         kwargs["backend"] = spec["backend"]

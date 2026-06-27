@@ -7,8 +7,8 @@
       {
         "comp_id": "ramp_6",
         "type": "hydrogen.control.Ramp",
-        "x": 1102.9191651125666,
-        "y": 449.88671757865063,
+        "x": 1022.8521367969888,
+        "y": 410.37733077499615,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -32,14 +32,14 @@
           ]
         },
         "ports": {},
-        "w": 72.19987520179257,
-        "h": 55.80074878924438
+        "w": 150.0,
+        "h": 78.0
       },
       {
         "comp_id": "pressuresource_5",
         "type": "hydrogen.thermofluid.PressureSource",
-        "x": 890.1096804488067,
-        "y": 565.8269564127914,
+        "x": 881.1096804488066,
+        "y": 544.8269564127913,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -53,8 +53,8 @@
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            0.0,
-            0.0
+            -1.0,
+            27.0
           ],
           "params": [
             0.0,
@@ -76,8 +76,8 @@
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            -24.26774825113057,
-            112.00499192829477
+            0.7322517488694302,
+            96.00499192829477
           ],
           "params": [
             0.0,
@@ -99,8 +99,8 @@
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            -55.069121031411555,
-            2.800124798207378
+            2.930878968588445,
+            39.80012479820738
           ],
           "params": [
             98.00436793725794,
@@ -122,12 +122,12 @@
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            0.0,
-            0.0
+            12.0,
+            28.0
           ],
           "params": [
-            0.0,
-            0.0
+            -5.0,
+            -21.0
           ]
         },
         "ports": {}

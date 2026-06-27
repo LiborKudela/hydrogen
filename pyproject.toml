@@ -25,6 +25,9 @@ hydrogen-ui = "hydrogen.ui.app:main"
 dev = ["pytest>=7"]
 examples = ["matplotlib>=3.7"]
 mpi = ["mpi4py>=3.1"]
+# Optional feos-backed medium (FeosMedium). CoolProp remains the default
+# backend, so these are only needed when a project selects provider="feos".
+feos = ["feos>=0.9", "si-units>=0.11"]
 docs = [
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.25",

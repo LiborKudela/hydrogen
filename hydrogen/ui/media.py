@@ -21,12 +21,18 @@ from functools import lru_cache
 from .qt import QtCore, QtGui, QtWidgets
 
 __all__ = ["MediaManagerDialog", "default_media_spec", "BACKENDS",
-           "fluid_status"]
+           "PROVIDERS", "fluid_status"]
 
 #: CoolProp backends offered in the manager, fastest engineering-grade first.
 #: ``BICUBIC&HEOS`` / ``TTSE&HEOS`` are tabular (≈50-60x faster per property,
 #: ~1e-4 accuracy); ``HEOS`` is the full reference equation-of-state solver.
 BACKENDS = ["BICUBIC&HEOS", "TTSE&HEOS", "HEOS"]
+
+#: Thermophysical backends.  ``coolprop`` is the reference default; ``feos``
+#: uses the feos equation of state (Peng-Robinson built from CoolProp critical
+#: constants) for thermodynamics and delegates transport to CoolProp.  The
+#: ``Backend`` column only applies to ``coolprop``.
+PROVIDERS = ["coolprop", "feos"]
 
 
 def default_media_spec(fluid: str) -> dict:
@@ -88,8 +94,13 @@ class MediaManagerDialog(QtWidgets.QDialog):
     after an accepted exec to get the edited table.
     """
 
-    _COLS = ("Key", "Fluid", "Backend", "Cache size", "Disable warnings", "")
-    _STATUS_COL = 5
+    _COLS = ("Key", "Fluid", "Provider", "Backend", "Cache size",
+             "Disable warnings", "")
+    _PROVIDER_COL = 2
+    _BACKEND_COL = 3
+    _CACHE_COL = 4
+    _WARN_COL = 5
+    _STATUS_COL = 6
 
     def __init__(self, media: dict | None, used_keys=None, parent=None):
         super().__init__(parent)
@@ -100,13 +111,15 @@ class MediaManagerDialog(QtWidgets.QDialog):
 
         outer = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
-            "Shared fluids referenced by components. <b>Backend</b> trades "
-            "speed for accuracy: tabular <code>BICUBIC&amp;HEOS</code> is "
-            "~50-60x faster per property (≈1e-4 error); <code>HEOS</code> is "
-            "the full reference solver. <b>Cache size</b> should exceed a "
-            "pipe's segment count to avoid re-computing states every Newton "
-            "iteration. Editing a medium re-instantiates the model on the next "
-            "run.")
+            "Shared fluids referenced by components. <b>Provider</b> picks the "
+            "engine: <code>coolprop</code> (reference) or <code>feos</code> "
+            "(equation of state; transport via CoolProp). <b>Backend</b> "
+            "(CoolProp only) trades speed for accuracy: tabular "
+            "<code>BICUBIC&amp;HEOS</code> is ~50-60x faster per property "
+            "(≈1e-4 error); <code>HEOS</code> is the full reference solver. "
+            "<b>Cache size</b> should exceed a pipe's segment count to avoid "
+            "re-computing states every Newton iteration. Editing a medium "
+            "re-instantiates the model on the next run.")
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
@@ -169,19 +182,31 @@ class MediaManagerDialog(QtWidgets.QDialog):
         self._table.setItem(r, 1, QtWidgets.QTableWidgetItem(
             spec.get("fluid") or key))
 
+        provider = QtWidgets.QComboBox()
+        provider.addItems(PROVIDERS)
+        prov = (spec.get("provider") or "coolprop").lower()
+        if provider.findText(prov) < 0:
+            provider.addItem(prov)
+        provider.setCurrentText(prov)
+        self._table.setCellWidget(r, self._PROVIDER_COL, provider)
+
         backend = QtWidgets.QComboBox()
         backend.addItems(BACKENDS)
         b = spec.get("backend") or "HEOS"
         if backend.findText(b) < 0:
             backend.addItem(b)
         backend.setCurrentText(b)
-        self._table.setCellWidget(r, 2, backend)
+        self._table.setCellWidget(r, self._BACKEND_COL, backend)
+        # Backend is CoolProp-only; feos ignores it.
+        provider.currentTextChanged.connect(
+            lambda _t, bx=backend: bx.setEnabled(_t == "coolprop"))
+        backend.setEnabled(prov == "coolprop")
 
         cache = QtWidgets.QSpinBox()
         cache.setRange(1, 10_000_000)
         cache.setSingleStep(100)
         cache.setValue(int(spec.get("scalar_cache_maxsize") or 100))
-        self._table.setCellWidget(r, 3, cache)
+        self._table.setCellWidget(r, self._CACHE_COL, cache)
 
         warn = QtWidgets.QCheckBox()
         warn.setChecked(bool(spec.get("disable_warnings", True)))
@@ -190,7 +215,7 @@ class MediaManagerDialog(QtWidgets.QDialog):
         wl.setContentsMargins(0, 0, 0, 0)
         wl.setAlignment(QtCore.Qt.AlignCenter)
         wl.addWidget(warn)
-        self._table.setCellWidget(r, 4, wrap)
+        self._table.setCellWidget(r, self._WARN_COL, wrap)
 
         status = QtWidgets.QTableWidgetItem()
         status.setFlags(QtCore.Qt.ItemIsEnabled)   # read-only, non-selectable
@@ -244,7 +269,8 @@ class MediaManagerDialog(QtWidgets.QDialog):
 
     # --- result ------------------------------------------------------------ #
     def _checkbox(self, r: int) -> QtWidgets.QCheckBox:
-        return self._table.cellWidget(r, 4).findChild(QtWidgets.QCheckBox)
+        return self._table.cellWidget(r, self._WARN_COL).findChild(
+            QtWidgets.QCheckBox)
 
     def _accept(self):
         media: dict = {}
@@ -257,13 +283,22 @@ class MediaManagerDialog(QtWidgets.QDialog):
                 self._warn(f"Duplicate medium key {key!r}.")
                 return
             fluid = self._table.item(r, 1).text().strip() or key
-            media[key] = {
+            provider = self._table.cellWidget(
+                r, self._PROVIDER_COL).currentText().strip() or "coolprop"
+            spec = {
                 "fluid": fluid,
-                "backend": self._table.cellWidget(r, 2).currentText().strip()
-                           or "HEOS",
-                "scalar_cache_maxsize": int(self._table.cellWidget(r, 3).value()),
+                "scalar_cache_maxsize": int(
+                    self._table.cellWidget(r, self._CACHE_COL).value()),
                 "disable_warnings": bool(self._checkbox(r).isChecked()),
             }
+            if provider == "feos":
+                # feos: thermodynamics from the equation of state, no CoolProp
+                # tabular backend to choose.
+                spec["provider"] = "feos"
+            else:
+                spec["backend"] = self._table.cellWidget(
+                    r, self._BACKEND_COL).currentText().strip() or "HEOS"
+            media[key] = spec
         missing = self._used - set(media)
         if missing:
             self._warn("These media are in use and can't be removed: "
