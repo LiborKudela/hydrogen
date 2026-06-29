@@ -34,7 +34,7 @@ from ...medium import CoolPropMedium
 from ...model import Model, Parameter
 from ...paramspec import ParamSpec
 from ..materials import WallMaterial
-from .flow import PressureVessel, StraightPipe
+from .flow import PressureVessel, SegmentedChannel, StraightPipe
 from .permeation import FixedPartialPressure, PermeationFlux
 from .ports import FluidPort_phm, ThermalPort_TQ
 from .walls import (
@@ -245,7 +245,18 @@ class Pipe(Model):
                         "identical pipes cost the same equations as one and "
                         "share the same pressure / temperature / velocity.",
                         unit="1", default=1, ui_label=True)] = 1,
+        channel_engine: Annotated[str, ParamSpec("Internal flow discretisation "
+                       "engine: 'segmented' (default; a single staggered "
+                       "SegmentedChannel, deduplicated by construction -- much "
+                       "faster to instantiate) or 'straight' (the legacy "
+                       "StraightPipe chain of TwoPortSegments).",
+                       choices=("segmented", "straight"), structural=True)]
+                       = "segmented",
     ):
+        if channel_engine not in ("straight", "segmented"):
+            raise ValueError(
+                f"Pipe: channel_engine must be 'straight' or 'segmented', "
+                f"got {channel_engine!r}")
         if outer_thermal not in self._OUTER_MODES:
             raise ValueError(
                 f"Pipe: outer_thermal must be one of {self._OUTER_MODES}, "
@@ -288,6 +299,7 @@ class Pipe(Model):
         self.T_wall_init = T_wall_init
         self.p_init = p_init
         self.count = int(count)
+        self.channel_engine = channel_engine
         self.n_leaky = n_leaky
         self.any_leaky = n_leaky > 0
         # Radial geometry: cumulative radii r[0]=D/2, r[k+1]=r[k]+thickness_k.
@@ -313,11 +325,18 @@ class Pipe(Model):
                            description="Number of identical parallel pipes."))
         N = self['count']
 
-        self.add_component('pipe', StraightPipe(
-            self.medium, D=self.D, L=self.L, epsilon=self.epsilon,
-            z_in=self.z_in, z_out=self.z_out, n_segments=self.n_segments,
-            heat_port=True, leaky=self.any_leaky, multiphase=self.multiphase,
-            count=N))
+        if self.channel_engine == "segmented":
+            self.add_component('pipe', SegmentedChannel(
+                self.medium, D=self.D, L=self.L, epsilon=self.epsilon,
+                z_in=self.z_in, z_out=self.z_out, N=self.n_segments,
+                heat_port=True, leaky=self.any_leaky, multiphase=self.multiphase,
+                count=N))
+        else:
+            self.add_component('pipe', StraightPipe(
+                self.medium, D=self.D, L=self.L, epsilon=self.epsilon,
+                z_in=self.z_in, z_out=self.z_out, n_segments=self.n_segments,
+                heat_port=True, leaky=self.any_leaky, multiphase=self.multiphase,
+                count=N))
 
         K = len(self.layers)
         r = self.radii
@@ -334,6 +353,8 @@ class Pipe(Model):
             if K > 0:
                 w = self[f'wall_{i}_{K - 1}']
                 return w['T_b'], w['Q_dot_b']
+            if self.channel_engine == "segmented":
+                return self['pipe'][f'T_wall_{i}'], self['pipe'][f'q_inflow_{i}']
             seg = self['pipe'][f'pipe_segment_{i}']
             return seg['T_wall'], seg['q_inflow']
 
@@ -362,7 +383,10 @@ class Pipe(Model):
                     # q_inflow); the caller closes them by wiring `wall_outer_{i}`
                     # to a boundary, so the segment's require_connection warning
                     # would be misleading -- silence it.
-                    self['pipe'][f'pipe_segment_{i}'].ports['wall'].require_connection = False
+                    if self.channel_engine == "segmented":
+                        self['pipe'].ports[f'wall_{i}'].require_connection = False
+                    else:
+                        self['pipe'][f'pipe_segment_{i}'].ports['wall'].require_connection = False
                 T_s, Q_s = _surface(i)
                 self.add_port(f'wall_outer_{i}', ThermalPort_TQ(
                     self,
@@ -375,17 +399,25 @@ class Pipe(Model):
                 self.add_component(f'env_{i}', FixedPartialPressure(p_partial=self.p_ext))
 
         # Re-expose the fluid inlet/outlet so a Pipe is drop-in for a StraightPipe.
+        # The two engines name their boundary face variables differently:
+        # StraightPipe uses pipe-level `p_in`/`p_out`; SegmentedChannel uses the
+        # shared face vars `p_0`/`p_{N}` (m_dot still via `m_dot_in`/`m_dot_out`).
+        if self.channel_engine == "segmented":
+            in_p, in_h = self['pipe']['p_0'], self['pipe']['h_0']
+            out_p = self['pipe'][f'p_{self.n_segments}']
+            out_h = self['pipe'][f'h_{self.n_segments}']
+        else:
+            in_p, in_h = self['pipe']['p_in'], self['pipe']['h_in']
+            out_p, out_h = self['pipe']['p_out'], self['pipe']['h_out']
         self.add_port('inlet', FluidPort_phm(
             self,
-            channels={'p': self['pipe']['p_in'], 'h': self['pipe']['h_in'],
-                      'm_dot': self['pipe']['m_dot_in']},
+            channels={'p': in_p, 'h': in_h, 'm_dot': self['pipe']['m_dot_in']},
             flow_orientation='in',
             medium=self.medium,
         ))
         self.add_port('outlet', FluidPort_phm(
             self,
-            channels={'p': self['pipe']['p_out'], 'h': self['pipe']['h_out'],
-                      'm_dot': self['pipe']['m_dot_out']},
+            channels={'p': out_p, 'h': out_h, 'm_dot': self['pipe']['m_dot_out']},
             flow_orientation='in',
             medium=self.medium,
         ))

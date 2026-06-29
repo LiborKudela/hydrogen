@@ -16,7 +16,7 @@ Closed-form steady state (reached as t -> infinity):
     T_outer  = T_inf + Q_in / (h * A)              (all heat leaves by convection)
     T_inner  = T_outer + Q_in / (k * A / L)         (Fourier drop across the wall)
 
-Run with `python examples/flat_wall.py` from the project root.
+Run with `python tutorials/flat_wall.py` from the project root.
 """
 
 from __future__ import annotations
@@ -137,7 +137,7 @@ def main():
     assert abs((T_inner[-1] - T_outer[-1]) - Q_IN / G_cond) < 1e-2, "Fourier drop violated"
 
     out_path = plot_results(system.record, "flat_wall.html",
-                            show=False, subdir="examples")
+                            show=False, subdir="tutorials")
     print()
     print(f"Plot written to {out_path}")
 

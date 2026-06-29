@@ -9,7 +9,7 @@ environment leak) over the year-long leak transient.
 
 Run ``run_local.py`` first to produce ``system.json``, then::
 
-    python examples/h2_permeation_pressurize/run_service.py
+    python tutorials/h2_permeation_pressurize/run_service.py
 """
 
 from __future__ import annotations
@@ -128,7 +128,7 @@ def main():
         print(f"  env leak at end      : {env[-1]:.3e} kg/s")
         print(f"  cumulative H2 lost   : {cum*1e9:.3f} ug")
 
-        out = Path(hd.local_results_path("examples", "h2_permeation_live.png"))
+        out = Path(hd.local_results_path("tutorials", "h2_permeation_live.png"))
         fig.savefig(out, dpi=110)
         print(f"  chart saved to {out}")
 

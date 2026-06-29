@@ -15,11 +15,11 @@ any moment over any variables, so a UI can add or drop charts mid-run.
 
 Run it::
 
-    python examples/host_client/run_client.py
+    python tutorials/host_client/run_client.py
 
 Under MPI with several workers (needs `mpi4py` + an MPI runtime on PATH)::
 
-    HYDROGEN_WORKERS=5 python examples/host_client/run_client.py
+    HYDROGEN_WORKERS=5 python tutorials/host_client/run_client.py
 
 Knobs (env vars):
 
@@ -38,7 +38,7 @@ import sys
 import time
 from pathlib import Path
 
-# Allow `python examples/host_client/run_client.py` without `pip install -e .`.
+# Allow `python tutorials/host_client/run_client.py` without `pip install -e .`.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -179,7 +179,7 @@ def main():
         stream.update()    # capture any final rows
         stream.close()
         print(f"\nRun finished: {len(t)} samples plotted.")
-        out = Path(local_results_path("examples", "signal_dynamics_live.png"))
+        out = Path(local_results_path("tutorials", "signal_dynamics_live.png"))
         fig.savefig(out, dpi=110)
         print(f"Chart saved to {out}")
 

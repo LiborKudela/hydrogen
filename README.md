@@ -163,7 +163,7 @@ spec = {
 model = from_dict(spec)
 ```
 
-See `examples/serialize_system.py` for a round-trip plus a data-defined nested
+See `tutorials/serialize_system.py` for a round-trip plus a data-defined nested
 network.
 
 ## Driving a system from another tool (host/client)
@@ -224,12 +224,13 @@ are available too. Finish with `service.shutdown()` (or use
 `with hydrogen.start_host() as service:`).
 
 A complete live example — a matplotlib window with Pause/Resume/Stop buttons fed by
-a variable stream — is `examples/host_client/run_client.py`.
+a variable stream — is `tutorials/host_client/run_client.py`.
 
-## Examples
+## Tutorials
 
-In `examples/` (each writes artifacts under the git-ignored `local_results/`,
-overridable via `HYDROGEN_LOCAL_RESULTS`):
+Practical, self-validating worked guides in `tutorials/` (each writes artifacts
+under the git-ignored `local_results/tutorials/`, overridable via
+`HYDROGEN_LOCAL_RESULTS`). Run any with `python tutorials/<script>.py`:
 
 | Script | What it shows |
 |---|---|
@@ -240,9 +241,30 @@ overridable via `HYDROGEN_LOCAL_RESULTS`):
 | `mixing_junction_reversal.py` | Reversible-flow `MixingJunction` |
 | `flat_wall.py`, `conjugate_pipe.py` | Thermal wall / coupled power pipe |
 | `control_valve.py` | Control blocks driving a compressible valve |
+| `two_phase_boiler.py` | Single-phase closures vs smooth HEM boiling |
 | `serialize_system.py` | Save/load JSON + build a system from a dict |
+| `saved_system_2.py` | Headless twin of a UI project (source → valve → pipe → tank) |
+| `data_structures_info.py` | Inspect the component catalogue (UI tooling view) |
 | `host_client/run_client.py` | Drive a host from a separate (UI) process, live chart |
-| `bench_*.py` | Performance benchmarks (adaptive stepping, BLT, pipe tree) |
+| `h2_permeation_pressurize/` | Author a model, save JSON, run it locally and via a host |
+
+## Benchmarks
+
+Scaling / simulation-speed / analytical-correctness harnesses in `benchmarks/`
+(less polished than tutorials; artifacts under `local_results/benchmarks/`). The
+analytical ones also assert correctness against closed-form solutions, so they
+double as regression checks. Run with `python benchmarks/<script>.py`:
+
+| Script | What it measures |
+|---|---|
+| `analytical_integrator.py` | Integrator accuracy vs closed form (Crank-Nicolson order check) |
+| `scaling_segmented_pipe.py` | `SegmentedChannel` scaling + straight-vs-segmented engine match |
+| `bench_adaptive.py` | Adaptive vs fixed-step time stepping |
+| `bench_blt.py` | Solve time with vs without BLT |
+| `bench_pipe_tree.py` | Pipe-tree instantiate/solve scaling + correctness fingerprint |
+| `bench_segmented.py` | `SegmentedChannel` vs `StraightPipe` (speed + match) |
+| `bench_feos_vs_coolprop.py` | CoolProp vs feos medium A/B |
+| `bench_line_search.py` | Damped Newton vs backtracking line search |
 
 ## API Documentation
 
@@ -267,8 +289,9 @@ reference (parameters, flags, domains).
 ## Tests
 
 ```bash
-pytest                                  # full suite (example scripts deselected)
-pytest -m examples                      # also run the end-to-end example scripts
+pytest                                  # full suite (tutorial + benchmark scripts deselected)
+pytest -m tutorials                     # also run the end-to-end tutorial scripts
+pytest -m benchmarks                    # run the scaling / analytical benchmark scripts
 pytest -v tests/test_integration.py     # CN integrator vs analytical solutions
 ```
 
@@ -311,7 +334,7 @@ needle, roughly in impact order:
   use the smooth homogeneous-equilibrium variants — same CoolProp values, but with
   consistent, continuous finite-difference partials — so Newton boils cleanly
   from liquid through the dome to superheated steam (no events). See
-  `examples/two_phase_boiler.py`. Boiling density falls off a cliff (`vg/vf ~ 300`), so
+  `tutorials/two_phase_boiler.py`. Boiling density falls off a cliff (`vg/vf ~ 300`), so
   the HEM path either needs a damped step (`relaxation ~ 0.2`) with a fine continuation
   ramp, or — preferably — `line_search=True` (see below) to take full steps and cross
   the dome on a coarse ramp with no hand-tuned damping.
@@ -347,7 +370,8 @@ hydrogen/
 │   ├── serialization/      # to_dict/from_dict/to_json/from_json + component registry
 │   ├── service/            # out-of-process host + client (start_host, SystemProxy)
 │   └── utilities/          # Interpolation1D / Interpolation2D
-├── examples/
+├── tutorials/              # practical, self-validating worked guides
+├── benchmarks/             # scaling / speed / analytical-correctness harnesses
 ├── tests/
 └── docs/                   # mkdocs sources
 ```

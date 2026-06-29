@@ -63,8 +63,9 @@ class _LiquidRig(Model):
 
 def test_incompressible_kv_law_holds_at_solution():
     val = _solve(_LiquidRig(Kv=10.0, opening=1.0), _WATER)
-    dp = val('.v.p_in') - val('.v.p_out')
-    rho = 0.5 * (val('.v.rho_in') + val('.v.rho_out'))
+    # The valve is a single-cell SegmentedChannel: face 0 = inlet, face 1 = outlet.
+    dp = val('.v.p_0') - val('.v.p_1')
+    rho = 0.5 * (val('.v.rho_0') + val('.v.rho_1'))
     m_dot = val('.v.m_dot_in')
     # Same regularised law the model implements (dp >> dp_eps so ~ sqrt(dp)).
     g = dp / (dp ** 2 + 1.0 ** 2) ** 0.25
@@ -129,8 +130,9 @@ def test_compressible_expansion_factor_below_incompressible():
     # At an equal moderate dp the gas (Y < 1) passes less than the liquid law
     # would predict (Y = 1).  Compare the dimensionless Y implied by the flow.
     val = _solve(_GasRig(p_out=5.0e5), _AIR)
-    dp = val('.v.p_in') - val('.v.p_out')
-    rho = 0.5 * (val('.v.rho_in') + val('.v.rho_out'))
+    # The valve is a single-cell SegmentedChannel: face 0 = inlet, face 1 = outlet.
+    dp = val('.v.p_0') - val('.v.p_1')
+    rho = 0.5 * (val('.v.rho_0') + val('.v.rho_1'))
     m_dot = val('.v.m_dot_in')
     g = dp / (dp ** 2 + 1.0 ** 2) ** 0.25
     incompressible = (5.0 / 36000.0) * np.sqrt(rho) * g

@@ -32,11 +32,11 @@ def local_results_path(subdir: str, filename: str) -> str:
     var.  Use this for any artifact a script wants on disk without
     polluting the repo:
 
-        out = local_results_path("examples", "fill_vessel.html")
+        out = local_results_path("tutorials", "fill_vessel.html")
         plot_results(record, out)                      # explicit path
 
         # or pass the subdir to plot_results directly:
-        plot_results(record, "fill_vessel.html", subdir="examples")
+        plot_results(record, "fill_vessel.html", subdir="tutorials")
     """
     out_dir = _local_results_root() / subdir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -53,10 +53,11 @@ def plot_results(record, filename, show=False, max_vars=None, subdir=None):
     Pass `max_vars` to clamp the number of traces (handy for very wide systems).
 
     `subdir`: if given, the plot is written to `<local_results>/<subdir>/<filename>`
-    instead of treating `filename` as a cwd-relative path.  Examples should pass
-    `subdir="examples"`, tests `subdir="tests"`, so artifacts collect under the
-    git-ignored `local_results/` sandbox.  Pass an absolute `filename` to
-    bypass this entirely.
+    instead of treating `filename` as a cwd-relative path.  Tutorials pass
+    `subdir="tutorials"`, benchmarks `subdir="benchmarks"`, tests
+    `subdir="tests"`, so artifacts collect under the git-ignored
+    `local_results/` sandbox.  Pass an absolute `filename` to bypass this
+    entirely.
     """
     import plotly.graph_objects as go
 

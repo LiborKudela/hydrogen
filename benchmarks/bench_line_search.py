@@ -12,10 +12,17 @@ two regimes:
 
 Not committed / not a pytest: run directly.
 """
+import sys
 import time
+from pathlib import Path
+
 import numpy as np
 
-import examples.two_phase_boiler as B
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+import tutorials.two_phase_boiler as B  # noqa: E402
 from hydrogen import CoolPropMedium
 import CoolProp.CoolProp as CP
 

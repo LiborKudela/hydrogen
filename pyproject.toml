@@ -23,7 +23,7 @@ hydrogen-ui = "hydrogen.ui.app:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
-examples = ["matplotlib>=3.7"]
+examples = ["matplotlib>=3.7"]  # plotting dep for the tutorials/ + benchmarks/ scripts
 mpi = ["mpi4py>=3.1"]
 # Optional feos-backed medium (FeosMedium). CoolProp remains the default
 # backend, so these are only needed when a project selects provider="feos".
@@ -38,18 +38,19 @@ docs = [
 
 [tool.setuptools.packages.find]
 include = ["hydrogen*"]
-exclude = ["examples*", "tests*"]
+exclude = ["tutorials*", "benchmarks*", "tests*"]
 
 [tool.setuptools.package-data]
 "hydrogen.components.icons" = ["*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Exclude the (slow) end-to-end example runs from the default suite; opt in
-# with `pytest -m examples` when you want to verify the examples still run
-# and produce correct results after a change.
-addopts = "-q -m 'not examples'"
+# Exclude the (slow) end-to-end tutorial + benchmark runs from the default
+# suite; opt in with `pytest -m tutorials` / `pytest -m benchmarks` when you
+# want to verify those scripts still run and produce correct results.
+addopts = "-q -m 'not tutorials and not benchmarks'"
 markers = [
-    "examples: end-to-end example scripts (deselected by default; run with -m examples)",
-    "slow: long-running cases (e.g. the bench_* example scripts)",
+    "tutorials: end-to-end tutorial scripts (deselected by default; run with -m tutorials)",
+    "benchmarks: scaling / speed / analytical-correctness benchmark scripts (deselected by default; run with -m benchmarks)",
+    "slow: long-running cases (e.g. the benchmark scripts)",
 ]

@@ -9,7 +9,7 @@ Measures, for several (N, K, M) sizes:
     every leaf-pipe `m_dot_out`, hashed) so we can verify each refactor
     preserves the numerical answer.
 
-Run as:  python3 examples/bench_pipe_tree.py
+Run as:  python3 benchmarks/bench_pipe_tree.py
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from examples.pipe_tree import TreeSystem, _bernoulli_warm_start  # noqa: E402
+from tutorials.pipe_tree import TreeSystem, _bernoulli_warm_start  # noqa: E402
 from hydrogen import CoolPropMedium  # noqa: E402
 
 # Sizes to benchmark.  Tuned so the smallest finishes in ~seconds on the
@@ -149,7 +149,7 @@ def main():
         all_results.append(bench_one(label, size))
 
     from hydrogen import local_results_path
-    out_path = Path(local_results_path("examples", "bench_pipe_tree.jsonl"))
+    out_path = Path(local_results_path("benchmarks", "bench_pipe_tree.jsonl"))
     with out_path.open("a") as f:
         for r in all_results:
             f.write(json.dumps(r) + "\n")

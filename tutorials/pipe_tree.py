@@ -352,7 +352,7 @@ def run_tree(label: str, system: TreeSystem, *, warm_m_dot: float | None = None,
         # Sanitise label into a usable filename.
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in label.lower())
         output_html = f"pipe_tree_{safe}.html"
-    out_path = plot_results(system.record, output_html, show=False, subdir="examples")
+    out_path = plot_results(system.record, output_html, show=False, subdir="tutorials")
     print()
     print(f"Plot written to {out_path}")
     print()

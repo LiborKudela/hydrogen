@@ -29,6 +29,17 @@ import sympy as _sp
 
 _CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
+# Bumped whenever the lambdified-source CODE GENERATION changes in a way that
+# is NOT already captured by the (sympy version, expr structure, modules
+# signature, cse) tuple -- e.g. a change to which compat callables are injected
+# into the lambdify `modules` dict.  The dict's contents are intentionally kept
+# out of `modules_signature` (so ordinary signature churn doesn't thrash the
+# cache), so removing/adding an entry would otherwise silently reuse stale
+# source.  v2: dropped the `_NUMPY_LAMBDIFY_COMPAT` Heaviside shim, so sympy's
+# numpy printer now inlines `Heaviside(x)` as `select(...)` instead of emitting
+# a bare `Heaviside(...)` call that NameErrors at eval time.
+_LAMBDA_CACHE_FORMAT_VERSION = "2"
+
 
 def hash_array(arr):
     """Hash that works for both numpy arrays and arbitrary hashable objects."""
@@ -175,6 +186,9 @@ def lambda_cache_key(args, expr, modules_signature: list[str], cse: bool) -> str
     """
     import pickle
     h = hashlib.sha256()
+    h.update(b"fmt=")
+    h.update(_LAMBDA_CACHE_FORMAT_VERSION.encode())
+    h.update(b"|")
     h.update(_sp.__version__.encode())
     h.update(b"|cse=")
     h.update(b"1" if cse else b"0")

@@ -9,7 +9,7 @@ System layout:
 
     PressureSource (2 bar, 293 K)  --[ StraightPipe (3 mm x 1 m, adiabatic) ]-->  PressureVessel (1 atm, 1 L)
 
-Run with `python examples/fill_vessel.py` from the project root.
+Run with `python tutorials/fill_vessel.py` from the project root.
 """
 
 from __future__ import annotations
@@ -164,7 +164,7 @@ def main():
     assert np.all(np.diff(m_v) >= -1e-9), "vessel mass should be non-decreasing"
 
     out_path = plot_results(system.record, "fill_vessel.html",
-                            show=False, subdir="examples")
+                            show=False, subdir="tutorials")
     print()
     print(f"Plot written to {out_path}")
 

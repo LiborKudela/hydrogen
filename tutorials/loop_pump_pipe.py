@@ -51,7 +51,7 @@ from a time-varying mass-flow target: `m_dot_target(t)` is a sinusoid via
 the framework's `t` symbol, and the loop tracks it quasi-statically with
 `pump.a_iz` and the pump head responding step by step.
 
-Run with `python examples/loop_pump_pipe.py` from the project root.
+Run with `python tutorials/loop_pump_pipe.py` from the project root.
 """
 
 from __future__ import annotations
@@ -300,7 +300,7 @@ def main():
               f"{a_iz_t[i]:10.3e}  {dp_pump_t[i] / 1e3:13.4f}")
 
     out_path = plot_results(rec, "loop_pump_pipe.html",
-                            show=False, subdir="examples")
+                            show=False, subdir="tutorials")
     print(f"\nPlot written to {out_path}")
 
 

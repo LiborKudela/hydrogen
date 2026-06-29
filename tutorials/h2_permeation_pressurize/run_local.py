@@ -7,7 +7,7 @@ The companion ``run_service.py`` loads the saved ``system.json`` on a hydrogen
 host -- it never sees this file -- and prints the same table, so the two runs
 can be compared by eye.
 
-    python examples/h2_permeation_pressurize/run_local.py
+    python tutorials/h2_permeation_pressurize/run_local.py
 """
 
 from __future__ import annotations

@@ -38,7 +38,7 @@ It has three parts:
       into superheated steam -- no events, no regime switching, no hand-tuned
       damping (the line search backs off only at the density cliff).
 
-Run with `python examples/two_phase_boiler.py` from the project root.
+Run with `python tutorials/two_phase_boiler.py` from the project root.
 """
 
 from __future__ import annotations

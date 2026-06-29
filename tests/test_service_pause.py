@@ -1,7 +1,7 @@
 """Pause / resume control over a live streaming run on the hydrogen host.
 
 Spawns a real host subprocess (``workers=1``, no MPI) running the CoolProp-free
-signal system from ``examples/host_client/signal_dynamics.json``, then exercises
+signal system from ``tutorials/host_client/signal_dynamics.json``, then exercises
 the cooperative pause path end-to-end:
 
 * ``pause()`` parks the run at a step boundary -> the host emits a
@@ -21,7 +21,7 @@ import hydrogen
 
 _SPEC = (
     Path(__file__).resolve().parent.parent
-    / "examples" / "host_client" / "signal_dynamics.json"
+    / "tutorials" / "host_client" / "signal_dynamics.json"
 ).read_text()
 
 

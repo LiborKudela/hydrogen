@@ -1,7 +1,7 @@
 """Signal-controlled valves: the control (blocks) domain driving fluid valves.
 
 Two parts, both self-validating (they ``assert`` their invariants, so this
-script doubles as an end-to-end test under ``pytest -m examples``):
+script doubles as an end-to-end test under ``pytest -m tutorials``):
 
   Part 1 - A liquid `IncompressibleValve` whose opening is commanded by a
       signal chain ``Ramp -> Limiter -> valve.opening``.  The ramp drives the
@@ -18,7 +18,7 @@ script doubles as an end-to-end test under ``pytest -m examples``):
       flow saturates once the pressure-drop ratio exceeds ``xT`` and stops
       depending on the downstream pressure.
 
-Run with ``python examples/control_valve.py`` from the project root.
+Run with ``python tutorials/control_valve.py`` from the project root.
 """
 
 from __future__ import annotations
@@ -100,9 +100,11 @@ def part1_controlled_liquid_valve():
 
     opening = trace('.v.opening')
     m_dot = trace('.v.m_dot_in')
-    p_in = trace('.v.p_in')
-    p_out = trace('.v.p_out')
-    rho = 0.5 * (trace('.v.rho_in') + trace('.v.rho_out'))
+    # The valve is a single-cell SegmentedChannel: face 0 is the inlet, face 1
+    # the outlet (p_0/p_1, rho_0/rho_1).
+    p_in = trace('.v.p_0')
+    p_out = trace('.v.p_1')
+    rho = 0.5 * (trace('.v.rho_0') + trace('.v.rho_1'))
 
     print(f"\n{'t [s]':>6}  {'cmd opening':>11}  {'m_dot [kg/s]':>12}  {'dp [bar]':>9}")
     for i in range(0, len(t), max(1, N // 8)):
@@ -119,7 +121,7 @@ def part1_controlled_liquid_valve():
     assert m_dot[-1] > m_dot[2], "flow must rise as the valve opens"
     assert m_dot[-1] == _approx(expected, rel=1e-6), "Kv law violated"
 
-    out_path = plot_results(rec, "control_valve.html", show=False, subdir="examples")
+    out_path = plot_results(rec, "control_valve.html", show=False, subdir="tutorials")
     print(f"Plot written to {out_path}")
 
 
@@ -164,7 +166,7 @@ def part2_compressible_choke():
         def val(suffix):
             return last[next(i for i, n in enumerate(names) if n.endswith(suffix))]
 
-        p_in = val('.v.p_in')
+        p_in = val('.v.p_0')          # single-cell valve: face 0 = inlet
         m_dot = val('.v.m_dot_in')
         flows.append(m_dot)
         print(f"{p_out/1e5:11.2f}  {(p_in-p_out)/p_in:10.3f}  {m_dot:12.4f}")

@@ -37,7 +37,7 @@ because the inputs happen to balance.  See
 `tests/test_mixing_junction.py::FourPortQuasiStaticSystem` for the
 quasi-static topology that does work (one pressure-pin port + flow pins).
 
-Run with `python examples/mixing_junction_reversal.py` from the project root.
+Run with `python tutorials/mixing_junction_reversal.py` from the project root.
 """
 
 from __future__ import annotations
@@ -311,7 +311,7 @@ def main():
     assert (m_junc.max() - m_junc.min()) < 1e-6, "junction mass drift should be ~0"
 
     # --- Plot ------------------------------------------------------------
-    out_path = local_results_path("examples", "mixing_junction_reversal.html")
+    out_path = local_results_path("tutorials", "mixing_junction_reversal.html")
     plot_results(rec, out_path)
     print(f"\nPlot written to {out_path}")
     print("(open in a browser; m_dot_0 is the sinusoid; h_junction oscillates")

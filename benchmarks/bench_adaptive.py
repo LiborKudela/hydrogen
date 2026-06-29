@@ -17,7 +17,7 @@ What we report per-strategy:
 The reference run uses a TIGHT fixed dt (10x smaller than the coarse fixed
 run) so we can compute realistic accuracy numbers.
 
-Run with `python examples/bench_adaptive.py` from the project root.
+Run with `python benchmarks/bench_adaptive.py` from the project root.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 # Reuse the FillSystem definition from the existing example
-from examples.fill_vessel import (  # noqa: E402
+from tutorials.fill_vessel import (  # noqa: E402
     DT,
     FillSystem,
     N_STEPS,

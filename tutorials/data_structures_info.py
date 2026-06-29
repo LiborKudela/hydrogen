@@ -13,12 +13,12 @@ all of which hydrogen exposes without instantiating anything:
 
 The catalogue ``type`` strings and the template shape are exactly what go into
 a system spec's ``components`` map (see ``to_dict`` / ``from_dict`` and the
-``examples/h2_permeation_pressurize/system.json`` dump), so a UI can build a
+``tutorials/h2_permeation_pressurize/system.json`` dump), so a UI can build a
 valid spec purely from this metadata and hand it back to hydrogen to load.
 
 Run::
 
-    python3 examples/UI/data_structures_info.py
+    python3 tutorials/data_structures_info.py
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 # Allow running the script directly (no `pip install -e .` required).
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 

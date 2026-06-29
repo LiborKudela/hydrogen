@@ -927,6 +927,425 @@ class StraightPipe(Model):
             )
         return [self[f'pipe_segment_{i}'].ports['leak'] for i in range(self.n_segments)]
 
+
+class SegmentedChannel(Model):
+    """A duct of `N` finite-volume cells sharing `N+1` faces, deduplicated by
+    construction.
+
+    This is the staggered-grid replacement for an explicit chain of
+    `TwoPortSegment`s wired by `StraightPipe`.  Instead of every segment owning
+    its own in- and out-face property/velocity closures (and relying on the
+    global duplicate-equation reduction to collapse the `5*(N-1)` redundant
+    interface closures), the channel owns **one** set of closures per shared
+    face:
+
+        per face j (0..N):   M_j = count*rho_j*A*w_j        (axial mass flow)
+                             T_j  = T_ph(p_j, h_j)
+                             rho_j = rho_ph(p_j, h_j)
+                             mu_j  = mu_ph(p_j, h_j)
+                             k_j   = k_ph(p_j, h_j)
+
+    and one balance set per cell i (between faces i and i+1):
+
+        continuity:  M_i - M_{i+1} (+ m_dot_leak_i) == 0
+        momentum:    distributed duct balance (see `_momentum_eq`)
+        energy:      h_i + w_i^2/2 + q_specific - (h_{i+1} + w_{i+1}^2/2) == 0
+        q_diag:      q_inflow_i - q == 0
+        wall temp:   (adiabatic only) T_wall_i - (T_i + T_{i+1})/2 == 0
+
+    `M_j` is the signed **axial** mass flow (positive downstream); the cell maps
+    it onto the "flow into me" convention used by the per-cell balances as
+    `m_dot_in = M_i`, `m_dot_out = -M_{i+1}`.  The boundary into-me flows
+    `m_dot_in`/`m_dot_out` (the inlet/outlet port channels) satisfy
+    `m_dot_in = M_0` and `m_dot_out = -M_N`.
+
+    With `N=1` and `dynamic="static"` the equation set is identical to a single
+    `TwoPortSegment`.
+
+    Dynamic levels (``dynamic=``):
+      * ``"static"`` (default) -- quasi-steady mass / momentum / energy, exactly
+        the `TwoPortSegment` physics.
+      * ``"advective"`` / ``"compressible"`` -- transient enthalpy advection /
+        + mass storage.  Scaffolded; not yet implemented.
+    """
+
+    _MULTIPHASE_MODES = ("single", "HEM")
+    _DYNAMIC_LEVELS = ("static", "advective", "compressible")
+    #: Instance flags that change the emitted equation structure, so the
+    #: per-class template cache keeps heated / leaky / multiphase / sized
+    #: variants distinct (see `Model.collect_equations`).
+    _cache_key_flags = ("multiphase", "heat_port", "leaky", "dynamic", "N")
+
+    PARAMS = {
+        "f_factor_func": ParamSpec("Callable f(Re, epsilon, Dh) returning the "
+                                  "Darcy friction factor symbolically."),
+        "q_inflow_func": ParamSpec("Callable returning the radial heat input "
+                                  "rate symbolically."),
+    }
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        D: Annotated[float, ParamSpec("Pipe bore (inner) diameter.", unit="m",
+                    default=0.01)],
+        L: Annotated[float, ParamSpec("Total flow length.", unit="m",
+                    default=1.0)],
+        epsilon: Annotated[float, _SPEC_EPSILON],
+        z_in: Annotated[float, _SPEC_Z_IN],
+        z_out: Annotated[float, _SPEC_Z_OUT],
+        N: Annotated[int, ParamSpec("Number of finite-volume cells (>= 1); the "
+                    "channel has N+1 shared faces.", unit="1",
+                    structural=True)] = 1,
+        f_factor_func=None,
+        q_inflow_func=None,
+        multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
+        heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        dynamic: Annotated[str, ParamSpec("Dynamic modelling level: 'static' "
+                          "(quasi-steady, default), 'advective', "
+                          "'compressible'.",
+                          choices=("static", "advective", "compressible"),
+                          structural=True)] = "static",
+        count: Annotated[float, _SPEC_COUNT] = 1.0,
+    ):
+        self.medium = medium
+        if multiphase not in self._MULTIPHASE_MODES:
+            raise ValueError(
+                f"multiphase must be one of {self._MULTIPHASE_MODES}, "
+                f"got {multiphase!r}")
+        if dynamic not in self._DYNAMIC_LEVELS:
+            raise ValueError(
+                f"dynamic must be one of {self._DYNAMIC_LEVELS}, got {dynamic!r}")
+        if dynamic != "static":
+            raise NotImplementedError(
+                f"SegmentedChannel dynamic={dynamic!r} is scaffolded but not yet "
+                f"implemented; use 'static' (quasi-steady) for now.")
+        if int(N) != N or N < 1:
+            raise ValueError(f"N must be an integer >= 1, got {N!r}")
+        self.multiphase = multiphase
+        self.heat_port = bool(heat_port)
+        self.leaky = bool(leaky)
+        self.dynamic = dynamic
+        self.N = int(N)
+        # `n_segments` alias so the channel is a drop-in for `StraightPipe`
+        # consumers that read `.n_segments` and per-cell port lists.
+        self.n_segments = self.N
+        self.D = D
+        self.L = L
+        self.epsilon = epsilon
+        self.z_in = z_in
+        self.z_out = z_out
+        self.count = count
+        # Default the constitutive hooks (mirrors StraightPipe): Churchill
+        # friction, and a Gnielinski/laminar Nusselt heat term that is zeroed
+        # when there is no heat port.
+        self.f_factor_func = f_factor_func or self.get_churchill_f_factor
+        self.q_inflow_func = q_inflow_func or (
+            self.get_q_inflow if self.heat_port else self.get_q_inflow_adiabatic)
+        h_std = float(medium.eval_h_pT(101325.0, 293.15))
+        self._h_std = h_std
+        self._rho_std = float(medium.eval_rho_ph(101325.0, h_std))
+        self._mu_std = float(medium.eval_mu_ph(101325.0, h_std))
+        self._k_std = float(medium.eval_k_ph(101325.0, h_std))
+        super().__init__()
+
+    # --- constitutive correlations (same as StraightPipe) ------------------
+    def get_churchill_f_factor(self, Re, epsilon, D):
+        term1 = (8.0 / Re) ** 12
+        A = (-2.457 * sp.log((7.0 / Re) ** 0.9 + 0.27 * epsilon / D)) ** 16
+        B = (37530.0 / Re) ** 16
+        term2 = 1.0 / (A + B) ** 1.5
+        return (term1 + term2) ** (1.0 / 12.0) * 8
+
+    def calculate_nu_smooth(self, Re, Pr, fr):
+        U = Re / 1000
+        nu_1 = (fr / 8) * (Re - 1000) * Pr / (1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
+        nu_2 = 3.52 * U ** 4 - 45.148 * U ** 3 + 212.13 * U ** 2 - 427.45 * U + 316.08
+        nu_3 = 3.66
+        TRANSITION_WIDTH = 100
+        TRANSITION_CENTER_1 = 2250
+        TRANSITION_CENTER_2 = 3050
+        w1 = sp.Max(0.0, sp.Min(1.0, 1.0 - (Re - TRANSITION_CENTER_1) / TRANSITION_WIDTH))
+        w3 = sp.Max(0.0, sp.Min(1.0, (Re - TRANSITION_CENTER_2) / TRANSITION_WIDTH))
+        w2 = 1.0 - w1 - w3
+        return w1 * nu_1 + w2 * nu_2 + w3 * nu_3
+
+    def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
+        Re = w * Dh * rho / mu
+        Pr = mu * rho / k
+        nu = self.calculate_nu_smooth(Re, Pr, fr)
+        alpha = nu * k / Dh
+        return alpha * area * (T_wall - T)
+
+    def get_q_inflow_adiabatic(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
+        return 0.0
+
+    def _property_funcs(self):
+        m = self.medium
+        if self.multiphase == "HEM":
+            try:
+                return m.T_ph_hem, m.rho_ph_hem, m.mu_ph_hem, m.k_ph_hem
+            except AttributeError as exc:
+                raise AttributeError(
+                    f"multiphase='HEM' requires a medium exposing *_ph_hem "
+                    f"property functions (e.g. CoolPropMedium); "
+                    f"{type(m).__name__} does not.") from exc
+        return m.T_ph, m.rho_ph, m.mu_ph, m.k_ph
+
+    def _momentum_eq(self, cell, *, p_in, p_out, A_in, A_out, A_avg, rho_avg,
+                     w_in, w_out, w_avg, m_dot_avg, f_avg, Dh_avg, L, z_in, z_out):
+        """Default per-cell momentum residual (distributed duct balance).
+
+        Identical to `TwoPortSegment._momentum_eq`, but parameterised on the
+        cell's own segment length `L` and station elevations `z_in`/`z_out` so a
+        single channel can carry many cells.  Subclasses (valves / pumps)
+        override to substitute a different pressure/flow relation.
+        """
+        delta_P_friction = f_avg * (L / Dh_avg) * (rho_avg * abs(w_avg) * w_avg / 2)
+        momentum_flux = m_dot_avg * (w_out - w_in)
+        buoyancy_force = -G_const * (z_out - z_in) * A_avg * rho_avg
+        return p_in * A_in - p_out * A_out - delta_P_friction * A_avg - momentum_flux + buoyancy_force
+
+    def declare_components(self):
+        spec = merged_param_specs(type(self))
+        N = self.N
+        A_value = np.pi * self.D ** 2 / 4
+        P_value = np.pi * self.D
+        L_segment_value = self.L / N
+
+        self.add_component('count', Parameter(self.count, **spec['count'].param_kwargs()))
+        self.add_component('A', Parameter(A_value, "m^2"))
+        self.add_component('P', Parameter(P_value, "m"))
+        self.add_component('L_segment', Parameter(L_segment_value, "m"))
+
+        # N+1 station elevations shared between adjacent cells.
+        dz = (self.z_out - self.z_in) / N
+        for j in range(N + 1):
+            self.add_component(f'z_{j}', Parameter(self.z_in + j * dz, "m"))
+
+        # N+1 shared faces, each carrying its own (single) closure set.
+        for j in range(N + 1):
+            self.add_component(f'p_{j}', Variable(101325, "Pa"))
+            self.add_component(f'h_{j}', Variable(self._h_std, "J/kg"))
+            self.add_component(f'M_{j}', Variable(0.0, "kg/s"))
+            self.add_component(f'w_{j}', Variable(0.1, "m/s"))
+            self.add_component(f'T_{j}', Variable(293.15, "K"))
+            self.add_component(f'rho_{j}', Variable(self._rho_std, "kg/m^3"))
+            self.add_component(f'mu_{j}', Variable(self._mu_std, "Pa*s"))
+            self.add_component(f'k_{j}', Variable(self._k_std, "W/m/K"))
+
+        # Per-cell wall-temperature / heat-diagnostic (+ leak) variables.
+        for i in range(N):
+            self.add_component(f'T_wall_{i}', Variable(293.15, "K"))
+            self.add_component(f'q_inflow_{i}', Variable(0.0, "W"))
+            if self.leaky:
+                self.add_component(f'm_dot_leak_{i}', Variable(0.0, "kg/s"))
+
+        # Boundary "into me" mass flows = the inlet/outlet port channels.
+        self.add_component('m_dot_in', Variable(0.0, "kg/s"))
+        self.add_component('m_dot_out', Variable(0.0, "kg/s"))
+
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_0'], 'h': self['h_0'], 'm_dot': self['m_dot_in']},
+            flow_orientation='in', medium=self.medium))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self[f'p_{N}'], 'h': self[f'h_{N}'], 'm_dot': self['m_dot_out']},
+            flow_orientation='in', medium=self.medium))
+
+        if self.heat_port:
+            for i in range(N):
+                self.add_port(f'wall_{i}', ThermalPort_TQ(
+                    self,
+                    channels={'T': self[f'T_wall_{i}'], 'Q_dot': self[f'q_inflow_{i}']},
+                    flow_orientation='in', require_connection=True))
+        if self.leaky:
+            for i in range(N):
+                self.add_port(f'leak_{i}', PermeationPort_pN(
+                    self,
+                    channels={'p_partial': self[f'p_{i}'],
+                              'm_dot_leak': self[f'm_dot_leak_{i}']},
+                    flow_orientation='in', require_connection=True))
+
+    def declare_equations(self):
+        N = self.N
+        count = self['count'].symbol
+        A = self['A'].symbol
+        P = self['P'].symbol
+        L_seg = self['L_segment'].symbol
+        Dh = 4 * A / P
+        T_ph, rho_ph, mu_ph, k_ph = self._property_funcs()
+        eqs = []
+
+        # --- per-face closures (ONE set per shared face) -------------------
+        for j in range(N + 1):
+            p = self[f'p_{j}'].symbol
+            h = self[f'h_{j}'].symbol
+            M = self[f'M_{j}'].symbol
+            w = self[f'w_{j}'].symbol
+            T = self[f'T_{j}'].symbol
+            rho = self[f'rho_{j}'].symbol
+            mu = self[f'mu_{j}'].symbol
+            k = self[f'k_{j}'].symbol
+            eqs.append(M - count * rho * A * w)
+            eqs.append(T - T_ph(p, h))
+            eqs.append(rho - rho_ph(p, h))
+            eqs.append(mu - mu_ph(p, h))
+            eqs.append(k - k_ph(p, h))
+
+        # Boundary into-me flows (inlet/outlet port channels).
+        eqs.append(self['m_dot_in'].symbol - self['M_0'].symbol)
+        eqs.append(self['m_dot_out'].symbol + self[f'M_{N}'].symbol)
+
+        # --- per-cell balances --------------------------------------------
+        # The N cells are structurally identical -- same correlations, only the
+        # per-cell leaf symbols differ.  Building each from scratch re-fires
+        # sympy's assumption + Max/Min canonicalisation machinery N times, which
+        # is the dominant cost of `collect_equations` for long pipes.  Instead
+        # build ONE cell on placeholder symbols and rename its leaves per cell.
+        #
+        # The rename is a pure symbol->symbol swap, done under
+        # `sp.evaluate(False)`: the template is already canonical so no
+        # re-evaluation is needed.  This is ~20x faster than rebuilding -- and,
+        # crucially, a *plain* `xreplace` (evaluate on) is actually SLOWER than
+        # rebuilding because it reconstructs every parent node and pays the full
+        # canonicalisation cost again.  For N == 1 (valves) there is nothing to
+        # amortise, and valve hooks read per-cell symbols directly, so just
+        # build the single cell normally.
+        if N == 1:
+            eqs.extend(self._cell_residuals(
+                0, A=A, P=P, L_seg=L_seg, count=count, Dh=Dh,
+                **self._cell_real_syms(0)))
+            return eqs
+
+        ref = self._cell_placeholder_syms()
+        template = self._cell_residuals(
+            0, A=A, P=P, L_seg=L_seg, count=count, Dh=Dh, **ref)
+        with sp.evaluate(False):
+            for i in range(N):
+                real = self._cell_real_syms(i)
+                mapping = {ph: real[k] for k, ph in ref.items()
+                           if real[k] is not None}
+                eqs.extend(eq.xreplace(mapping) for eq in template)
+        return eqs
+
+    #: Per-cell residual symbol fields whose ``in``/``out`` ends map to faces
+    #: ``stem_{i}`` / ``stem_{i+1}`` (used to remap a cell template onto each
+    #: cell's own symbols).
+    _CELL_FACE_FIELDS = (
+        ('p_in', 'p_out', 'p'), ('h_in', 'h_out', 'h'),
+        ('w_in', 'w_out', 'w'), ('rho_in', 'rho_out', 'rho'),
+        ('mu_in', 'mu_out', 'mu'), ('k_in', 'k_out', 'k'),
+        ('T_in', 'T_out', 'T'), ('M_in', 'M_out', 'M'),
+    )
+
+    def _cell_real_syms(self, i):
+        """The actual leaf symbols for cell ``i`` keyed by residual field."""
+        d = {}
+        for k_in, k_out, stem in self._CELL_FACE_FIELDS:
+            d[k_in] = self[f'{stem}_{i}'].symbol
+            d[k_out] = self[f'{stem}_{i + 1}'].symbol
+        d['z_in'] = self[f'z_{i}'].symbol
+        d['z_out'] = self[f'z_{i + 1}'].symbol
+        d['T_wall'] = self[f'T_wall_{i}'].symbol
+        d['q_inflow'] = self[f'q_inflow_{i}'].symbol
+        d['m_dot_leak'] = self[f'm_dot_leak_{i}'].symbol if self.leaky else None
+        return d
+
+    def _cell_placeholder_syms(self):
+        """Fresh placeholder symbols for one cell, keyed like `_cell_real_syms`.
+
+        ``m_dot_leak`` is ``None`` when the channel is not leaky so it is never
+        referenced by `_cell_residuals` and never enters the rename map.
+        """
+        keys = [k for pair in self._CELL_FACE_FIELDS for k in pair[:2]]
+        keys += ['z_in', 'z_out', 'T_wall', 'q_inflow']
+        d = {k: sp.Symbol(f'__cell_{k}__', real=True) for k in keys}
+        d['m_dot_leak'] = (sp.Symbol('__cell_m_dot_leak__', real=True)
+                           if self.leaky else None)
+        return d
+
+    def _cell_residuals(self, cell, *, p_in, p_out, h_in, h_out, w_in, w_out,
+                        rho_in, rho_out, mu_in, mu_out, k_in, k_out, T_in, T_out,
+                        M_in, M_out, z_in, z_out, T_wall, q_inflow, m_dot_leak,
+                        A, P, L_seg, count, Dh):
+        """Residuals for a single cell as a pure function of its symbols.
+
+        Shared by the direct (N == 1) path and the template build; expressed in
+        terms of the passed symbols so the same code serves real and
+        placeholder symbols.  Per-cell hooks (`f_factor_func`,
+        `q_inflow_func`, `_momentum_eq`) must be pure functions of their
+        arguments for the template rename to be valid (true for the base
+        channel; the valve subclasses are N == 1 and take the direct path).
+        """
+        w_eps = 1e-4
+        m_eps = 1e-6
+
+        # "flow into me" mapping for this cell.
+        m_dot_in = M_in
+        m_dot_out = -M_out
+
+        rho_avg = (rho_in + rho_out) / 2
+        mu_avg = (mu_in + mu_out) / 2
+        k_avg = (k_in + k_out) / 2
+        w_avg = (w_in + w_out) / 2
+        A_avg = A
+        m_dot_avg = (m_dot_in - m_dot_out) / 2
+        p_avg = (p_in + p_out) / 2
+        h_avg = (h_in + h_out) / 2
+        T_avg = (T_in + T_out) / 2
+        P_avg = P
+        Dh_avg = Dh
+        Re_avg = rho_avg * abs(w_avg) * Dh_avg / mu_avg + 1
+
+        eqs = []
+        # continuity
+        cont = m_dot_in + m_dot_out
+        if self.leaky:
+            cont = cont + m_dot_leak
+        eqs.append(cont)
+
+        # momentum
+        f_avg = self.f_factor_func(Re_avg, self.epsilon, Dh_avg)
+        eqs.append(self._momentum_eq(
+            cell, p_in=p_in, p_out=p_out, A_in=A, A_out=A, A_avg=A_avg,
+            rho_avg=rho_avg, w_in=w_in, w_out=w_out, w_avg=w_avg,
+            m_dot_avg=m_dot_avg, f_avg=f_avg, Dh_avg=Dh_avg, L=L_seg,
+            z_in=z_in, z_out=z_out))
+
+        # energy
+        area_conv = count * P_avg * L_seg
+        q = self.q_inflow_func(
+            w_avg, p_avg, h_avg, rho_avg, T_avg, mu_avg, k_avg,
+            f_avg, T_wall, Dh_avg, area_conv)
+        sign_w = w_avg / sp.sqrt(w_avg ** 2 + w_eps ** 2)
+        m_dot_reg = sp.sqrt(m_dot_avg ** 2 + m_eps ** 2)
+        q_specific = sign_w * q / m_dot_reg
+        eqs.append(h_in + w_in ** 2 / 2 + q_specific - (h_out + w_out ** 2 / 2))
+        eqs.append(q_inflow - q)
+
+        if not self.heat_port:
+            eqs.append(T_wall - T_avg)
+        return eqs
+
+    @property
+    def segment_wall_ports(self):
+        if not self.heat_port:
+            raise AttributeError(
+                "SegmentedChannel was built with heat_port=False; it has no "
+                "segment wall ports. Pass heat_port=True to expose them.")
+        return [self.ports[f'wall_{i}'] for i in range(self.N)]
+
+    @property
+    def segment_leak_ports(self):
+        if not self.leaky:
+            raise AttributeError(
+                "SegmentedChannel was built with leaky=False; it has no segment "
+                "leak ports. Pass leaky=True to expose them.")
+        return [self.ports[f'leak_{i}'] for i in range(self.N)]
+
+
 class AdiabaticPump(TwoPortSegment):
     #TODO: make it into real pupm with a real friction
     # model and make the izoentropic case a special case of real pump.
@@ -947,11 +1366,12 @@ class AdiabaticPump(TwoPortSegment):
         self.add_component('a_iz', Variable(0.0, "W"))
 
 
-class Valve(TwoPortSegment):
+class Valve(SegmentedChannel):
     """Base class for control valves: an adiabatic throttle whose pressure/
     flow relation is set by a sizing coefficient and a 0..1 opening signal.
 
-    Built on `TwoPortSegment` so it reuses continuity, the *adiabatic* energy
+    Built on `SegmentedChannel` (a single `N=1` cell) so it reuses continuity,
+    the *adiabatic* energy
     balance -- which makes an equal-area valve isenthalpic, the correct
     throttling physics -- and the face-property closures; only the momentum
     relation is swapped, via the `_momentum_eq` hook.  Heat transfer is off
@@ -990,16 +1410,19 @@ class Valve(TwoPortSegment):
                          "the sign*sqrt(|dp|) flow law smooth through dp = 0.",
                          unit="Pa")] = 1.0,
     ):
-        A = float(np.pi * D ** 2 / 4.0)
-        P = float(np.pi * D)
         # Store the constructor scalars under their own names so the reflective
         # serializer can recover them (it maps each __init__ arg to a like-named
         # attribute); `D` / `opening` are not otherwise kept by the base.
         self.D = D
         self.opening = opening
         self.dp_eps = dp_eps
-        super().__init__(medium, A, A, P, P, z_in, z_out, 1.0, 0.0,
-                         self._no_friction, self._no_heat)
+        # A single finite-volume cell; the channel computes A = pi*D^2/4 and
+        # P = pi*D from the connecting diameter.  Friction / heat are inert (the
+        # momentum hook is replaced by the valve flow law), so a nominal L and
+        # zero roughness are passed.
+        super().__init__(medium, D=D, L=1.0, epsilon=0.0, z_in=z_in,
+                         z_out=z_out, N=1, f_factor_func=self._no_friction,
+                         q_inflow_func=self._no_heat)
 
     @staticmethod
     def _no_friction(Re, epsilon, Dh):
@@ -1020,7 +1443,7 @@ class Valve(TwoPortSegment):
         self.add_port('opening', RealSignal.as_input(
             self, self['opening'], name='opening'))
 
-    def _momentum_eq(self, *, p_in, p_out, rho_avg, m_dot_avg, **_):
+    def _momentum_eq(self, cell=None, *, p_in, p_out, rho_avg, m_dot_avg, **_):
         dp = p_in - p_out
         theta = self['opening'].symbol
         return m_dot_avg - self._valve_flow(dp, rho_avg, theta)
@@ -1137,10 +1560,11 @@ class CompressibleValve(Valve):
         gamma = self['gamma'].symbol
         dp_eps = self['dp_eps'].symbol      # Pa: sqrt(|dp|) regulariser
         p_eps = self['p_eps'].symbol        # Pa: smooth max/min scale
-        p_in = self['p_in'].symbol
-        p_out = self['p_out'].symbol
-        rho_in = self['rho_in'].symbol
-        rho_out = self['rho_out'].symbol
+        # Single-cell channel: face 0 is the inlet, face 1 the outlet.
+        p_in = self['p_0'].symbol
+        p_out = self['p_1'].symbol
+        rho_in = self['rho_0'].symbol
+        rho_out = self['rho_1'].symbol
 
         # All smooth-max/min arguments below are PRESSURES (Pa), so `p_eps`
         # (Pa) is the only blending scale -- no dimensionless/dimensional mix.
@@ -1987,7 +2411,7 @@ class LoopBuffer(MixingJunction):
     states attach real residuals to the loop (`dm/dt = m_dot_in - m_dot_out`,
     `dU/dt = m_dot_in*h_in - m_dot_out*h` in forward flow) so that even
     at steady state `(m, U)` are pinned by initial conditions rather than
-    collapsing to `0 = 0`.  See `examples/loop_pump_pipe.py` for the
+    collapsing to `0 = 0`.  See `tutorials/loop_pump_pipe.py` for the
     canonical usage.
 
     Bidirectional flow

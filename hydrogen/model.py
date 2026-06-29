@@ -213,29 +213,6 @@ def set_equation_cache_validation(enabled: bool) -> bool:
     return prev
 
 
-# Numpy doesn't ship a single-arg `Heaviside` (`np.heaviside` is
-# 2-arg: `heaviside(x, h0)`), so `sp.lambdify(..., modules=['numpy', ...])`
-# emits the bare name `Heaviside(x)` (sympy <1.10) or `Heaviside(x, 1/2)`
-# (sympy >=1.11) which then NameErrors at call time.  `Heaviside` shows up
-# in the Jacobian of every `sp.Max`/`sp.Min` -- the `StraightPipe`
-# heat-transfer correlation uses both, so any non-adiabatic pipe hits this.
-# Accept both arities: when sympy supplies its own `H(0)` value as the
-# second positional arg, defer to that; otherwise default to `0.5`.
-#
-# TODO: this shim may be removable once we drop sympy <1.11 support.
-# Sympy 1.11+'s NumPy printer inlines `Heaviside(x)` as
-# `numpy.select([less(x,0), equal(x,0), True], [0, 1/2, 1])` directly --
-# but ONLY when `Heaviside` is NOT in the modules dict (otherwise the
-# printer defers to the dict entry and emits the literal call).
-def _heaviside_compat(x, h0=0.5):
-    return np.heaviside(x, h0)
-
-
-_NUMPY_LAMBDIFY_COMPAT = {
-    "Heaviside": _heaviside_compat,
-}
-
-
 def _vectorise_callable(fn):
     """Wrap a scalar `fn(*scalars) -> scalar` so it also works on numpy arrays.
 
@@ -1052,7 +1029,7 @@ class Model:
     # --- trivial-equation reduction ---------------------------------------------------
 
     @staticmethod
-    def _classify_linear(eq):
+    def _classify_linear(eq, param_set=None):
         """Try to express `eq` as `c0 + sum(ci * vi) == 0` where every `vi` is a
         sympy Symbol and every coefficient is a Number.
 
@@ -1063,7 +1040,59 @@ class Model:
         the previous `is_polynomial()`/`as_poly().degree()` path was triggering on
         every equation, including the many CoolProp-laden ones that are obviously
         non-linear).
+
+        When `param_set` is given (a set of Parameter symbols), linearity is
+        classified in the VARIABLES only: any subexpression whose free symbols
+        are all in `param_set` (plus pure Numbers) is treated as part of the
+        constant coefficient field.  This recognises e.g. `a + k*b` (with `k` a
+        Parameter) as linear in `{a, b}` with coefficients `{a: 1, b: k}` -- a
+        wiring whose Jacobian entries are constant w.r.t. the Newton state and
+        so eliminable just like the numeric-coefficient case.  When `param_set`
+        is None the legacy behaviour holds: every symbol is an indeterminate and
+        only Numbers may be coefficients.
         """
+        if param_set is not None:
+            # Any subexpression free of NON-parameter symbols (numbers and/or
+            # parameters only) is a constant coefficient.
+            if eq.free_symbols <= param_set:
+                return eq, {}
+            if isinstance(eq, sp.Symbol):
+                # Has a non-parameter free symbol and is a bare Symbol -> it is
+                # a variable indeterminate (a parameter symbol would have been
+                # caught by the subset check above).
+                return sp.S.Zero, {eq: sp.S.One}
+            if eq.is_Mul:
+                coeff = sp.S.One
+                sym = None
+                for arg in eq.args:
+                    if arg.free_symbols <= param_set:
+                        coeff = coeff * arg          # number or parameter expr
+                    elif isinstance(arg, sp.Symbol):
+                        if sym is not None:
+                            return None              # var*var -> nonlinear
+                        sym = arg
+                    else:
+                        return None                  # var**2, f(var), ... -> nonlinear
+                if sym is None:
+                    return coeff, {}
+                return sp.S.Zero, {sym: coeff}
+            if eq.is_Add:
+                const = sp.S.Zero
+                coeffs = {}
+                for term in eq.args:
+                    sub = Model._classify_linear(term, param_set)
+                    if sub is None:
+                        return None
+                    c, syms = sub
+                    const = const + c
+                    for s, sc in syms.items():
+                        if s in coeffs:
+                            coeffs[s] = coeffs[s] + sc
+                        else:
+                            coeffs[s] = sc
+                return const, coeffs
+            return None
+
         if isinstance(eq, sp.Symbol):
             return sp.S.Zero, {eq: sp.S.One}
         if eq.is_Number:
@@ -1100,6 +1129,25 @@ class Model:
             return const, coeffs
         return None
 
+    def _dynamic_param_symbols(self):
+        """Set of parameter symbols whose VALUE changes within a step (the
+        `cur`/`prev` leaves of every `Input`).
+
+        Used by the parameter-coefficient linear eliminators to refuse a
+        substitution whose RHS depends on a time-varying parameter: the
+        prev-step mirror (`xreplace(current_to_prev)`) only maps variable
+        cur->prev symbols, so a dynamic parameter would be frozen at its
+        current-level value on the previous time level -- wrong for an Input
+        whose `cur` and `prev` genuinely differ."""
+        dyn = set()
+        for inp in self._collect_inputs():
+            for leaf in ('cur', 'prev'):
+                comp = inp.components.get(leaf)
+                s = getattr(comp, 'symbol', None) if comp is not None else None
+                if s is not None:
+                    dyn.add(s)
+        return dyn
+
     @staticmethod
     def _close_substitutions(substitutions):
         """Resolve chains in `substitutions` so each value only references symbols
@@ -1131,9 +1179,18 @@ class Model:
         return substitutions
 
     @line_profiler.profile
-    def remove_trivial_equations(self, equations, var_symbols):
+    def remove_trivial_equations(self, equations, var_symbols, allow_param_coeffs=False):
         """Eliminate trivially-linear equations (`a*x + b*y + c == 0` with `a,b,c`
         constants and `x,y` symbols) without invoking `sp.solve`/`sp.Poly`.
+
+        When `allow_param_coeffs` is True the notion of "constant" is widened
+        from pure Numbers to "Numbers and Parameters", so wirings like
+        `0 = a + k*b` (with `k` a Parameter) become eligible.  Two guards keep
+        this safe: (1) the eliminated variable's own coefficient must still be a
+        nonzero Number, so we never bake `1/parameter` (a possible runtime
+        division-by-zero) into a substitution; (2) substitutions whose RHS
+        references a time-varying (`Input`) parameter are skipped, because the
+        prev-step mirror can't carry such a parameter to the old time level.
 
         Strategy:
           1. Walk every equation once. Use `_classify_linear` to detect those that
@@ -1158,10 +1215,14 @@ class Model:
         var_set = set(var_symbols_list)
         raw_var_set = set(self.raw_var_symbols)
         current_to_prev = {var.symbol: var.prev_symbol for var in self.raw_vars_references}
+        # Parameter-coefficient mode: classify linearity in the variables while
+        # treating Parameters as part of the constant coefficient field.
+        param_set = set(self.raw_param_symbols) if allow_param_coeffs else None
+        dynamic_param_set = self._dynamic_param_symbols() if allow_param_coeffs else set()
 
         print("Identifying trivial equations (structural)")
         for idx, eq in enumerate(equations):
-            classified = Model._classify_linear(eq)
+            classified = Model._classify_linear(eq, param_set)
             if classified is None:
                 new_eqs.append(eq)
                 continue
@@ -1174,7 +1235,25 @@ class Model:
             # would fully fix `x` to a constant) are deliberately left in the system
             # so downstream code that expects at least one surviving variable / row
             # keeps working.
-            if len(coeffs) != 2:
+            #
+            # In `allow_param_coeffs` mode we ALSO accept the single-variable case
+            # (`len == 1`) -- but only when the constant `c0` references a
+            # parameter.  This is exactly the `var = parameter-expression` wiring
+            # (e.g. `0 = a - k`) that the legacy classifier handled implicitly by
+            # treating the parameter as a pseudo-variable; once parameters are
+            # folded into the constant field that equation drops to one variable,
+            # so without this branch enabling the flag would ELIMINATE FEWER
+            # equations.  Pure-number fixes (`0 = 2*a - 5`) stay excluded, matching
+            # legacy.
+            if allow_param_coeffs:
+                if len(coeffs) == 2:
+                    pass
+                elif len(coeffs) == 1 and getattr(c0, "free_symbols", set()):
+                    pass
+                else:
+                    new_eqs.append(eq)
+                    continue
+            elif len(coeffs) != 2:
                 new_eqs.append(eq)
                 continue
 
@@ -1184,6 +1263,15 @@ class Model:
                 s for s in coeffs
                 if s in raw_var_set and s in var_set and s not in removed_vars
             ]
+            if allow_param_coeffs:
+                # Guard 1 (safe division): only eliminate a variable whose own
+                # coefficient is a nonzero Number.  The OTHER term's coefficient
+                # may be a parameter expression, but dividing by it could be a
+                # runtime division-by-zero, so it never becomes the pivot.
+                candidates = [
+                    s for s in candidates
+                    if getattr(coeffs[s], "is_Number", False) and coeffs[s] != 0
+                ]
             if not candidates:
                 new_eqs.append(eq)
                 continue
@@ -1197,6 +1285,14 @@ class Model:
                     continue
                 rest = rest - c * s
             sol = rest / coeff1
+
+            # Guard 2 (prev-step mirror): a substitution that references a
+            # time-varying parameter can't be mirrored to the previous time
+            # level correctly (see `_dynamic_param_symbols`), so leave the
+            # equation in the system.
+            if allow_param_coeffs and (sol.free_symbols & dynamic_param_set):
+                new_eqs.append(eq)
+                continue
 
             substitutions[var1] = sol
             removed_vars.add(var1)
@@ -1213,98 +1309,30 @@ class Model:
             Model._close_substitutions(substitutions)
             sub_keys = set(substitutions.keys())
 
-            # Step A: cache the xreplace step by template.  A naive
-            # `[e.xreplace(substitutions) for e in new_eqs]` makes sympy walk
-            # the FULL tree of every survivor (~389 CoolProp-laden equations
-            # at N=4) just to discover that ~9 out of 10 of them never touch
-            # any symbol in `substitutions`.  Two stacked optimisations:
+            # Apply the closed substitutions in a single pass: equations whose
+            # `free_symbols` are disjoint from the eliminated set keep their
+            # identity (no tree walk), the rest get ONE direct `xreplace`.
             #
-            #   1. **Pre-filter:** equations whose `free_symbols` are disjoint
-            #      from `sub_keys` keep their identity -- no tree allocated.
-            #
-            #   2. **Per-template cache:** equations that DO touch a sub_key
-            #      are normalised to a `(structural_template, mask)` key
-            #      where `mask` is the tuple of placeholder positions whose
-            #      backing Symbol appears in `substitutions`.  Two equations
-            #      sharing the same `(template, mask)` produce structurally
-            #      identical xreplace results -- we compute the substituted
-            #      *template* once and re-bind placeholders -> actual symbols
-            #      per instance.  Combined with `_close_substitutions` having
-            #      already inlined chains, this turns the per-equation tree
-            #      walk into a per-template tree walk + a cheap re-bind.
-            _ph_pool_a = []
-
-            def _ph(k):
-                while len(_ph_pool_a) <= k:
-                    _ph_pool_a.append(sp.Symbol(f"_red_ph_{len(_ph_pool_a)}", real=True))
-                return _ph_pool_a[k]
-
-            template_subbed_cache = {}
+            # A previous per-template placeholder cache here was ~19x SLOWER on
+            # channel / wall-heavy models (measured 26.8 s vs 1.4 s at N=300,
+            # identical output): normalising each instance to a template,
+            # hashing that CoolProp-laden tree for the cache key, and rebinding
+            # placeholders cost far more than a single `xreplace` -- even at a
+            # ~98% template-hit rate, because the rebind is itself a full tree
+            # walk so the cache never avoids the dominant cost.
             n_skipped = 0
             n_applied = 0
-            n_template_hit = 0
             new_eqs_out = []
             for e in new_eqs:
-                if not (e.free_symbols & sub_keys):
+                if e.free_symbols & sub_keys:
+                    new_eqs_out.append(e.xreplace(substitutions))
+                    n_applied += 1
+                else:
                     new_eqs_out.append(e)
                     n_skipped += 1
-                    continue
-                # Normalise this equation's symbols to placeholders, then
-                # mark which placeholder indices are being substituted AND
-                # the structural template of the substitution RHS.  Two
-                # instances share a cache slot iff they have the same
-                # equation template AND the same per-placeholder substitution
-                # RHS template (with all RHS-external symbols themselves
-                # placeholder-normalised in a per-equation-extension pool).
-                sym_order = []
-                sym_to_ph = {}
-                for atom in sp.preorder_traversal(e):
-                    if isinstance(atom, sp.Symbol) and atom not in sym_to_ph:
-                        sym_to_ph[atom] = _ph(len(sym_to_ph))
-                        sym_order.append(atom)
-                template_e = e.xreplace(sym_to_ph)
-
-                # Build the placeholder-space substitution dict for this
-                # instance, extending the placeholder pool as needed for any
-                # symbols present only on RHS values.
-                full_sym_to_ph = dict(sym_to_ph)
-                rhs_sym_orders = []
-                ph_subs_template = {}
-                rhs_templates_for_key = []
-                for k, sym in enumerate(sym_order):
-                    if sym not in substitutions:
-                        continue
-                    rhs = substitutions[sym]
-                    rhs_extra_order = []
-                    for rhs_atom in sp.preorder_traversal(rhs):
-                        if isinstance(rhs_atom, sp.Symbol) and rhs_atom not in full_sym_to_ph:
-                            full_sym_to_ph[rhs_atom] = _ph(len(full_sym_to_ph))
-                            rhs_extra_order.append(rhs_atom)
-                    rhs_template = rhs.xreplace(full_sym_to_ph) if rhs.free_symbols else rhs
-                    ph_subs_template[_ph(k)] = rhs_template
-                    rhs_sym_orders.append(rhs_extra_order)
-                    rhs_templates_for_key.append((k, rhs_template))
-
-                cache_key = (template_e, tuple(rhs_templates_for_key))
-                cached = template_subbed_cache.get(cache_key)
-                if cached is None:
-                    cached = template_e.xreplace(ph_subs_template)
-                    template_subbed_cache[cache_key] = cached
-                else:
-                    n_template_hit += 1
-
-                # Re-bind: the cached substituted template has placeholders
-                # `_red_ph_*` whose intended actual symbols are recorded in
-                # `full_sym_to_ph`.  Reverse the map and xreplace.
-                ph_to_sym = {ph: sym for sym, ph in full_sym_to_ph.items()}
-                new_eqs_out.append(cached.xreplace(ph_to_sym) if ph_to_sym else cached)
-                n_applied += 1
-
             print(
                 f"Applying substitutions to {n_applied}/{len(new_eqs)} equations "
-                f"(skipped {n_skipped} disjoint, "
-                f"{n_template_hit} template-cache hits / "
-                f"{len(template_subbed_cache)} unique templates)"
+                f"(skipped {n_skipped} disjoint)"
             )
             new_eqs = new_eqs_out
         else:
@@ -1905,7 +1933,7 @@ class Model:
     # --- linear-block (multi-var) elimination ----------------------------------------
 
     @line_profiler.profile
-    def remove_linear_block_equations(self, equations, var_symbols):
+    def remove_linear_block_equations(self, equations, var_symbols, allow_param_coeffs=False):
         """Eliminate equations linear in >=3 surviving Variables.
 
         Extension of `remove_trivial_equations` (which only handles 2-var
@@ -1935,10 +1963,19 @@ class Model:
             something that could vanish).  Plain Numbers (incl. negatives)
             are fine.
           * Only Variables (not Parameters) are eligible as pivots.
+
+        When `allow_param_coeffs` is True, Parameters are folded into the
+        constant coefficient field (so `c1*v1 + k*v2 + ... == 0` with `k` a
+        Parameter is recognised as linear).  The existing "numeric pivot
+        coefficient only" guard already makes this division-safe; substitutions
+        whose RHS references a time-varying (`Input`) parameter are additionally
+        skipped so the prev-step mirror stays correct.
         """
         raw_var_set = set(self.raw_var_symbols)
         var_set = set(var_symbols)
         current_to_prev = {v.symbol: v.prev_symbol for v in self.raw_vars_references}
+        param_set = set(self.raw_param_symbols) if allow_param_coeffs else None
+        dynamic_param_set = self._dynamic_param_symbols() if allow_param_coeffs else set()
 
         # Pass 1: count var usage across ALL eqs (linear + nonlinear) and
         # find candidate indices.  Usage drives pivot selection: prefer
@@ -1949,7 +1986,7 @@ class Model:
             for s in eq.free_symbols:
                 if s in var_set:
                     var_usage[s] = var_usage.get(s, 0) + 1
-            res = Model._classify_linear(eq)
+            res = Model._classify_linear(eq, param_set)
             if res is None:
                 continue
             c0, coeffs = res
@@ -1980,7 +2017,7 @@ class Model:
 
         for idx in candidate_indices:
             eq_now = eqs_state[idx]
-            res = Model._classify_linear(eq_now)
+            res = Model._classify_linear(eq_now, param_set)
             if res is None:
                 # Earlier pivot substitution turned this candidate nonlinear
                 # (rare but possible if RHS contained a product).  Leave it
@@ -2015,6 +2052,12 @@ class Model:
                     continue
                 rest = rest - c * s
             sol = rest / cp
+
+            # Guard (prev-step mirror): skip substitutions whose RHS references
+            # a time-varying parameter -- it can't be carried to the previous
+            # time level by `xreplace(current_to_prev)`.
+            if allow_param_coeffs and (sol.free_symbols & dynamic_param_set):
+                continue
 
             substitutions[pivot] = sol
             removed_vars.add(pivot)
@@ -2067,7 +2110,7 @@ class Model:
     def instantiate(self, cse=True, aditional_modules=None, max_remove_trival_passes=1,
                     lambda_cache_dir=None, max_remove_duplicate_passes=5,
                     enable_blt=True, max_remove_linear_block_passes=3,
-                    enable_var_scaling=False):
+                    enable_var_scaling=False, eliminate_param_linear=None):
         # Step B's `declare_equations()` template cache is scoped to this single
         # `instantiate()` call to avoid cross-call contamination (e.g. Air's
         # `Air_rho_ph` Function nodes leaking into a subsequent Hydrogen
@@ -2091,6 +2134,7 @@ class Model:
                     enable_blt=enable_blt,
                     max_remove_linear_block_passes=max_remove_linear_block_passes,
                     enable_var_scaling=enable_var_scaling,
+                    eliminate_param_linear=eliminate_param_linear,
                 )
         finally:
             _eq_cache_var.reset(_eq_cache_token)
@@ -2100,18 +2144,20 @@ class Model:
                           max_remove_trival_passes=1, lambda_cache_dir=None,
                           max_remove_duplicate_passes=5, enable_blt=True,
                           max_remove_linear_block_passes=3,
-                          enable_var_scaling=False):
+                          enable_var_scaling=False, eliminate_param_linear=None):
         if aditional_modules is None:
             aditional_modules = []
-        # `_NUMPY_LAMBDIFY_COMPAT` patches sympy callables that `lambdify`
-        # doesn't know how to translate to numpy by default (e.g. `Heaviside`,
-        # which appears in the Jacobian of any `sp.Max`/`sp.Min`).  Inserted
-        # AFTER `'numpy'` so numpy's own names win, but BEFORE the medium
-        # modules so the compat dict is part of the runtime namespace used
-        # by both fresh-lambdify code-gen AND cached-source re-exec.  Kept
-        # out of `_lambda_modules_sig` (we only signature `aditional_modules`)
-        # so the cache key stays stable across versions of the compat dict.
-        #
+        # Parameter-coefficient linear elimination (treat Parameters as constant
+        # coefficients in the trivial / linear-block reducers).  Opt-in: defaults
+        # to the `HYDROGEN_PARAM_LINEAR_ELIM` env var so it can be A/B-tested
+        # without editing call sites.  See `remove_trivial_equations`.
+        if eliminate_param_linear is None:
+            eliminate_param_linear = os.environ.get(
+                "HYDROGEN_PARAM_LINEAR_ELIM", "").strip().lower() in (
+                "1", "true", "yes", "on")
+        self._eliminate_param_linear = eliminate_param_linear
+        if eliminate_param_linear:
+            print("Parameter-coefficient linear elimination: ENABLED")
         # NOTE on medium-callback wrapping: per-template lambdas that get
         # called with array placeholders need their medium callbacks
         # (`Air_rho_ph` etc.) to broadcast across instances.  However
@@ -2122,7 +2168,7 @@ class Model:
         # here and patch only the vectorised templates' `__globals__`
         # post-hoc, after `_vec_template_use` is decided below.  Scalar
         # templates pay no wrapper overhead at all.
-        all_modules = ["numpy", _NUMPY_LAMBDIFY_COMPAT] + aditional_modules
+        all_modules = ["numpy"] + aditional_modules
 
         # Disk cache for the lambdified residual + Jacobian source.  When the
         # same (geometry, medium, sympy version) has been compiled before, this
@@ -2196,7 +2242,9 @@ class Model:
         # all-`+1` workload reduces structurally to plain UF (one extra
         # integer multiply per `find()`), so this is a strict generalisation
         # of the old code.
+        _t0_collect_conn = time.time()
         connections = self.collect_connections()
+        _timings.append(("collect_connections", time.time() - _t0_collect_conn, []))
         if connections:
             uf_start = time.time()
             uf_parent = {}
@@ -2314,7 +2362,7 @@ class Model:
             for i in range(max_remove_trival_passes):
                 print(f"Removing trivial pass {i+1}")
                 _t_pass = time.time()
-                self.improved_equations, self.all_improved_symbols, pass_subs = self.remove_trivial_equations(self.improved_equations, self.all_improved_symbols)
+                self.improved_equations, self.all_improved_symbols, pass_subs = self.remove_trivial_equations(self.improved_equations, self.all_improved_symbols, allow_param_coeffs=eliminate_param_linear)
                 _trivial_pass_times.append(time.time() - _t_pass)
                 # Accumulate substitutions across passes ONLY when this pass produced
                 # new substitutions: the inner xreplace below would otherwise be 1k+
@@ -2432,7 +2480,8 @@ class Model:
                 _t_pass = time.time()
                 self.improved_equations, self.all_improved_symbols, lb_subs = (
                     self.remove_linear_block_equations(
-                        self.improved_equations, self.all_improved_symbols)
+                        self.improved_equations, self.all_improved_symbols,
+                        allow_param_coeffs=eliminate_param_linear)
                 )
                 _lb_pass_times.append(time.time() - _t_pass)
                 if not lb_subs:
@@ -2997,7 +3046,15 @@ class Model:
         # Drop the now-unused symbolic Jacobian Matrix.
         self.jacobian = None
 
-        self.active_vars_references = [var for var in self.raw_vars_references if var.symbol in self.improved_vars]
+        # Membership must be tested against a SET: `improved_vars` is a list, so
+        # the previous `var.symbol in self.improved_vars` was an O(n) scan run
+        # once per raw var -> O(n^2) overall, which dominated "other" at large
+        # segment counts.
+        _t0_active = time.time()
+        _improved_var_set = set(self.improved_vars)
+        self.active_vars_references = [var for var in self.raw_vars_references
+                                       if var.symbol in _improved_var_set]
+        _timings.append(("active vars references", time.time() - _t0_active, []))
 
         # Per-variable scale vector for the Newton convergence metric.
         # Per-Variable `scale` attribute wins; otherwise we fall back to
@@ -3121,7 +3178,9 @@ class Model:
         # instant instead of integrating across the discontinuity.
         self._event_times = self._collect_events()
 
+        _t0_gc = time.time()
         gc.collect()
+        _timings.append(("gc.collect", time.time() - _t0_gc, []))
 
         _t_total = time.time() - _t_instantiate_start
         _measured = sum(s for _, s, _ in _timings)

@@ -18,8 +18,8 @@ Separate processes give each its own clean in-memory cache.
 
 Run from the project root::
 
-    python examples/UI/bench_feos_vs_coolprop.py            # default stop_time
-    python examples/UI/bench_feos_vs_coolprop.py 20         # custom stop_time
+    python benchmarks/bench_feos_vs_coolprop.py            # default stop_time
+    python benchmarks/bench_feos_vs_coolprop.py 20         # custom stop_time
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import sys
 import time
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 

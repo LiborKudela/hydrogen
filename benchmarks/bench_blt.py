@@ -13,8 +13,8 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from examples.pipe_tree import TreeSystem, _bernoulli_warm_start  # noqa: E402
-from examples.run_system import System as RunSystem  # noqa: E402
+from tutorials.pipe_tree import TreeSystem, _bernoulli_warm_start  # noqa: E402
+from tutorials.run_system import System as RunSystem  # noqa: E402
 from hydrogen import CoolPropMedium  # noqa: E402
 
 

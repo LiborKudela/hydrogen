@@ -4,7 +4,7 @@ Covers two scenarios:
 
   * Forward flow:  the legacy `dU/dt = m_dot_in*h_in - m_dot_out*h` and
     `dm/dt = m_dot_in - m_dot_out` behavior must be reproduced exactly,
-    so that existing examples like `examples/loop_pump_pipe.py` keep
+    so that existing tutorials like `tutorials/loop_pump_pipe.py` keep
     behaving the same.
 
   * Reverse flow:  with `m_dot_in < 0` and `m_dot_out < 0` (fluid moving
@@ -92,7 +92,7 @@ class _BufferTestSystem(Model):
 
     This is enough to exercise the buffer's mass + energy balance and its
     new smooth-blend inlet under both flow directions; the loop-breaking
-    rank-deficiency aspect is covered by `examples/loop_pump_pipe.py`.
+    rank-deficiency aspect is covered by `tutorials/loop_pump_pipe.py`.
     """
 
     def __init__(self, h_inlet: float):
@@ -108,7 +108,7 @@ class _BufferTestSystem(Model):
 
     def declare_equations(self):
         # Standard (p, h, m_dot) wiring -- exactly the same shape as
-        # `examples/loop_pump_pipe.py`.  Under "flow into me", both faces
+        # `tutorials/loop_pump_pipe.py`.  Under "flow into me", both faces
         # of every m_dot wire describe fluid entering their own component
         # at the shared interface, so the two values are equal in
         # magnitude with opposite sign -> sum-to-zero connection on the

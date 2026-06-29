@@ -21,7 +21,7 @@ Validation (printed + asserted at the end):
     what the q/m_dot and per-segment-area corrections buy us).
   * The gas cools (h_out < h_in) and the metal warms above its 20 C start.
 
-Run with `python examples/conjugate_pipe.py` from the project root.
+Run with `python tutorials/conjugate_pipe.py` from the project root.
 """
 
 from __future__ import annotations
@@ -106,22 +106,25 @@ def main():
         idx = next(i for i, n in enumerate(names) if n.endswith(suffix))
         return state[:, idx]
 
-    h_in = trace('.pipe.pipe.h_in')
-    h_out = trace('.pipe.pipe.h_out')
+    # The pipe is a SegmentedChannel with N cells / N+1 shared faces: face 0 is
+    # the inlet, face N the outlet (h_0..h_N, p_0..p_N), with per-cell
+    # q_inflow_i and wall nodes wall_i_0.
+    h_in = trace('.pipe.pipe.h_0')
+    h_out = trace(f'.pipe.pipe.h_{N}')
     m_dot = trace('.pipe.pipe.m_dot_in')
     q_total = np.zeros_like(h_in)
     for i in range(N):
-        q_total = q_total + trace(f'.pipe_segment_{i}.q_inflow')
+        q_total = q_total + trace(f'.pipe.pipe.q_inflow_{i}')
     fluid_power = m_dot * (h_out - h_in)
 
     # Convert inlet/outlet enthalpy to temperature for a readable summary.
-    p_io = trace('.pipe.pipe.p_in')
+    p_io = trace('.pipe.pipe.p_0')
     T_in = np.array([AIR.eval_T_ph(p_io[k], h_in[k]) for k in range(len(t))])
-    p_out = trace('.pipe.pipe.p_out')
+    p_out = trace(f'.pipe.pipe.p_{N}')
     T_out = np.array([AIR.eval_T_ph(p_out[k], h_out[k]) for k in range(len(t))])
 
-    wall_first = trace('.wall_0.T_a')
-    wall_last = trace(f'.wall_{N - 1}.T_a')
+    wall_first = trace('.wall_0_0.T_a')
+    wall_last = trace(f'.wall_{N - 1}_0.T_a')
 
     print()
     print("=== Conjugate hot-gas pipe summary ===")
@@ -147,7 +150,7 @@ def main():
     # quasi-steady state (wall storage still charging, so allow slack).
     assert fluid_power[-1] < 0.0, "fluid must be giving up heat"
 
-    out_path = plot_results(system.record, "conjugate_pipe.html", show=False, subdir="examples")
+    out_path = plot_results(system.record, "conjugate_pipe.html", show=False, subdir="tutorials")
     print()
     print(f"Plot written to {out_path}")
 

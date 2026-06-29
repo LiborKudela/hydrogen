@@ -1,7 +1,7 @@
 """On-demand variable streams over a live host run (`SystemProxy.vars_stream`).
 
 Spawns a real host (``workers=1``) running the CoolProp-free signal system from
-``examples/host_client/signal_dynamics.json`` and checks the stream contract:
+``tutorials/host_client/signal_dynamics.json`` and checks the stream contract:
 
 * a stream watches nothing until ``series`` / ``series_values`` register a name,
   which expands a suffix to every match and backfills the full history;
@@ -22,7 +22,7 @@ import hydrogen
 
 _SPEC = (
     Path(__file__).resolve().parent.parent
-    / "examples" / "host_client" / "signal_dynamics.json"
+    / "tutorials" / "host_client" / "signal_dynamics.json"
 ).read_text()
 
 # Full recorded names of the signal system (root composite is `_SpecComposite`).

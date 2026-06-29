@@ -15,9 +15,9 @@ Two complementary demos:
       GUI emit it" workflow, and it exercises validation + nesting.
 
 Both parts self-validate (they `assert` their invariants), so this script
-doubles as an end-to-end serialization test under `pytest -m examples`.
+doubles as an end-to-end serialization test under `pytest -m tutorials`.
 
-Run with `python examples/serialize_system.py` from the project root.
+Run with `python tutorials/serialize_system.py` from the project root.
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ def part1_roundtrip():
     text = to_json(original, indent=2)
 
     # ...and persist the JSON to disk (git-ignored sandbox).
-    out_path = Path(local_results_path("examples", "fluid_line.json"))
+    out_path = Path(local_results_path("tutorials", "fluid_line.json"))
     out_path.write_text(text)
     print(f"\nSpec written to {out_path}")
     print(f"  hydrogen_version : {spec['hydrogen_version']}")

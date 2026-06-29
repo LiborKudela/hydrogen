@@ -151,11 +151,13 @@ def test_conjugate_pipe_energy_conservation_and_cooling():
         sys.next_step()
 
     rec = sys.record
-    h_in = _trace(rec, '.pipe.pipe.h_in')[-1]
-    h_out = _trace(rec, '.pipe.pipe.h_out')[-1]
+    # Pipe uses a SegmentedChannel: inlet/outlet are faces 0 and n, and each
+    # cell owns a `q_inflow_{i}` wall-heat diagnostic.
+    h_in = _trace(rec, '.pipe.pipe.h_0')[-1]
+    h_out = _trace(rec, f'.pipe.pipe.h_{n}')[-1]
     m_dot = _trace(rec, '.pipe.pipe.m_dot_in')[-1]
 
-    q_total = sum(_trace(rec, f'.pipe_segment_{i}.q_inflow')[-1] for i in range(n))
+    q_total = sum(_trace(rec, f'.pipe.pipe.q_inflow_{i}')[-1] for i in range(n))
 
     # Telescoping energy balance: total fluid enthalpy-flux change == sum of
     # per-segment wall heats.  This is the headline check for the q/m_dot and
@@ -193,10 +195,10 @@ def test_conjugate_pipe_quasi_static_walls():
     # No wall capacities -> no der_ states attached to the walls.
     assert not any('.wall_' in n_ and 'der_' in n_ for n_ in rec['vars_names'])
 
-    h_in = _trace(rec, '.pipe.pipe.h_in')[-1]
-    h_out = _trace(rec, '.pipe.pipe.h_out')[-1]
+    h_in = _trace(rec, '.pipe.pipe.h_0')[-1]
+    h_out = _trace(rec, f'.pipe.pipe.h_{n}')[-1]
     m_dot = _trace(rec, '.pipe.pipe.m_dot_in')[-1]
-    q_total = sum(_trace(rec, f'.pipe_segment_{i}.q_inflow')[-1] for i in range(n))
+    q_total = sum(_trace(rec, f'.pipe.pipe.q_inflow_{i}')[-1] for i in range(n))
 
     fluid_power = m_dot * (h_out - h_in)
     rel_err = abs(fluid_power - q_total) / abs(q_total)

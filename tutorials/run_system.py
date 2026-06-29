@@ -2,10 +2,10 @@
 
 (The pipes are adiabatic: `StraightPipe` defaults to `heat_port=False`.  To make
 them exchange heat, build them with `heat_port=True` and wire a thermal boundary
-or wall to each segment's `wall` port -- see `examples/conjugate_pipe.py`.)
+or wall to each segment's `wall` port -- see `tutorials/conjugate_pipe.py`.)
 
-Run with `python -m examples.run_system` from the project root, or just
-`python examples/run_system.py` (the small `sys.path` shim below makes the latter
+Run with `python -m tutorials.run_system` from the project root, or just
+`python tutorials/run_system.py` (the small `sys.path` shim below makes the latter
 work without first `pip install -e .`-ing the package).
 """
 
@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-# Allow running this script directly via `python examples/run_system.py` by adding the
+# Allow running this script directly via `python tutorials/run_system.py` by adding the
 # project root (one level up from this file) to sys.path. No-op when the package is
 # already installed.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -148,7 +148,7 @@ def main():
     assert err_osc_z < max(1e-2, 3 * expected_osc_z), "z_osc outside CN phase-drift budget"
 
     out_path = plot_results(model_test.record, "model_test.html",
-                            show=False, subdir="examples")
+                            show=False, subdir="tutorials")
     print(f"Plot written to {out_path}")
 
 
