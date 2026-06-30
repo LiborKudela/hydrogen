@@ -58,6 +58,7 @@ def build_model(n_segments: int, engine: str):
             self.add_component("pipe_2", Pipe(
                 HYDROGEN, D=0.01, L=1.0, epsilon=1e-6, z_in=0.0, z_out=0.0,
                 n_segments=n_segments, layers=layers, channel_engine=engine,
+                dynamic="static",
                 p_ext=1.0))
             self.add_component("tank_3", Tank(
                 HYDROGEN, volume=0.05, diameter=0.3, layers=layers,

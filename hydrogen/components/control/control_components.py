@@ -41,6 +41,14 @@ from ...ports import Port
 # Channel name carried by every signal connector (the connector's value).
 _SIGNAL_CHANNEL = "value"
 
+# Shared metadata for the optional signal `unit` tag every block carries.  The
+# blocks have no common annotated `__init__`, so this spec is authored once and
+# referenced from each subclass signature via ``Annotated[...]`` -- a single
+# source of truth for the catalog and `declare_components`.
+_SPEC_SIGNAL_UNIT = ParamSpec(
+    "Optional unit tag for the signal channel (e.g. 'Pa', 'K', '1'); None "
+    "leaves the signal untagged / dimensionless.")
+
 
 class RealSignal(Port):
     """Causal real-valued signal connector (Modelica RealInput / RealOutput).
@@ -86,13 +94,6 @@ class Block(Model):
     #: Abstract base -- excluded from the component catalog / registry.
     _catalog_abstract = True
 
-    #: Shared metadata: every block carries an optional signal `unit` tag.
-    PARAMS = {
-        "unit": ParamSpec(
-            "Optional unit tag for the signal channel (e.g. 'Pa', 'K', '1'); "
-            "None leaves the signal untagged / dimensionless."),
-    }
-
     def _add_input(self, name="u", *, init=0.0, unit=None, require_connection=True):
         self.add_component(name, Variable(init, unit))
         self.add_port(name, RealSignal.as_input(
@@ -118,7 +119,7 @@ class Constant(Block):
     UI_ICON = "constant.svg"
 
     def __init__(self, k: Annotated[float, ParamSpec("Constant output value.")] = 0.0,
-                 unit=None):
+                 unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None):
         self.k = k
         self.unit = unit
         super().__init__()
@@ -167,7 +168,7 @@ class Step(_TimeSource):
                              "occurs.", unit="s")] = 0.0,
         offset: Annotated[float, ParamSpec("Baseline output before the "
                          "step.")] = 0.0,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         self.height = height
         self.start_time = start_time
@@ -197,7 +198,7 @@ class Ramp(_TimeSource):
                              "begins.", unit="s")] = 0.0,
         offset: Annotated[float, ParamSpec("Baseline output before the "
                          "ramp.")] = 0.0,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         if duration <= 0.0:
             raise ValueError("Ramp duration must be > 0")
@@ -236,7 +237,7 @@ class Sine(_TimeSource):
                          "sine.")] = 0.0,
         start_time: Annotated[float, ParamSpec("Time before which the output "
                              "stays at offset.", unit="s")] = 0.0,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         self.amplitude = amplitude
         self.freq = freq
@@ -291,7 +292,7 @@ class SmoothRamp(_TimeSource):
         corner: Annotated[float, ParamSpec("Corner-rounding width as a fraction "
                          "of duration (0 < corner <= 0.5); smaller is sharper.")]
         = 0.1,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         if duration <= 0.0:
             raise ValueError("SmoothRamp duration must be > 0")
@@ -333,7 +334,8 @@ class Gain(Block):
     UI_ICON = "gain.svg"
 
     def __init__(self, k: Annotated[float, ParamSpec("Gain factor applied to "
-                "the input.")] = 1.0, unit=None):
+                "the input.")] = 1.0,
+                unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None):
         self.k = k
         self.unit = unit
         super().__init__()
@@ -356,7 +358,7 @@ class Add(Block):
         self,
         k1: Annotated[float, ParamSpec("Weight on the first input u1.")] = 1.0,
         k2: Annotated[float, ParamSpec("Weight on the second input u2.")] = 1.0,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         self.k1 = k1
         self.k2 = k2
@@ -381,7 +383,7 @@ class Feedback(Block):
 
     UI_ICON = "feedback.svg"
 
-    def __init__(self, unit=None):
+    def __init__(self, unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None):
         self.unit = unit
         super().__init__()
 
@@ -404,7 +406,7 @@ class Sum(Block):
         n: Annotated[int, ParamSpec("Number of inputs (>= 1).")],
         weights: Annotated[list | None, ParamSpec("Per-input weights (length "
                           "n); None = all ones.")] = None,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         if n < 1:
             raise ValueError("Sum needs at least one input")
@@ -434,7 +436,7 @@ class Product(Block):
 
     UI_ICON = "product.svg"
 
-    def __init__(self, unit=None):
+    def __init__(self, unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None):
         self.unit = unit
         super().__init__()
 
@@ -466,7 +468,7 @@ class Limiter(Block):
         hi: Annotated[float, ParamSpec("Upper saturation bound (> lo).")] = 1.0,
         eps: Annotated[float, ParamSpec("Smoothing scale of the soft min/max "
                       "blend; keep small relative to the signal range.")] = 1e-3,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         if hi <= lo:
             raise ValueError("Limiter requires hi > lo")
@@ -514,7 +516,7 @@ class Integrator(Block):
         k: Annotated[float, ParamSpec("Integral gain on the input.")] = 1.0,
         y_start: Annotated[float, ParamSpec("Initial output (integration "
                           "constant).")] = 0.0,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         self.k = k
         self.y_start = y_start
@@ -541,7 +543,7 @@ class FirstOrder(Block):
         T: Annotated[float, ParamSpec("Time constant (> 0).", unit="s")],
         k: Annotated[float, ParamSpec("Steady-state gain.")] = 1.0,
         y_start: Annotated[float, ParamSpec("Initial output.")] = 0.0,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         if T <= 0.0:
             raise ValueError("FirstOrder time constant T must be > 0")
@@ -590,7 +592,7 @@ class PID(Block):
         kd: Annotated[float, ParamSpec("Derivative gain.", unit="s")] = 0.0,
         Tf: Annotated[float, ParamSpec("Derivative-filter time constant (> 0); "
                      "der(x_d) -> de/dt as Tf -> 0.", unit="s")] = 0.1,
-        unit=None,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         if Tf <= 0.0:
             raise ValueError("PID derivative-filter time Tf must be > 0")

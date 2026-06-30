@@ -252,11 +252,22 @@ class Pipe(Model):
                        "StraightPipe chain of TwoPortSegments).",
                        choices=("segmented", "straight"), structural=True)]
                        = "segmented",
+        dynamic: Annotated[str, ParamSpec("Flow dynamic level (segmented engine "
+                       "only): 'static' (quasi-steady, default), 'advective' "
+                       "(transient cell energy: conduction + dispersion + "
+                       "enthalpy storage), or 'compressible' (not yet "
+                       "implemented).",
+                       choices=("static", "advective", "compressible"),
+                       structural=True)] = "static",
     ):
         if channel_engine not in ("straight", "segmented"):
             raise ValueError(
                 f"Pipe: channel_engine must be 'straight' or 'segmented', "
                 f"got {channel_engine!r}")
+        if dynamic != "static" and channel_engine != "segmented":
+            raise ValueError(
+                f"Pipe: dynamic={dynamic!r} requires channel_engine='segmented' "
+                f"(the 'straight' engine is quasi-steady only).")
         if outer_thermal not in self._OUTER_MODES:
             raise ValueError(
                 f"Pipe: outer_thermal must be one of {self._OUTER_MODES}, "
@@ -300,6 +311,7 @@ class Pipe(Model):
         self.p_init = p_init
         self.count = int(count)
         self.channel_engine = channel_engine
+        self.dynamic = dynamic
         self.n_leaky = n_leaky
         self.any_leaky = n_leaky > 0
         # Radial geometry: cumulative radii r[0]=D/2, r[k+1]=r[k]+thickness_k.
@@ -330,7 +342,7 @@ class Pipe(Model):
                 self.medium, D=self.D, L=self.L, epsilon=self.epsilon,
                 z_in=self.z_in, z_out=self.z_out, N=self.n_segments,
                 heat_port=True, leaky=self.any_leaky, multiphase=self.multiphase,
-                count=N))
+                dynamic=self.dynamic, count=N))
         else:
             self.add_component('pipe', StraightPipe(
                 self.medium, D=self.D, L=self.L, epsilon=self.epsilon,

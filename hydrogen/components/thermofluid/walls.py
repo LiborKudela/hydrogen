@@ -46,6 +46,39 @@ from .ports import PermeationPort_pN, ThermalPort_TQ
 
 
 # ---------------------------------------------------------------------------
+# Shared parameter metadata reused across every `TwoNodeWall` geometry.  The
+# subclasses (`FlatWall` / `CylindricalWall` / `SphericalWall`) have no common
+# annotated ``__init__``, so these specs are authored once here and referenced
+# from each subclass's signature via ``Annotated[...]`` -- a single source of
+# truth consumed by both the component catalog and ``declare_components``.
+# `dynamic` / `leaky` are ``structural`` so `cache_key_flag_names()` keys the
+# equation-template cache on them.
+# ---------------------------------------------------------------------------
+_SPEC_RHO = ParamSpec("Density of the wall material.", unit="kg/m^3")
+_SPEC_CP = ParamSpec("Specific heat capacity of the wall material.",
+                     unit="J/(kg*K)")
+_SPEC_K = ParamSpec("Thermal conductivity of the wall material.",
+                    unit="W/(m*K)")
+_SPEC_T_INIT = ParamSpec("Initial wall temperature.", unit="K")
+_SPEC_DYNAMIC = ParamSpec(
+    "If true the wall has thermal mass (heat-up transient); if false it "
+    "conducts quasi-statically with no capacity.", structural=True)
+_SPEC_LEAKY = ParamSpec(
+    "Enable gas permeation through the wall thickness (requires a "
+    "`permeation_flux`).", structural=True)
+_SPEC_PERM_FLUX = ParamSpec(
+    "Permeation flux model (SteadyRichardson / TransientDiffusion) supplying "
+    "the pressure-gradient -> mass-flow law; required when leaky.",
+    relevant_when={"leaky": True})
+_SPEC_P_IN_INIT = ParamSpec(
+    "Initial inner-surface partial pressure (only used when leaky).",
+    unit="Pa", relevant_when={"leaky": True})
+_SPEC_P_OUT_INIT = ParamSpec(
+    "Initial outer-surface partial pressure (only used when leaky).",
+    unit="Pa", relevant_when={"leaky": True})
+
+
+# ---------------------------------------------------------------------------
 # Boundary conditions (single-port drivers for a thermal network)
 # ---------------------------------------------------------------------------
 
@@ -375,38 +408,10 @@ class TwoNodeWall(Model):
         `Parameter`/`ParameterAlias` to share a parent's symbol.
     """
 
-    #: Single-source metadata for the shared material + permeation params (see
-    #: `hydrogen.paramspec`): read both by the component catalog and by
-    #: `declare_components` below, so the units live in exactly one place.
-    #: These args have no shared `__init__` to annotate (subclasses define
-    #: their own constructor), so the specs stay here.  `dynamic` and `leaky`
-    #: are marked ``structural`` so `cache_key_flag_names()` keys the
-    #: equation-template cache on them (`dynamic` toggles the ODE vs algebraic
-    #: thermal form; `leaky` toggles the whole permeation equation set).
-    PARAMS = {
-        "rho": ParamSpec("Density of the wall material.", unit="kg/m^3"),
-        "cp": ParamSpec("Specific heat capacity of the wall material.",
-                        unit="J/(kg*K)"),
-        "k": ParamSpec("Thermal conductivity of the wall material.",
-                       unit="W/(m*K)"),
-        "T_init": ParamSpec("Initial wall temperature.", unit="K"),
-        "dynamic": ParamSpec(
-            "If true the wall has thermal mass (heat-up transient); if false "
-            "it conducts quasi-statically with no capacity.", structural=True),
-        "leaky": ParamSpec(
-            "Enable gas permeation through the wall thickness (requires a "
-            "`permeation_flux`).", structural=True),
-        "permeation_flux": ParamSpec(
-            "Permeation flux model (SteadyRichardson / TransientDiffusion) "
-            "supplying the pressure-gradient -> mass-flow law; required when "
-            "leaky.", relevant_when={"leaky": True}),
-        "p_in_init": ParamSpec("Initial inner-surface partial pressure (only "
-                               "used when leaky).", unit="Pa",
-                               relevant_when={"leaky": True}),
-        "p_out_init": ParamSpec("Initial outer-surface partial pressure (only "
-                                "used when leaky).", unit="Pa",
-                                relevant_when={"leaky": True}),
-    }
+    #: The shared material + permeation params (`rho`/`cp`/`k`/`T_init`/
+    #: `dynamic`/`leaky`/`permeation_flux`/`p_*_init`) are annotated directly in
+    #: each subclass `__init__` via the module-level ``_SPEC_*`` constants above,
+    #: so their metadata is authored once and inherited by the catalog.
 
     #: The injected flux model's structural identity contributes to the
     #: equation-template cache key (alongside the derived structural `dynamic` /
@@ -595,14 +600,20 @@ class FlatWall(TwoNodeWall):
     """
 
     def __init__(
-        self, rho, cp, k,
+        self,
+        rho: Annotated[float, _SPEC_RHO],
+        cp: Annotated[float, _SPEC_CP],
+        k: Annotated[float, _SPEC_K],
         A: Annotated[float, ParamSpec("Heat-transfer (conduction) area of the "
                     "slab.", unit="m^2")],
         L: Annotated[float, ParamSpec("Slab thickness (the conduction "
                     "length).", unit="m")],
-        T_init=293.15, dynamic=True,
-        leaky=False, permeation_flux=None,
-        p_in_init=101325.0, p_out_init=101325.0,
+        T_init: Annotated[float, _SPEC_T_INIT] = 293.15,
+        dynamic: Annotated[bool, _SPEC_DYNAMIC] = True,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        permeation_flux: Annotated[object, _SPEC_PERM_FLUX] = None,
+        p_in_init: Annotated[float, _SPEC_P_IN_INIT] = 101325.0,
+        p_out_init: Annotated[float, _SPEC_P_OUT_INIT] = 101325.0,
     ):
         self.rho = rho
         self.cp = cp
@@ -692,15 +703,18 @@ class CylindricalWall(TwoNodeWall):
     """
 
     def __init__(
-        self, rho, cp, k,
+        self,
+        rho: Annotated[float, _SPEC_RHO],
+        cp: Annotated[float, _SPEC_CP],
+        k: Annotated[float, _SPEC_K],
         r_in: Annotated[float, ParamSpec("Inner radius of the tube wall (bore "
                        "side).", unit="m")],
         r_out: Annotated[float, ParamSpec("Outer radius of the tube wall.",
                         unit="m")],
         length: Annotated[float, ParamSpec("Axial length of the wall "
                          "segment.", unit="m")],
-        T_init=293.15,
-        dynamic=True,
+        T_init: Annotated[float, _SPEC_T_INIT] = 293.15,
+        dynamic: Annotated[bool, _SPEC_DYNAMIC] = True,
         angle_fraction: Annotated[float, ParamSpec("Fraction of the full 2*pi "
                        "tube the wall sweeps (1 = full tube, 0.5 = half, ...); "
                        "scales all extensive terms (mass, conductance, leak).",
@@ -709,10 +723,10 @@ class CylindricalWall(TwoNodeWall):
                        "this one component represents (multiplicity >= 1); "
                        "scales every extensive term so N tubes simulate as one "
                        "without extra equations.", unit="1")] = 1.0,
-        leaky=False,
-        permeation_flux=None,
-        p_in_init=101325.0,
-        p_out_init=101325.0,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        permeation_flux: Annotated[object, _SPEC_PERM_FLUX] = None,
+        p_in_init: Annotated[float, _SPEC_P_IN_INIT] = 101325.0,
+        p_out_init: Annotated[float, _SPEC_P_OUT_INIT] = 101325.0,
     ):
         if not (r_out > r_in > 0):
             raise ValueError(
@@ -841,13 +855,16 @@ class SphericalWall(TwoNodeWall):
     """
 
     def __init__(
-        self, rho, cp, k,
+        self,
+        rho: Annotated[float, _SPEC_RHO],
+        cp: Annotated[float, _SPEC_CP],
+        k: Annotated[float, _SPEC_K],
         r_in: Annotated[float, ParamSpec("Inner radius of the spherical shell "
                        "(bore side).", unit="m")],
         r_out: Annotated[float, ParamSpec("Outer radius of the spherical "
                         "shell.", unit="m")],
-        T_init=293.15,
-        dynamic=True,
+        T_init: Annotated[float, _SPEC_T_INIT] = 293.15,
+        dynamic: Annotated[bool, _SPEC_DYNAMIC] = True,
         angle_fraction: Annotated[float, ParamSpec("Fraction of the full sphere "
                        "(4*pi solid angle) the wall covers (1 = full shell, "
                        "0.5 = hemisphere, ...); scales all extensive terms "
@@ -856,10 +873,10 @@ class SphericalWall(TwoNodeWall):
                        "this one component represents (multiplicity >= 1); "
                        "scales every extensive term so N shells simulate as one "
                        "without extra equations.", unit="1")] = 1.0,
-        leaky=False,
-        permeation_flux=None,
-        p_in_init=101325.0,
-        p_out_init=101325.0,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        permeation_flux: Annotated[object, _SPEC_PERM_FLUX] = None,
+        p_in_init: Annotated[float, _SPEC_P_IN_INIT] = 101325.0,
+        p_out_init: Annotated[float, _SPEC_P_OUT_INIT] = 101325.0,
     ):
         if not (r_out > r_in > 0):
             raise ValueError(

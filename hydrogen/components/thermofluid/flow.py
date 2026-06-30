@@ -11,8 +11,9 @@ port and a permeation leak port, so they are shared across this package.
 
 from __future__ import annotations
 
+import re
 import warnings
-from typing import Annotated
+from typing import Annotated, Callable
 
 import numpy as np
 import sympy as sp
@@ -288,15 +289,6 @@ class TwoPortSegment(Model):
     #: Allowed values for the `multiphase` flag.
     _MULTIPHASE_MODES = ("single", "HEM")
 
-    #: The two callables can't carry a meaningful scalar type annotation, so
-    #: their metadata stays here (merged with the Annotated specs below).
-    PARAMS = {
-        "f_factor_func": ParamSpec("Callable f(Re, epsilon, Dh) returning the "
-                                  "Darcy friction factor symbolically."),
-        "q_inflow_func": ParamSpec("Callable returning the radial heat input "
-                                  "rate symbolically."),
-    }
-
     def __init__(
         self,
         medium: CoolPropMedium,
@@ -312,8 +304,11 @@ class TwoPortSegment(Model):
         z_out: Annotated[float, _SPEC_Z_OUT],
         L: Annotated[float, _SPEC_L],
         epsilon: Annotated[float, _SPEC_EPSILON],
-        f_factor_func,
-        q_inflow_func,
+        f_factor_func: Annotated[Callable, ParamSpec(
+            "Callable f(Re, epsilon, Dh) returning the Darcy friction factor "
+            "symbolically.")],
+        q_inflow_func: Annotated[Callable, ParamSpec(
+            "Callable returning the radial heat input rate symbolically.")],
         multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
         heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
         leaky: Annotated[bool, _SPEC_LEAKY] = False,
@@ -965,8 +960,26 @@ class SegmentedChannel(Model):
     Dynamic levels (``dynamic=``):
       * ``"static"`` (default) -- quasi-steady mass / momentum / energy, exactly
         the `TwoPortSegment` physics.
-      * ``"advective"`` / ``"compressible"`` -- transient enthalpy advection /
-        + mass storage.  Scaffolded; not yet implemented.
+      * ``"advective"`` -- transient **energy** on a **cell-centred** scalar.
+        The hydraulic side (``p_j``/``M_j``/``w_j``) stays face-oriented and
+        quasi-steady exactly as ``"static"`` (no acoustics), but the
+        thermodynamic state moves to cell centres: each cell ``i`` carries an
+        independent enthalpy ``hc_i`` (with cell pressure ``pc_i`` = face mean
+        and EoS-derived ``Tc_i``/``rhoc_i``/``kc_i``) and a conserved internal
+        energy ``U_i`` (companion ``der_U_i``).  The balance is
+        ``dU_i/dt = (advective enthalpy flux in - out) + q_wall + (axial
+        diffusion in - out)``.  Face enthalpies are *reconstructed* from the cell
+        values with the upwind-biased ``advection_scheme`` stencil
+        (``'U<n_up>D<n_down>'``, default ``'U2D1'``; sign-aware, reduced order at
+        the ends), so the energy flux ``M_j*h_j`` is a true upwind reconstruction
+        rather than a slaved face DOF.  Axial diffusion = Fourier conduction +
+        a pluggable ``dispersion_func`` (default conduction only; opt into
+        Taylor--Aris), assembled as per-face ``F_diff_j`` fluxes that telescope
+        to a compact Laplacian on the cell temperatures (no checkerboard null
+        mode); the channel ends carry no axial diffusion.  At steady state
+        (``der_U -> 0``, no leak) the equation set reduces to ``"static"``.
+      * ``"compressible"`` -- ``"advective"`` + mass storage + momentum inertia
+        (full acoustic wave operator).  Scaffolded; not yet implemented.
     """
 
     _MULTIPHASE_MODES = ("single", "HEM")
@@ -974,14 +987,8 @@ class SegmentedChannel(Model):
     #: Instance flags that change the emitted equation structure, so the
     #: per-class template cache keeps heated / leaky / multiphase / sized
     #: variants distinct (see `Model.collect_equations`).
-    _cache_key_flags = ("multiphase", "heat_port", "leaky", "dynamic", "N")
-
-    PARAMS = {
-        "f_factor_func": ParamSpec("Callable f(Re, epsilon, Dh) returning the "
-                                  "Darcy friction factor symbolically."),
-        "q_inflow_func": ParamSpec("Callable returning the radial heat input "
-                                  "rate symbolically."),
-    }
+    _cache_key_flags = ("multiphase", "heat_port", "leaky", "dynamic", "N",
+                        "advection_scheme")
 
     def __init__(
         self,
@@ -996,8 +1003,17 @@ class SegmentedChannel(Model):
         N: Annotated[int, ParamSpec("Number of finite-volume cells (>= 1); the "
                     "channel has N+1 shared faces.", unit="1",
                     structural=True)] = 1,
-        f_factor_func=None,
-        q_inflow_func=None,
+        f_factor_func: Annotated[Callable, ParamSpec(
+            "Callable f(Re, epsilon, Dh) returning the Darcy friction factor "
+            "symbolically.")] = None,
+        q_inflow_func: Annotated[Callable, ParamSpec(
+            "Callable returning the radial heat input rate symbolically.")] = None,
+        dispersion_func: Annotated[Callable, ParamSpec(
+            "Callable f(w, Dh, alpha) returning the effective axial diffusivity "
+            "[m^2/s] for the advective level (default: conduction only).")] = None,
+        advection_scheme: Annotated[str, ParamSpec(
+            "Face-enthalpy reconstruction for the advective level "
+            "('U<n_up>D<n_down>'); default 'U2D1'.", structural=True)] = "U2D1",
         multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
         heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
         leaky: Annotated[bool, _SPEC_LEAKY] = False,
@@ -1016,10 +1032,11 @@ class SegmentedChannel(Model):
         if dynamic not in self._DYNAMIC_LEVELS:
             raise ValueError(
                 f"dynamic must be one of {self._DYNAMIC_LEVELS}, got {dynamic!r}")
-        if dynamic != "static":
+        if dynamic == "compressible":
             raise NotImplementedError(
-                f"SegmentedChannel dynamic={dynamic!r} is scaffolded but not yet "
-                f"implemented; use 'static' (quasi-steady) for now.")
+                "SegmentedChannel dynamic='compressible' (mass + momentum "
+                "storage / acoustics) is scaffolded but not yet implemented; "
+                "use 'static' or 'advective'.")
         if int(N) != N or N < 1:
             raise ValueError(f"N must be an integer >= 1, got {N!r}")
         self.multiphase = multiphase
@@ -1042,11 +1059,30 @@ class SegmentedChannel(Model):
         self.f_factor_func = f_factor_func or self.get_churchill_f_factor
         self.q_inflow_func = q_inflow_func or (
             self.get_q_inflow if self.heat_port else self.get_q_inflow_adiabatic)
+        # Axial diffusion closure, used only by the `advective`/`compressible`
+        # levels.  Defaults to molecular conduction only (no dispersion
+        # enhancement): the Taylor--Aris term grows like w^2/alpha and on a
+        # coarse grid (cell-Peclet >> 2) it makes the central-difference energy
+        # balance very stiff.  Opt in with
+        # `dispersion_func=<channel>.get_taylor_aris_dispersion` once N is large
+        # enough to keep Pe_cell <~ 2 (see `_warn_cell_peclet`).
+        self._dispersion_is_custom = dispersion_func is not None
+        self.dispersion_func = dispersion_func or self.get_conduction_only
+        self.advection_scheme = advection_scheme
+        self._n_up, self._n_down = self._parse_advection_scheme(advection_scheme)
         h_std = float(medium.eval_h_pT(101325.0, 293.15))
         self._h_std = h_std
         self._rho_std = float(medium.eval_rho_ph(101325.0, h_std))
         self._mu_std = float(medium.eval_mu_ph(101325.0, h_std))
         self._k_std = float(medium.eval_k_ph(101325.0, h_std))
+        # Std-state isobaric heat capacity, used as a (constant) reference for the
+        # advective level's axial diffusion (a 2nd-order diffusive correction, so
+        # a fixed cp is adequate and keeps the residual free of T_ph derivatives,
+        # whose 2nd derivatives the medium does not provide).
+        try:
+            self._cp_std = float(medium.eval_dh_pT_dT(101325.0, 293.15))
+        except Exception:
+            self._cp_std = None
         super().__init__()
 
     # --- constitutive correlations (same as StraightPipe) ------------------
@@ -1079,6 +1115,114 @@ class SegmentedChannel(Model):
 
     def get_q_inflow_adiabatic(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
         return 0.0
+
+    def get_conduction_only(self, w, Dh, alpha):
+        """Axial diffusivity = molecular thermal diffusivity only (no shear
+        dispersion).  The robust default for the advective level."""
+        return alpha
+
+    def get_taylor_aris_dispersion(self, w, Dh, alpha):
+        """Effective axial (Taylor--Aris) diffusivity ``[m^2/s]``.
+
+        ``D_eff = alpha + (w*Dh)^2 / (192*alpha)`` -- molecular thermal
+        diffusivity ``alpha = k/(rho*cp)`` plus the laminar Taylor--Aris shear
+        enhancement.  Overridable like `f_factor_func`; pass a callable
+        ``(w, Dh, alpha) -> D_eff`` returning ``alpha`` (or ``0``) to disable the
+        shear term.
+        """
+        return alpha + (w * Dh) ** 2 / (192 * alpha)
+
+    # --- advective-level face reconstruction (cell -> face) ----------------
+    @staticmethod
+    def _parse_advection_scheme(scheme):
+        """Parse ``'U<n_up>D<n_down>'`` into ``(n_up, n_down)`` cell counts."""
+        s = str(scheme).upper().strip()
+        m = re.fullmatch(r"U(\d+)D(\d+)", s)
+        if not m:
+            raise ValueError(
+                f"advection_scheme must look like 'U2D1' (upwind/downwind cell "
+                f"counts), got {scheme!r}")
+        n_up, n_down = int(m.group(1)), int(m.group(2))
+        if n_up < 1:
+            raise ValueError("advection_scheme needs at least one upwind cell "
+                             "(n_up >= 1)")
+        return n_up, n_down
+
+    @staticmethod
+    def _interp_stencil(positions):
+        """Coefficients that interpolate the value at ``x = 0`` from samples at
+        ``positions`` (in units of ``dx``).  Solves the Vandermonde system so the
+        result is exact for polynomials up to degree ``len(positions) - 1``
+        (e.g. ``[-1.5, -0.5, 0.5] -> [-1/8, 6/8, 3/8]``, the U2D1 face value)."""
+        x = np.asarray(positions, dtype=float)
+        n = x.size
+        V = np.vander(x, n, increasing=True).T  # V[k, i] = x[i] ** k
+        rhs = np.zeros(n)
+        rhs[0] = 1.0
+        return np.linalg.solve(V, rhs)
+
+    def _face_h_recon(self, j, hc):
+        """Sign-aware reconstructed enthalpy at interior/outlet face ``j`` from
+        the cell-centre enthalpies ``hc`` (a list of cell symbols, ``len == N``).
+
+        Face ``j`` sits between cell ``j-1`` (left) and cell ``j`` (right).  The
+        upwind side is chosen by the sign of the face mass flow ``M_j`` via a
+        smooth blend so the Jacobian stays continuous.  The stencil uses up to
+        ``n_up`` upwind and ``n_down`` downwind cells and automatically drops to
+        a lower order near the channel ends where neighbours are missing."""
+        N = self.N
+        n_up, n_down = self._n_up, self._n_down
+
+        def one_sided(forward):
+            # Cell offsets and their positions relative to the face (units dx).
+            if forward:  # flow +x: upwind is the left side (cells j-1, j-2, ...)
+                offs = [j - 1 - k for k in range(n_up)] + [j + k for k in range(n_down)]
+                pos = [-0.5 - k for k in range(n_up)] + [0.5 + k for k in range(n_down)]
+            else:        # flow -x: upwind is the right side (cells j, j+1, ...)
+                offs = [j + k for k in range(n_up)] + [j - 1 - k for k in range(n_down)]
+                pos = [0.5 + k for k in range(n_up)] + [-0.5 - k for k in range(n_down)]
+            keep = [(o, p) for o, p in zip(offs, pos) if 0 <= o <= N - 1]
+            if not keep:
+                # The whole upwind side is past a channel end (e.g. reverse flow
+                # at the outlet with no downwind cell): fall back to the nearest
+                # in-domain cell (first-order, boundary value).
+                nearest = min(max(j - 1, 0), N - 1)
+                return hc[nearest]
+            offs = [o for o, _ in keep]
+            pos = [p for _, p in keep]
+            c = self._interp_stencil(pos)
+            return sum(float(ck) * hc[o] for ck, o in zip(c, offs))
+
+        h_fwd = one_sided(True)
+        h_bwd = one_sided(False)
+        M_j = self[f'M_{j}'].symbol
+        theta = (1 + M_j / sp.sqrt(M_j ** 2 + 1e-12)) / 2  # ~1 forward, ~0 reverse
+        return theta * h_fwd + (1 - theta) * h_bwd
+
+    def _warn_cell_peclet(self, w_ref=1.0):
+        """Best-effort cell-Peclet check for the central diffusion stencil.
+
+        Central reconstruction of the advective flux is non-oscillatory only
+        while ``Pe_cell = |w|*dx/D_eff <= 2``.  Evaluate it numerically at a
+        reference velocity using the std-state properties as a build-time nudge;
+        the true ``Pe`` is velocity-dependent at run time.
+        """
+        try:
+            cp = self._cp_std
+            alpha = self._k_std / (self._rho_std * cp)
+            Dh = 4.0 * (np.pi * self.D ** 2 / 4) / (np.pi * self.D)
+            D_eff = float(self.dispersion_func(w_ref, Dh, alpha))
+            dx = self.L / self.N
+            pe = abs(w_ref) * dx / D_eff
+        except Exception:  # property eval or hook may not support floats
+            return
+        if pe > 2.0:
+            warnings.warn(
+                f"SegmentedChannel(dynamic={self.dynamic!r}): estimated cell "
+                f"Peclet ~ {pe:.1f} > 2 at w_ref={w_ref} m/s (dx={dx:.3g} m). "
+                f"Central axial diffusion may oscillate; increase N "
+                f"(currently {self.N}).",
+                stacklevel=2)
 
     def _property_funcs(self):
         m = self.medium
@@ -1141,6 +1285,29 @@ class SegmentedChannel(Model):
             if self.leaky:
                 self.add_component(f'm_dot_leak_{i}', Variable(0.0, "kg/s"))
 
+        # Transient-energy states (advective level): one conservative internal
+        # energy `U_i` per cell (auto-attaches `der_U_i`) plus one axial-diffusion
+        # flux `F_diff_j` per face.  See the `dynamic` notes in the class docstring.
+        if self.dynamic == "advective":
+            count_num = getattr(self.count, 'value', self.count)
+            V_cell = count_num * A_value * L_segment_value
+            U_cell_init = V_cell * (self._rho_std * self._h_std - 101325.0)
+            # Cell-centred thermodynamic state: enthalpy `hc_i` is the genuine
+            # transported + diffused DOF (no longer slaved to the face average),
+            # with cell pressure `pc_i` (face mean) and the EoS-derived
+            # `Tc_i`/`rhoc_i`/`kc_i`.  `U_i` is the conserved internal energy.
+            for i in range(N):
+                self.add_component(f'U_{i}', DifferentialVariable(U_cell_init, "J"))
+                self.add_component(f'hc_{i}', Variable(self._h_std, "J/kg"))
+                self.add_component(f'pc_{i}', Variable(101325.0, "Pa"))
+                self.add_component(f'Tc_{i}', Variable(293.15, "K"))
+                self.add_component(f'rhoc_{i}', Variable(self._rho_std, "kg/m^3"))
+                self.add_component(f'kc_{i}', Variable(self._k_std, "W/m/K"))
+            for j in range(N + 1):
+                self.add_component(f'F_diff_{j}', Variable(0.0, "W"))
+            if self._dispersion_is_custom:
+                self._warn_cell_peclet()
+
         # Boundary "into me" mass flows = the inlet/outlet port channels.
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
         self.add_component('m_dot_out', Variable(0.0, "kg/s"))
@@ -1198,6 +1365,43 @@ class SegmentedChannel(Model):
         eqs.append(self['m_dot_in'].symbol - self['M_0'].symbol)
         eqs.append(self['m_dot_out'].symbol + self[f'M_{N}'].symbol)
 
+        # --- advective level: face reconstruction + axial diffusion ---------
+        # The transported scalar lives at cell centres (`hc_i`); every interior
+        # and outlet face enthalpy `h_j` is *reconstructed* from the cell values
+        # with the upwind-biased U<n_up>D<n_down> stencil (sign-aware, reduced to
+        # lower order near the ends).  The inlet face `h_0` stays a free port
+        # input.  This is the piece a face-collocated layout cannot express: it
+        # is what lets the energy flux M_j*h_j be a genuine upwind reconstruction
+        # rather than a slaved face DOF.
+        if self.dynamic == "advective":
+            hc = [self[f'hc_{i}'].symbol for i in range(N)]
+            for j in range(1, N + 1):
+                eqs.append(self[f'h_{j}'].symbol - self._face_h_recon(j, hc))
+
+            # Axial diffusion: a COMPACT 3-point Laplacian on the *cell* temps.
+            # F_diff_j is the +x conductive + dispersive energy flux through face
+            # j: F_j = -count*A*kappa_eff*(Tc_j - Tc_{j-1})/L_seg, with
+            # kappa_eff = rho*cp*D_eff (rho*cp*alpha == k, so Fourier conduction
+            # is included).  The net into cell i, F_diff_i - F_diff_{i+1},
+            # telescopes to count*A*kappa*(Tc_{i-1} - 2 Tc_i + Tc_{i+1})/L_seg --
+            # diagonally dominant and free of the checkerboard null mode that
+            # broke the old face-collocated stencil.  Ends are insulated.
+            cp = self._cp_std
+            for j in range(N + 1):
+                Fd = self[f'F_diff_{j}'].symbol
+                if j == 0 or j == N:
+                    eqs.append(Fd)
+                    continue
+                Tc_L = self[f'Tc_{j - 1}'].symbol
+                Tc_R = self[f'Tc_{j}'].symbol
+                rho_f = (self[f'rhoc_{j - 1}'].symbol + self[f'rhoc_{j}'].symbol) / 2
+                k_f = (self[f'kc_{j - 1}'].symbol + self[f'kc_{j}'].symbol) / 2
+                w_j = self[f'w_{j}'].symbol
+                alpha_f = k_f / (rho_f * cp)
+                D_eff = self.dispersion_func(w_j, Dh, alpha_f)
+                kappa_eff = rho_f * cp * D_eff
+                eqs.append(Fd + count * A * kappa_eff * (Tc_R - Tc_L) / L_seg)
+
         # --- per-cell balances --------------------------------------------
         # The N cells are structurally identical -- same correlations, only the
         # per-cell leaf symbols differ.  Building each from scratch re-fires
@@ -1251,6 +1455,19 @@ class SegmentedChannel(Model):
         d['T_wall'] = self[f'T_wall_{i}'].symbol
         d['q_inflow'] = self[f'q_inflow_{i}'].symbol
         d['m_dot_leak'] = self[f'm_dot_leak_{i}'].symbol if self.leaky else None
+        if self.dynamic == "advective":
+            d['U'] = self[f'U_{i}'].symbol
+            d['der_U'] = self[f'der_U_{i}'].symbol
+            d['F_diff_in'] = self[f'F_diff_{i}'].symbol
+            d['F_diff_out'] = self[f'F_diff_{i + 1}'].symbol
+            d['hc'] = self[f'hc_{i}'].symbol
+            d['pc'] = self[f'pc_{i}'].symbol
+            d['Tc'] = self[f'Tc_{i}'].symbol
+            d['rhoc'] = self[f'rhoc_{i}'].symbol
+            d['kc'] = self[f'kc_{i}'].symbol
+        else:
+            d['U'] = d['der_U'] = d['F_diff_in'] = d['F_diff_out'] = None
+            d['hc'] = d['pc'] = d['Tc'] = d['rhoc'] = d['kc'] = None
         return d
 
     def _cell_placeholder_syms(self):
@@ -1261,15 +1478,23 @@ class SegmentedChannel(Model):
         """
         keys = [k for pair in self._CELL_FACE_FIELDS for k in pair[:2]]
         keys += ['z_in', 'z_out', 'T_wall', 'q_inflow']
+        if self.dynamic == "advective":
+            keys += ['U', 'der_U', 'F_diff_in', 'F_diff_out',
+                     'hc', 'pc', 'Tc', 'rhoc', 'kc']
         d = {k: sp.Symbol(f'__cell_{k}__', real=True) for k in keys}
         d['m_dot_leak'] = (sp.Symbol('__cell_m_dot_leak__', real=True)
                            if self.leaky else None)
+        if self.dynamic != "advective":
+            d['U'] = d['der_U'] = d['F_diff_in'] = d['F_diff_out'] = None
+            d['hc'] = d['pc'] = d['Tc'] = d['rhoc'] = d['kc'] = None
         return d
 
     def _cell_residuals(self, cell, *, p_in, p_out, h_in, h_out, w_in, w_out,
                         rho_in, rho_out, mu_in, mu_out, k_in, k_out, T_in, T_out,
                         M_in, M_out, z_in, z_out, T_wall, q_inflow, m_dot_leak,
-                        A, P, L_seg, count, Dh):
+                        A, P, L_seg, count, Dh,
+                        U=None, der_U=None, F_diff_in=None, F_diff_out=None,
+                        hc=None, pc=None, Tc=None, rhoc=None, kc=None):
         """Residuals for a single cell as a pure function of its symbols.
 
         Shared by the direct (N == 1) path and the template build; expressed in
@@ -1319,10 +1544,33 @@ class SegmentedChannel(Model):
         q = self.q_inflow_func(
             w_avg, p_avg, h_avg, rho_avg, T_avg, mu_avg, k_avg,
             f_avg, T_wall, Dh_avg, area_conv)
-        sign_w = w_avg / sp.sqrt(w_avg ** 2 + w_eps ** 2)
-        m_dot_reg = sp.sqrt(m_dot_avg ** 2 + m_eps ** 2)
-        q_specific = sign_w * q / m_dot_reg
-        eqs.append(h_in + w_in ** 2 / 2 + q_specific - (h_out + w_out ** 2 / 2))
+        if self.dynamic == "advective":
+            # Conservative transient cell-energy balance on a CELL-CENTRED state.
+            # `hc` is the genuine (independent) cell enthalpy; `pc` is the face
+            # mean and `Tc`/`rhoc`/`kc` follow from the EoS.  `U` is the conserved
+            # internal energy; `der_U` is the net flux: advective enthalpy
+            # (+ kinetic) carried by the *reconstructed* face enthalpies
+            # `h_in`/`h_out`, wall heat, axial diffusion (cell-temp Laplacian),
+            # and any permeation-leak enthalpy.  At steady state (der_U -> 0, no
+            # leak) this reduces to the static balance.
+            T_ph, rho_ph, _mu_ph, k_ph = self._property_funcs()
+            V_cell = count * A * L_seg
+            eqs.append(pc - p_avg)
+            eqs.append(Tc - T_ph(pc, hc))
+            eqs.append(rhoc - rho_ph(pc, hc))
+            eqs.append(kc - k_ph(pc, hc))
+            eqs.append(U - V_cell * (rhoc * hc - pc))
+            flux = (m_dot_in * (h_in + w_in ** 2 / 2)
+                    + m_dot_out * (h_out + w_out ** 2 / 2)
+                    + q + F_diff_in - F_diff_out)
+            if self.leaky:
+                flux = flux + m_dot_leak * hc
+            eqs.append(der_U - flux)
+        else:
+            sign_w = w_avg / sp.sqrt(w_avg ** 2 + w_eps ** 2)
+            m_dot_reg = sp.sqrt(m_dot_avg ** 2 + m_eps ** 2)
+            q_specific = sign_w * q / m_dot_reg
+            eqs.append(h_in + w_in ** 2 / 2 + q_specific - (h_out + w_out ** 2 / 2))
         eqs.append(q_inflow - q)
 
         if not self.heat_port:
