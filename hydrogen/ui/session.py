@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from functools import lru_cache
 from typing import Callable
 
@@ -71,11 +72,65 @@ class SimulationSession:
         self._sig: str | None = None     # structural signature of the built model
         self._params: dict = {}          # {comp_id: {pure_name: value}} as built
         self._inst_kw: dict | None = None
+        # Run lifecycle for a *streaming* run (the run keeps advancing on the
+        # host after `start_run` returns; the phase is refreshed from the host's
+        # status/done events by `poll_logs`).  ``None`` means no run has been
+        # launched on the current model; otherwise one of the host phases
+        # ("running" / "paused" / "finished" / "stopped" / "error").
+        self._run_phase: str | None = None
+        self._stopping = False            # a stop was requested; label the finish
+        # Latest run status (from the host's throttled status/done events), for
+        # the table's step / progress rows.
+        self._run_step = 0
+        self._run_total = 0
+        self._run_t = 0.0
+        self._run_stop_time: float | None = None
+        # Wall-clock timing of the run: `_run_wall_t0` is the monotonic start
+        # (None when no run has begun); `_run_wall_elapsed` freezes the final
+        # elapsed the host reports on `done`.
+        self._run_wall_t0: float | None = None
+        self._run_wall_elapsed = 0.0
         # Guards state transitions so a background build and a GUI-thread abort
         # don't interleave; `_gen` bumps on every abort/reset so a build that
         # finishes *after* it was aborted discards its (now-dead) result.
         self._lock = threading.RLock()
         self._gen = 0
+        # Per-component modelling warnings raised by the host during build/run
+        # (``{comp_id: [message, ...]}``), plus a monotonic version so a poller
+        # can cheaply tell when the set changed.  Populated from host WARNING
+        # log events (see :meth:`_forward_events`); read by the GUI to badge the
+        # offending canvas nodes.
+        self._warn_lock = threading.Lock()
+        self._component_warnings: dict[str, list[str]] = {}
+        self._warnings_version = 0
+
+    # --- warnings ---------------------------------------------------------- #
+    def component_warnings(self) -> dict[str, list[str]]:
+        """Snapshot of ``{comp_id: [message, ...]}`` for components that raised
+        a modelling warning on the host."""
+        with self._warn_lock:
+            return {k: list(v) for k, v in self._component_warnings.items()}
+
+    @property
+    def warnings_version(self) -> int:
+        """Bumped whenever :meth:`component_warnings` would change (add / clear)
+        -- lets a poller detect updates without diffing the whole map."""
+        with self._warn_lock:
+            return self._warnings_version
+
+    def clear_warnings(self):
+        """Drop all accumulated component warnings (e.g. on a fresh build)."""
+        with self._warn_lock:
+            if self._component_warnings:
+                self._component_warnings = {}
+                self._warnings_version += 1
+
+    def _record_warning(self, comp_id: str, message: str):
+        with self._warn_lock:
+            msgs = self._component_warnings.setdefault(comp_id, [])
+            if message not in msgs:            # collapse identical repeats
+                msgs.append(message)
+                self._warnings_version += 1
 
     # --- state ------------------------------------------------------------- #
     @property
@@ -86,6 +141,43 @@ class SimulationSession:
     @property
     def sysp(self):
         return self._sysp
+
+    @property
+    def run_phase(self) -> str | None:
+        """Host phase of the streaming run on the current model, or ``None``."""
+        return self._run_phase
+
+    @property
+    def run_active(self) -> bool:
+        """A streaming run is advancing or parked (i.e. controllable)."""
+        return self._run_phase in ("running", "paused")
+
+    @property
+    def run_step(self) -> int:
+        """Latest solver step index of the current run (0 before/at start)."""
+        return self._run_step
+
+    @property
+    def run_progress(self) -> float | None:
+        """Run completion as a fraction 0..1, or ``None`` if it can't be
+        estimated.  Uses the step count when the run is step-bounded, otherwise
+        the sim time against the target ``stop_time``."""
+        if self._run_total:
+            return max(0.0, min(1.0, self._run_step / self._run_total))
+        if self._run_stop_time and self._run_stop_time > 0:
+            return max(0.0, min(1.0, self._run_t / self._run_stop_time))
+        return None
+
+    @property
+    def run_wall_time(self) -> float | None:
+        """Wall-clock seconds the current run has taken -- counting live while
+        it advances, frozen at the host-reported total once it ends.  ``None``
+        before any run."""
+        if self._run_wall_t0 is None:
+            return None
+        if self.run_active:
+            return time.monotonic() - self._run_wall_t0
+        return self._run_wall_elapsed
 
     # --- structural classification ----------------------------------------- #
     @staticmethod
@@ -163,6 +255,38 @@ class SimulationSession:
         self._build(system, inst_kw, sig, log)
         return "built"
 
+    def force_build(self, system: dict, inst_kw: dict, log: LogFn) -> str:
+        """Unconditionally (re)instantiate the model, even if its structure is
+        unchanged.
+
+        Bypasses the reuse / live-parameter path :meth:`ensure_built` takes --
+        use it to force a fresh compile (e.g. to pick up an external change the
+        structural signature can't see).
+        """
+        sig = self._structural_signature(system, inst_kw)
+        log("forced rebuild — re-instantiating model.", "status")
+        self._build(system, inst_kw, sig, log)
+        return "rebuilt"
+
+    def initialise(self, init_kw: dict, log: LogFn) -> str:
+        """Re-solve the built model to a Newton-consistent state at t=0, without
+        launching a run.
+
+        Use it to force a fresh initialise (e.g. after a live parameter change)
+        so the next run starts from a clean t=0 state.
+        """
+        if self._sysp is None:
+            raise RuntimeError("no model has been built")
+        log(f"initialising with {init_kw} …", "status")
+        self._sysp.initialise(**init_kw)
+        self._drain(log)
+        # State is back at t=0 and no run is in flight anymore.
+        self._run_phase = None
+        self._run_step = 0
+        self._run_t = 0.0
+        log("model initialised to t=0.", "status")
+        return "initialised"
+
     def _try_set_params(self, changed: dict, log: LogFn) -> bool:
         """Push changed pure params onto the live model. Only numeric values are
         live-settable (the host writes them straight into the solver buffer); a
@@ -184,6 +308,9 @@ class SimulationSession:
         return True
 
     def _build(self, system: dict, inst_kw: dict, sig: str, log: LogFn):
+        # A (re)build produces a fresh set of warnings; drop the previous
+        # model's so stale badges don't linger on the canvas.
+        self.clear_warnings()
         # Snapshot the generation + service under the lock, then run the slow,
         # blocking host calls WITHOUT holding it -- otherwise abort() couldn't
         # interrupt us (it needs the lock to tear the host down).
@@ -233,18 +360,77 @@ class SimulationSession:
             self._service = hd.start_host(workers=1)
 
     # --- run --------------------------------------------------------------- #
-    def run(self, init_kw: dict, run_kw: dict, log: LogFn):
-        """Initialise to t=0 (with current parameters) and run; returns the host
-        summary.  Assumes :meth:`ensure_built` has just been called."""
+    def start_run(self, init_kw: dict, run_kw: dict, log: LogFn):
+        """Initialise to t=0 and launch a *streaming* run, returning as soon as
+        the host acknowledges.
+
+        The run then advances asynchronously on the host: it keeps going even if
+        every UI window is closed, and is steerable via :meth:`pause_run` /
+        :meth:`resume_run` / :meth:`stop_run`.  Progress + completion are
+        surfaced through the host's status/done events (drained by
+        :meth:`poll_logs`, which also refreshes :attr:`run_phase`).  Live values
+        flow over the separate variable stream, unchanged.
+        """
         if self._sysp is None:
             raise RuntimeError("no model has been built")
         log(f"initialising with {init_kw} …", "status")
         self._sysp.initialise(**init_kw)
         self._drain(log)
-        log(f"running with {run_kw} …", "status")
-        summary = self._sysp.run(**run_kw)
+        # Force streaming so run() returns after the host ack instead of
+        # blocking to completion; throttle status progress events (the live data
+        # arrives over vars_stream, so status is only needed for phase/progress).
+        stream_kw = dict(run_kw)
+        stream_kw["stream"] = True
+        stream_kw.setdefault("every", 20)
+        self._stopping = False
+        self._run_phase = "running"
+        # Reset run-status tracking so step/progress restart for this run.
+        self._run_step = 0
+        self._run_t = 0.0
+        self._run_total = int(run_kw.get("steps") or 0)
+        st = run_kw.get("stop_time")
+        self._run_stop_time = float(st) if st is not None else None
+        self._run_wall_t0 = time.monotonic()
+        self._run_wall_elapsed = 0.0
+        log(f"starting run with {run_kw} … (streaming; keeps running in the "
+            f"background)", "status")
+        ack = self._sysp.run(**stream_kw)
         self._drain(log)
-        return summary
+        return ack
+
+    def _dispatch_run_cmd(self, name: str):
+        """Send a run-control command (``pause`` / ``resume`` / ``stop``) off the
+        GUI thread.
+
+        The host honours it at the next step boundary and replies then, so the
+        call can briefly block; running it on a throwaway daemon thread keeps the
+        UI responsive.  The resulting phase change comes back via events.
+        """
+        sysp = self._sysp
+        if sysp is None:
+            return
+
+        def go():
+            try:
+                getattr(sysp, name)()
+            except Exception:
+                pass
+
+        threading.Thread(target=go, name=f"hydrogen-run-{name}",
+                         daemon=True).start()
+
+    def pause_run(self):
+        if self.run_active:
+            self._dispatch_run_cmd("pause")
+
+    def resume_run(self):
+        if self._run_phase == "paused":
+            self._dispatch_run_cmd("resume")
+
+    def stop_run(self):
+        if self.run_active:
+            self._stopping = True
+            self._dispatch_run_cmd("stop")
 
     # --- teardown ---------------------------------------------------------- #
     def reset(self):
@@ -262,6 +448,15 @@ class SimulationSession:
             self._sig = None
             self._params = {}
             self._inst_kw = None
+            self._run_phase = None
+            self._stopping = False
+            self._run_step = 0
+            self._run_total = 0
+            self._run_t = 0.0
+            self._run_stop_time = None
+            self._run_wall_t0 = None
+            self._run_wall_elapsed = 0.0
+        self.clear_warnings()
 
     def shutdown(self):
         """Close the model and stop the host process."""
@@ -291,6 +486,15 @@ class SimulationSession:
             self._sig = None
             self._params = {}
             self._inst_kw = None
+            self._run_phase = None
+            self._stopping = False
+            self._run_step = 0
+            self._run_total = 0
+            self._run_t = 0.0
+            self._run_stop_time = None
+            self._run_wall_t0 = None
+            self._run_wall_elapsed = 0.0
+        self.clear_warnings()
         if svc is not None:
             try:
                 svc.terminate()       # kill outside the lock (it joins the process)
@@ -298,21 +502,98 @@ class SimulationSession:
                 pass
 
     # --- events ------------------------------------------------------------ #
-    @staticmethod
-    def _forward_events(sysp, log: LogFn):
-        """Drain a proxy's queued host events (logs / warnings / errors) to the
-        log sink, tagged by level."""
+    def _forward_events(self, sysp, log: LogFn):
+        """Drain a proxy's queued host events to the log sink, tagged by level,
+        and fold streaming-run ``status`` / ``done`` events into
+        :attr:`run_phase` as a side effect (so the phase stays fresh no matter
+        which poller drains the queue)."""
         for ev in sysp.poll_events():
-            if ev.get("type") == "log":
+            etype = ev.get("type")
+            if etype == "log":
                 message = ev.get("message", "")
                 level = ev.get("level") or ""
-                if "warn" in level.lower() or "warning" in message.lower():
-                    log(f"  [host warning] {message}", "warning")
+                is_warning = ("warn" in level.lower()
+                              or "warning" in message.lower())
+                if is_warning:
+                    comp = ev.get("component")
+                    where = ev.get("where")
+                    full = message + (f" ({where})" if where else "")
+                    tag = f" [{comp}]" if comp else ""
+                    log(f"  [warning{tag}] {full}", "warning")
+                    if comp:
+                        self._record_warning(comp, full)
                 else:
                     log(f"  [host] {message}", "host")
-            elif ev.get("type") == "error":
+            elif etype == "error":
                 log(f"  [host error] {ev.get('kind')}: {ev.get('message')}",
                     "error")
+                self._run_phase = "error"
+            elif etype == "status":
+                phase = ev.get("phase")
+                if phase:
+                    self._run_phase = phase
+                self._capture_run_stats(ev)
+            elif etype == "done":
+                self._capture_run_stats(ev)
+                # Prefer the phase the host reports; fall back to inferring a
+                # user-requested stop vs. a natural finish.
+                phase = ev.get("phase") or (
+                    "stopped" if self._stopping else "finished")
+                self._run_phase = phase
+                self._stopping = False
+                self._log_run_summary(ev, phase, log)
+
+    def _capture_run_stats(self, ev: dict):
+        """Fold a host status/done event's step / total / time into the tracked
+        run status (drives the table's step + progress rows)."""
+        step = ev.get("step")
+        if isinstance(step, int):
+            self._run_step = step
+        total = ev.get("total")
+        if isinstance(total, int) and total:
+            self._run_total = total
+        t = ev.get("t")
+        if isinstance(t, (int, float)):
+            self._run_t = float(t)
+        elapsed = ev.get("elapsed")       # only on `done` -> freeze wall time
+        if isinstance(elapsed, (int, float)):
+            self._run_wall_elapsed = float(elapsed)
+        elif self._run_wall_t0 is not None:
+            self._run_wall_elapsed = time.monotonic() - self._run_wall_t0
+
+    def _log_run_summary(self, ev: dict, phase: str, log: LogFn):
+        """Emit an end-of-run summary block (steps, sim/wall time, last solve)
+        from the host's ``done`` event fields (all optional for old hosts)."""
+        steps = ev.get("step")
+        detail: list[str] = []
+        if steps is not None:
+            total = ev.get("total") or 0
+            detail.append(f"  steps taken : {steps}"
+                          + (f" / {total}" if total else ""))
+        t_final = ev.get("t")
+        if isinstance(t_final, (int, float)):
+            detail.append(f"  sim time    : {t_final:.6g} s")
+        elapsed = ev.get("elapsed")
+        if isinstance(elapsed, (int, float)):
+            rate = (f", {steps / elapsed:.1f} steps/s"
+                    if steps and elapsed > 0 else "")
+            detail.append(f"  wall time   : {elapsed:.3g} s{rate}")
+        iters = ev.get("last_iters")
+        resid = ev.get("last_residual")
+        bits = []
+        if iters:
+            bits.append(f"{iters} Newton iters")
+        if isinstance(resid, float) and resid == resid:   # not NaN
+            bits.append(f"residual {resid:.2e}")
+        if bits:
+            detail.append("  last solve  : " + ", ".join(bits))
+
+        if detail:
+            log(f"\nrun {phase} — summary:", "status")
+            for line in detail:
+                log(line, "status")
+        else:
+            log(f"\nrun {phase}.", "status")
 
     def _drain(self, log: LogFn):
         """Forward queued host events for the committed model (if any)."""

@@ -23,7 +23,26 @@ from .style import domain_color, kind_color, port_on_right
 if TYPE_CHECKING:
     from .canvas import Canvas
 
-__all__ = ["PortItem", "NodeItem", "ConnectionItem", "nearest_on_rect"]
+__all__ = ["PortItem", "NodeItem", "ConnectionItem", "nearest_on_rect",
+           "display_type_name"]
+
+
+def display_type_name(entry: dict) -> str:
+    """The type as shown to the user, including the component's submodule.
+
+    The *serialized* type is domain-namespaced only (``hydrogen.thermofluid.Pipe``)
+    so names never collide across domains, but that hides which submodule a leaf
+    lives in.  For display we splice the catalog's ``category`` (the submodule
+    inside the domain, e.g. ``assemblies`` / ``flow``) back in, giving the fully
+    qualified ``hydrogen.thermofluid.assemblies.Pipe``.  Falls back to the bare
+    type when there is no category (or the name isn't a ``hydrogen.<domain>.``
+    one)."""
+    type_name = entry.get("type", "")
+    category = entry.get("category")
+    if category and type_name.startswith("hydrogen."):
+        head, _, cls = type_name.rpartition(".")
+        return f"{head}.{category}.{cls}"
+    return type_name
 
 #: One parsed :class:`QSvgRenderer` per icon path, shared across all nodes.
 _ICON_RENDERERS: dict[str, "QtSvg.QSvgRenderer"] = {}
@@ -332,6 +351,9 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         # change): a component carrying any DifferentialVariable is *dynamic*.
         self._is_dynamic: bool = False
         self._diff_vars: list[str] = []
+        # Modelling warnings the host raised for this component (build/run), each
+        # a formatted message; drives the amber warning badge + its dialog.
+        self._warnings: list[str] = []
         # Custom port placements: pname -> (x, y, side); empty = use defaults.
         self._port_layout: dict[str, tuple] = {}
         # Visual transform state (applied around the node's centre).
@@ -344,7 +366,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self.setFlag(QtWidgets.QGraphicsItem.ItemSendsGeometryChanges, True)
         self.setAcceptHoverEvents(True)
         self.setZValue(1)
-        self.setToolTip(f"{entry['type']}\n\n{entry.get('summary', '')}")
+        self.setToolTip(
+            f"{display_type_name(entry)}\n\n{entry.get('summary', '')}")
 
         self._title = LabelTextItem(comp_id, self, "title")
         tf = self._title.font()
@@ -355,7 +378,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._title.setPos(12, 7)
         self._title.setZValue(6)
 
-        sub_text = entry["type"] + ("  *" if entry.get("needs_medium") else "")
+        sub_text = display_type_name(entry) + (
+            "  *" if entry.get("needs_medium") else "")
         self._sub = LabelTextItem(sub_text, self, "title")
         sf = self._sub.font()
         sf.setPointSize(8)
@@ -572,8 +596,27 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._update_dynamic_tooltip()
         self.update()
 
+    # --- modelling warnings ------------------------------------------------ #
+    @property
+    def has_warnings(self) -> bool:
+        return bool(self._warnings)
+
+    def warning_messages(self) -> list[str]:
+        return list(self._warnings)
+
+    def set_warnings(self, messages: list[str]):
+        """Record the host's modelling warnings for this component; refresh the
+        badge + tooltip.  Empty clears them."""
+        new = list(messages or [])
+        if new == self._warnings:
+            return
+        self._warnings = new
+        self._update_dynamic_tooltip()
+        self.update()
+
     def _update_dynamic_tooltip(self):
-        base = f"{self.entry['type']}\n\n{self.entry.get('summary', '')}".rstrip()
+        base = (f"{display_type_name(self.entry)}\n\n"
+                f"{self.entry.get('summary', '')}").rstrip()
         if self._is_dynamic:
             n = len(self._diff_vars)
             shown = self._diff_vars[:12]
@@ -583,6 +626,13 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
                      f"state{'s' if n != 1 else ''}:\n{lines}{more}")
         else:
             base += "\n\n\u25cb Quasi-static (no differential states)"
+        if self._warnings:
+            n = len(self._warnings)
+            shown = self._warnings[:6]
+            lines = "\n".join(f"  \u2022 {w}" for w in shown)
+            more = "" if n <= len(shown) else f"\n  \u2026 (+{n - len(shown)} more)"
+            base += (f"\n\n\u26a0 {n} warning{'s' if n != 1 else ''}:"
+                     f"\n{lines}{more}")
         self.setToolTip(base)
 
     def set_name_visible(self, visible: bool):
@@ -1066,6 +1116,31 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         painter.drawEllipse(center, 4.5, 4.5)
         painter.restore()
 
+    def _draw_warning_badge(self, painter, rect):
+        """An amber warning triangle with a ``!`` in the top-left corner when
+        the host raised a modelling warning for this component.  Right-click ->
+        'Show warnings…' (or hover) for the messages."""
+        if not self._warnings:
+            return
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        cx, cy, r = rect.left() + 12.0, rect.top() + 11.0, 8.0
+        tri = QtGui.QPolygonF([
+            QtCore.QPointF(cx, cy - r),
+            QtCore.QPointF(cx - r * 0.92, cy + r * 0.72),
+            QtCore.QPointF(cx + r * 0.92, cy + r * 0.72),
+        ])
+        painter.setPen(QtGui.QPen(QtGui.QColor("#8a5a00"), 1.2))
+        painter.setBrush(QtGui.QColor("#ffcc33"))
+        painter.drawPolygon(tri)
+        # Exclamation mark.
+        painter.setPen(QtGui.QPen(QtGui.QColor("#5a3d00"), 1.5))
+        painter.drawLine(QtCore.QPointF(cx, cy - r * 0.30),
+                         QtCore.QPointF(cx, cy + r * 0.28))
+        painter.setBrush(QtGui.QColor("#5a3d00"))
+        painter.drawEllipse(QtCore.QPointF(cx, cy + r * 0.52), 0.9, 0.9)
+        painter.restore()
+
     def _draw_resize_handles(self, painter):
         if self._hover_corner is None and self._resize_corner is None:
             return
@@ -1108,6 +1183,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
                     self._icon.render(painter, body)
                     self._draw_pressure_source_control_guide(painter, body)
                 self._draw_dynamic_badge(painter, rect)
+                self._draw_warning_badge(painter, rect)
                 self._draw_resize_handles(painter)
                 return
 
@@ -1125,6 +1201,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             if body is not None:
                 self._icon.render(painter, body)
             self._draw_dynamic_badge(painter, rect)
+            self._draw_warning_badge(painter, rect)
             self._draw_resize_handles(painter)
             return
 
@@ -1132,6 +1209,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         painter.setBrush(self._fill.lighter(106) if self._hovered else self._fill)
         painter.drawRoundedRect(rect, 9, 9)
         self._draw_dynamic_badge(painter, rect)
+        self._draw_warning_badge(painter, rect)
         self._draw_resize_handles(painter)
 
 

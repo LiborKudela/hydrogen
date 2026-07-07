@@ -14,17 +14,26 @@ try:
         from PySide6 import QtSvg
     except ImportError:
         QtSvg = None  # type: ignore
+    try:                                    # QtCharts too (bundled with PySide6)
+        from PySide6 import QtCharts
+    except ImportError:
+        QtCharts = None  # type: ignore
 except ImportError:  # fall back to PyQt5
     from PyQt5 import QtCore, QtGui, QtWidgets  # type: ignore
     try:
         from PyQt5 import QtSvg  # type: ignore
     except ImportError:
         QtSvg = None  # type: ignore
+    try:                                    # PyQt5 names the module QtChart
+        from PyQt5 import QtChart as QtCharts  # type: ignore
+    except ImportError:
+        QtCharts = None  # type: ignore
 
 #: ``Signal`` is ``Signal`` on PySide6 and ``pyqtSignal`` on PyQt5.
 Signal = getattr(QtCore, "Signal", None) or QtCore.pyqtSignal
 
-__all__ = ["QtCore", "QtGui", "QtWidgets", "QtSvg", "Signal", "exec_", "drop_point"]
+__all__ = ["QtCore", "QtGui", "QtWidgets", "QtSvg", "QtCharts", "Signal",
+           "exec_", "drop_point"]
 
 
 def exec_(widget, *args):

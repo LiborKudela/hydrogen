@@ -2,7 +2,7 @@
 
 Pure function over a list of dotted variable names -- no host process needed.
 Locks down the dropdown-tree contract a UI relies on: explicit ``leaf`` flags,
-unique ``path`` keys, subtree ``count`` badges, groups-first natural ordering,
+unique ``path`` keys, subtree ``count`` badges, leaves-first natural ordering,
 the stripped common root, and the leaf-that-is-also-a-prefix edge case.
 """
 
@@ -60,7 +60,7 @@ def test_indices_match_input_order():
     assert leaves == {"m.alpha": 0, "m.beta": 1, "m.gamma": 2}
 
 
-def test_groups_before_leaves_and_natural_sort():
+def test_leaves_before_groups_and_natural_sort():
     # Mix of a group ("grp") and bare leaves, plus numbered siblings.
     names = [
         "r.zeta",          # leaf
@@ -72,13 +72,14 @@ def test_groups_before_leaves_and_natural_sort():
     tree = _build_var_tree(names)
     order = [c["name"] for c in tree["children"]]
 
-    # Groups (grp, seg2, seg10) come before bare leaves (alpha, zeta)...
+    # Bare leaves (alpha, zeta) -- a level's own, outermost variables -- come
+    # before groups (grp, seg2, seg10)...
     groups = [c["name"] for c in tree["children"] if not c["leaf"]]
     leaves = [c["name"] for c in tree["children"] if c["leaf"]]
-    assert order == groups + leaves
-    # ...groups natural-sorted (seg2 before seg10), leaves alphabetical.
-    assert groups == ["grp", "seg2", "seg10"]
+    assert order == leaves + groups
+    # ...leaves alphabetical, groups natural-sorted (seg2 before seg10).
     assert leaves == ["alpha", "zeta"]
+    assert groups == ["grp", "seg2", "seg10"]
 
 
 def test_leaf_that_is_also_a_prefix():

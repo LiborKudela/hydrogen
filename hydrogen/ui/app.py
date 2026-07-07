@@ -18,12 +18,21 @@ from .canvas import Canvas
 from .catalog import ComponentTree
 from .home import HomeScreen
 from .items import NodeItem
+from .live import LiveController
 from .media import MediaManagerDialog, default_media_spec
 from .project import is_project, make_project
 from .qt import QtCore, QtGui, QtSvg, QtWidgets, exec_
 from .recent import add_recent_file, recent_files, remove_recent_file
 from .session import SimulationSession
-from .simulate import SimSettingsDialog, SimulateDialog, default_sim_options
+from .simulate import (
+    SimSettingsDialog,
+    SimulateDialog,
+    _SessionWorker,
+    default_sim_options,
+    initialise_kwargs,
+    instantiate_kwargs,
+    run_kwargs,
+)
 
 __all__ = ["MainWindow", "main"]
 
@@ -101,6 +110,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # Right: canvas + toolbar (Media / Settings / Simulate / Clear).
         self._canvas = Canvas(self._by_type, self._set_status)
         self._canvas.set_media_provider(lambda: list(self._media))
+        # Live pump: refresh canvas plot/table objects off the simulation stream.
+        self._live = LiveController(self._session)
+        self._canvas.set_objects_changed_hook(self._sync_live_objects)
+        # Persistent run log: every build/run log line is recorded here (even
+        # for runs launched from the toolbar with no window open), so the
+        # Simulate window shows the full output + summary whenever it is opened.
+        self._run_log: list[tuple[str, str]] = []
+        self._log_view = None               # the open Simulate window's panel
+        self._live.set_log_sink(self._record_log)
+        self._live.start()
         media_btn = QtWidgets.QPushButton("Media")
         media_btn.setToolTip("Manage the shared CoolProp fluids (backend, cache) "
                              "the components reference.")
@@ -114,6 +133,27 @@ class MainWindow(QtWidgets.QMainWindow):
                             "building and only re-instantiated when its "
                             "structure changes.")
         simulate.clicked.connect(self._simulate)
+
+        # Live run controls next to Simulate. One button doubles as Run / Pause
+        # / Resume: it starts a run straight from the toolbar (build + initialise
+        # + streaming run, no window needed), then pauses/resumes the live run.
+        # A streaming run keeps advancing on the host even with every window
+        # closed, so these stay meaningful. Driven by the pump's phaseChanged.
+        self._starting = False              # a toolbar-launched run is building
+        self._run_worker = None             # keep the launch worker alive
+        self._runctl_btn = QtWidgets.QPushButton("▶ Run")
+        self._runctl_btn.setToolTip(
+            "Run the model (build if needed, then simulate) — no window needed. "
+            "While running this pauses/resumes the live run.")
+        self._runctl_btn.clicked.connect(self._on_runctl)
+        self._stop_btn = QtWidgets.QPushButton("⏹ Stop")
+        self._stop_btn.setToolTip("Stop the running simulation (the built model "
+                                  "stays alive for another run).")
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._stop_run)
+        self._live.phaseChanged.connect(self._on_run_phase)
+        self._live.warningsChanged.connect(self._refresh_component_warnings)
+
         clear = QtWidgets.QPushButton("Clear canvas")
         clear.clicked.connect(self._canvas.clear_nodes)
 
@@ -156,6 +196,8 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(media_btn)
         bar.addWidget(sim_settings)
         bar.addWidget(simulate)
+        bar.addWidget(self._runctl_btn)
+        bar.addWidget(self._stop_btn)
         bar.addWidget(clear)
         rl.addLayout(bar)
         rl.addWidget(self._canvas, 1)
@@ -228,6 +270,14 @@ class MainWindow(QtWidgets.QMainWindow):
         quit_act = file_menu.addAction("&Quit")
         quit_act.setShortcut(QtGui.QKeySequence.Quit)
         quit_act.triggered.connect(self.close)
+
+        plots_menu = self.menuBar().addMenu("&Plots")
+        add_table = plots_menu.addAction("Add &Table")
+        add_table.setToolTip("Add a live variable table to the canvas.")
+        add_table.triggered.connect(lambda: self._add_object("table"))
+        add_ts = plots_menu.addAction("Add T&imeseries")
+        add_ts.setToolTip("Add a live timeseries chart to the canvas.")
+        add_ts.triggered.connect(lambda: self._add_object("timeseries"))
 
     def _svg_icon(self, svg: str, fallback) -> QtGui.QIcon:
         """Build a crisp `QIcon` from an inline SVG string, falling back to a
@@ -370,6 +420,9 @@ class MainWindow(QtWidgets.QMainWindow):
         add_recent_file(path)
         self._show_editor()
         self._update_title()
+        # Frame the loaded contents. Deferred so the editor view is shown and
+        # laid out first (fitInView needs the final viewport size).
+        QtCore.QTimer.singleShot(0, self._canvas.fit_view)
 
     def _rebuild_recent_menu(self):
         self._recent_menu.clear()
@@ -426,6 +479,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_status(self, text: str):
         self.statusBar().showMessage(text)
+
+    # --- plot / table objects + live pump ---------------------------------- #
+    def _add_object(self, kind: str):
+        self._show_editor()
+        self._canvas.add_object(kind)
+
+    def _sync_live_objects(self):
+        """Re-register the canvas objects with the live pump (called whenever the
+        set of objects or their watched variables changes)."""
+        self._live.set_contents([o.content for o in self._canvas.overlays()])
 
     def _update_catalog_label(self, catalog: list[dict]):
         domains = {entry["domain"] for entry in catalog}
@@ -555,12 +618,152 @@ class MainWindow(QtWidgets.QMainWindow):
             build_system=lambda: self._build_system(self._canvas.nodes()),
             get_options=lambda: self._sim_options,
             parent=self,
+            log_sink=self._record_log,
         )
-        exec_(dlg)
+        # Show everything recorded so far (e.g. a run started from the toolbar),
+        # then mirror new lines into this panel while it is open.
+        dlg.prime_log(self._run_log)
+        self._log_view = dlg._logs
+        try:
+            exec_(dlg)
+        finally:
+            self._log_view = None
+
+    def _record_log(self, message: str, level: str = "status"):
+        """Append a build/run log line to the persistent store and, if the
+        Simulate window is open, mirror it into that panel.  Always called on
+        the GUI thread (worker/live signals are queued)."""
+        self._run_log.append((message, level))
+        if len(self._run_log) > 5000:        # cap memory on long sessions
+            del self._run_log[:len(self._run_log) - 5000]
+        if self._log_view is not None:
+            self._log_view.add(message, level)
+
+    # --- live run controls ------------------------------------------------- #
+    def _update_runctl(self):
+        """Sync the Run/Pause/Resume + Stop buttons to the current run phase."""
+        phase = self._session.run_phase
+        # Once the run is actually live, drop any 'starting' state so the button
+        # flips straight to Pause (the launch worker's done signal may lag).
+        if phase in ("running", "paused"):
+            self._starting = False
+        if phase == "running":
+            self._runctl_btn.setText("⏸ Pause")
+            self._runctl_btn.setEnabled(True)
+            self._stop_btn.setEnabled(True)
+        elif phase == "paused":
+            self._runctl_btn.setText("▶ Resume")
+            self._runctl_btn.setEnabled(True)
+            self._stop_btn.setEnabled(True)
+        elif self._starting:
+            self._runctl_btn.setText("… Starting")
+            self._runctl_btn.setEnabled(False)
+            self._stop_btn.setEnabled(False)
+        else:                                # idle / finished / stopped / error
+            self._runctl_btn.setText("▶ Run")
+            self._runctl_btn.setEnabled(True)
+            self._stop_btn.setEnabled(False)
+
+    def _on_run_phase(self, phase: str):
+        """React to a streaming run's phase change (driven by the live pump)."""
+        self._update_runctl()
+        if phase:
+            self._set_status(f"Simulation {phase}.")
+
+    def _refresh_component_warnings(self):
+        """Push the session's per-component modelling warnings onto the canvas
+        nodes (driven by the live pump's ``warningsChanged`` signal), so an
+        offending component shows a warning badge and lists its messages."""
+        self._canvas.set_component_warnings(self._session.component_warnings())
+
+    def _on_runctl(self):
+        """Run when idle, pause when running, resume when paused."""
+        phase = self._session.run_phase
+        if phase == "running":
+            self._session.pause_run()
+        elif phase == "paused":
+            self._session.resume_run()
+        else:
+            self._start_run_from_toolbar()
+
+    def _stop_run(self):
+        self._session.stop_run()
+
+    def _start_run_from_toolbar(self):
+        """Build (if needed) and launch a streaming run straight from the
+        toolbar -- no Simulate window. The heavy build/initialise runs on a
+        worker thread so the UI stays responsive."""
+        if self._session.run_active or self._starting:
+            return
+        nodes = self._canvas.nodes()
+        if not nodes:
+            self._set_status("Place at least one component before simulating.")
+            return
+        options = self._sim_options
+        run_kw = run_kwargs(options)
+        if run_kw.get("stop_time") is None:
+            self._set_status("Set a stop_time in ⚙ Settings first — the run is "
+                             "driven by it.")
+            return
+        if (run_kw.get("strategy", {}).get("name") == "fixed"
+                and run_kw.get("dt") is None):
+            self._set_status("strategy='fixed' needs a dt (set it in ⚙ Settings).")
+            return
+        try:
+            system = self._build_system(nodes)
+        except Exception as exc:
+            self._set_status(f"Build failed: {type(exc).__name__}: {exc}")
+            return
+        inst_kw = instantiate_kwargs(options)
+        init_kw = initialise_kwargs(options)
+
+        def task(log):
+            self._session.ensure_built(system, inst_kw, log)
+            return self._session.start_run(init_kw, run_kw, log)
+
+        self._starting = True
+        self._update_runctl()
+        self._set_status("Building / starting simulation…")
+        self._record_log("\n— run launched from the toolbar —", "status")
+        worker = _SessionWorker(task)
+        worker.logged.connect(self._on_toolbar_log)
+        worker.done.connect(self._on_toolbar_run_started)
+        worker.failed.connect(self._on_toolbar_run_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._run_worker = worker
+        worker.start()
+
+    def _on_toolbar_log(self, message: str, level: str = "status"):
+        self._record_log(message, level)
+        self._set_status(message.strip() or level)
+
+    def _on_toolbar_run_started(self, _ack):
+        self._starting = False
+        self._run_worker = None
+        self._set_status("Simulation running — use ⏸/⏹ to steer it.")
+        self._update_runctl()
+
+    def _on_toolbar_run_failed(self, kind: str, message: str):
+        self._starting = False
+        self._run_worker = None
+        self._set_status(f"Run failed: {kind}: {message}")
+        self._update_runctl()
 
     def closeEvent(self, event):
+        self._live.shutdown()
         self._session.shutdown()
+        # Release the plot/table objects' off-screen render widgets and any open
+        # Variables windows -- these are top-level widgets that would otherwise
+        # keep the Qt event loop alive after this window closes.
+        for overlay in self._canvas.overlays():
+            overlay.dispose()
+        for win in list(getattr(self._canvas, "_var_windows", [])):
+            win.close()
         super().closeEvent(event)
+        # This is the application's main window: closing it ends the session.
+        # Quit explicitly rather than relying on quitOnLastWindowClosed, which
+        # off-screen helper widgets (plot render surfaces) can otherwise defeat.
+        QtWidgets.QApplication.instance().quit()
 
 
 def main(argv: list[str] | None = None):

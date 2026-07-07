@@ -58,5 +58,9 @@ def render_canvas_thumbnail(canvas_state: dict, size: QtCore.QSize,
         scene.render(painter, target, src, QtCore.Qt.KeepAspectRatio)
         painter.end()
     finally:
+        # Plot/table objects keep their content widget off-screen (a top-level
+        # widget); clear them so this throwaway canvas doesn't leak them (they
+        # would otherwise linger as "open windows" and keep the app running).
+        canvas.clear_nodes()
         canvas.deleteLater()
     return pm

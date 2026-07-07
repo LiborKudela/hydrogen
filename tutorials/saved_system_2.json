@@ -5,10 +5,38 @@
   "canvas": {
     "nodes": [
       {
+        "comp_id": "pressuresource_5",
+        "type": "hydrogen.thermofluid.PressureSource",
+        "x": 277.2619476297925,
+        "y": 592.3325039267571,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": {
+          "p_source": 1001325.0,
+          "T_source": 293.15,
+          "A": 0.001,
+          "p_control": false
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            -2.1520270778028134,
+            -0.6486498672667267
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {}
+      },
+      {
         "comp_id": "ramp_6",
         "type": "hydrogen.control.Ramp",
-        "x": 990.0,
-        "y": 406.0,
+        "x": 383.06442964780234,
+        "y": 465.21838692585163,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -32,42 +60,14 @@
           ]
         },
         "ports": {},
-        "w": 132.0,
-        "h": 66.0
-      },
-      {
-        "comp_id": "pressuresource_5",
-        "type": "hydrogen.thermofluid.PressureSource",
-        "x": 891.1096804488066,
-        "y": 568.8269564127913,
-        "rot": 0,
-        "mirror_x": false,
-        "mirror_y": false,
-        "medium": "Hydrogen",
-        "params": {
-          "p_source": 1001325.0,
-          "T_source": 293.15,
-          "A": 0.001,
-          "p_control": false
-        },
-        "ports_locked": true,
-        "label_offsets": {
-          "title": [
-            -1.0,
-            27.0
-          ],
-          "params": [
-            0.0,
-            0.0
-          ]
-        },
-        "ports": {}
+        "w": 150.0,
+        "h": 78.0
       },
       {
         "comp_id": "compressiblevalve_4",
         "type": "hydrogen.thermofluid.CompressibleValve",
-        "x": 1142.4546616148273,
-        "y": 560.8935814800557,
+        "x": 499.80625185074376,
+        "y": 599.3754810054576,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -89,8 +89,8 @@
       {
         "comp_id": "tank_3",
         "type": "hydrogen.thermofluid.Tank",
-        "x": 1655.6097514356456,
-        "y": 387.6195933185569,
+        "x": 962.530672998794,
+        "y": 477.7328917232212,
         "rot": -90,
         "mirror_x": false,
         "mirror_y": false,
@@ -133,12 +133,12 @@
             }
           ],
           "h_inner": 50.0,
-          "count": 1,
+          "count": 2,
           "outer_thermal": "adiabatic",
           "h_ext": 10.0,
           "T_ext": 293.15,
           "T_outer": 293.15,
-          "p_ext": 0.0,
+          "p_ext": 1.0,
           "T_wall_init": 293.15,
           "p_init": 101325.0,
           "T_init": 293.15
@@ -146,12 +146,12 @@
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            2.930878968588445,
-            39.80012479820738
+            -116.02299837396492,
+            7.41144477858893
           ],
           "params": [
-            98.00436793725794,
-            -116.6718665919737
+            -97.30962951573201,
+            -135.20844865877132
           ]
         },
         "ports": {}
@@ -159,19 +159,19 @@
       {
         "comp_id": "pipe_2",
         "type": "hydrogen.thermofluid.Pipe",
-        "x": 1403.7447315696058,
-        "y": 567.6046175336728,
+        "x": 761.0963218055224,
+        "y": 606.0865170590747,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
         "medium": "Hydrogen",
         "params": {
-          "D": 0.01,
+          "D": 0.005,
           "L": 1.0,
           "epsilon": 1e-06,
           "z_in": 0.0,
           "z_out": 0.0,
-          "n_segments": 100,
+          "n_segments": 50,
           "layers": [
             {
               "__type__": "WallLayer",
@@ -211,7 +211,7 @@
           "h_ext": 10.0,
           "T_ext": 293.15,
           "T_outer": 293.15,
-          "p_ext": 0.0,
+          "p_ext": 1.0,
           "T_wall_init": 293.15,
           "p_init": 101325.0,
           "count": 1,
@@ -236,8 +236,8 @@
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            12.0,
-            28.0
+            8.543918766591787,
+            15.327702144169393
           ],
           "params": [
             -5.0,
@@ -264,13 +264,237 @@
         "from": "ramp_6.y",
         "to": "compressiblevalve_4.opening"
       }
+    ],
+    "objects": [
+      {
+        "kind": "table",
+        "x": -394.65005613428644,
+        "y": 413.00738455571184,
+        "w": 554.5267592267227,
+        "h": 296.68893102916974,
+        "content": {
+          "title": "Variables",
+          "rows": [
+            {
+              "full": "__sim_time__",
+              "label": "time",
+              "unit": "s",
+              "description": "simulation time",
+              "value": null
+            },
+            {
+              "full": "__sim_progress__",
+              "label": "progress",
+              "unit": "%",
+              "description": "run progress",
+              "value": null
+            },
+            {
+              "full": "__sim_step__",
+              "label": "step",
+              "unit": "",
+              "description": "solver step index",
+              "value": null
+            },
+            {
+              "full": "__sim_dt__",
+              "label": "step size",
+              "unit": "s",
+              "description": "last time step size (dt)",
+              "value": null
+            },
+            {
+              "full": "__run_wall__",
+              "label": "wall time",
+              "unit": "s",
+              "description": "run wall-clock time",
+              "value": null
+            },
+            {
+              "full": "pipe_2.m_dot_leak_env",
+              "label": "pipe_2.m_dot_leak_env",
+              "unit": "kg/s",
+              "description": "",
+              "value": 0.0
+            },
+            {
+              "full": "tank_3.m_dot_leak_env",
+              "label": "tank_3.m_dot_leak_env",
+              "unit": "kg/s",
+              "description": "",
+              "value": 0.0
+            }
+          ]
+        }
+      },
+      {
+        "kind": "timeseries",
+        "x": -399.77618010252405,
+        "y": 731.363322070746,
+        "w": 553.9945825321616,
+        "h": 358.1376903628543,
+        "content": {
+          "title": "Leak flow",
+          "traces": [
+            {
+              "full": "pipe_2.m_dot_leak_env",
+              "label": "pipe_2.m_dot_leak_env",
+              "color": "#1f77b4",
+              "width": 2.0,
+              "dash": "dashdotdot",
+              "visible": true
+            },
+            {
+              "full": "tank_3.m_dot_leak_env",
+              "label": "tank_3.m_dot_leak_env",
+              "color": "#d62728",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            }
+          ],
+          "settings": {
+            "title": "Leak flow",
+            "legend": true,
+            "legend_pos": "bottom",
+            "title_size": 12,
+            "axis_size": 9,
+            "x_title": "time [s]",
+            "y_title": ""
+          }
+        }
+      },
+      {
+        "kind": "timeseries",
+        "x": 167.91427706661432,
+        "y": 728.6454501346332,
+        "w": 554.7652160469321,
+        "h": 360.7358539760842,
+        "content": {
+          "title": "Temperature",
+          "traces": [
+            {
+              "full": "tank_3.gas.T",
+              "label": "tank_3.gas.T",
+              "color": "#1f77b4",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            },
+            {
+              "full": "pipe_2.pipe.T_0",
+              "label": "pipe_2.pipe.T_0",
+              "color": "#2ca02c",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            }
+          ],
+          "settings": {
+            "title": "Temperature",
+            "legend": true,
+            "legend_pos": "bottom",
+            "title_size": 12,
+            "axis_size": 9,
+            "x_title": "time [s]",
+            "y_title": ""
+          }
+        }
+      },
+      {
+        "kind": "timeseries",
+        "x": -408.00759493944565,
+        "y": 1102.1430135952764,
+        "w": 561.016233659511,
+        "h": 366.00201756500996,
+        "content": {
+          "title": "Mass flow",
+          "traces": [
+            {
+              "full": "pipe_2.pipe.m_dot_in",
+              "label": "pipe_2.pipe.m_dot_in",
+              "color": "#1f77b4",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            }
+          ],
+          "settings": {
+            "title": "Mass flow",
+            "legend": true,
+            "legend_pos": "bottom",
+            "title_size": 12,
+            "axis_size": 9,
+            "x_title": "time [s]",
+            "y_title": ""
+          }
+        }
+      },
+      {
+        "kind": "timeseries",
+        "x": 165.39788596000324,
+        "y": 1102.5404293853996,
+        "w": 560.1460412988953,
+        "h": 359.6788623014031,
+        "content": {
+          "title": "Flow velocity",
+          "traces": [
+            {
+              "full": "pipe_2.pipe.w_0",
+              "label": "pipe_2.pipe.w_0",
+              "color": "#1f77b4",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            }
+          ],
+          "settings": {
+            "title": "Flow velocity",
+            "legend": true,
+            "legend_pos": "bottom",
+            "title_size": 12,
+            "axis_size": 9,
+            "x_title": "time [s]",
+            "y_title": ""
+          }
+        }
+      },
+      {
+        "kind": "timeseries",
+        "x": 733.1607598841797,
+        "y": 731.2856561739463,
+        "w": 527.7707299588731,
+        "h": 356.68946948711766,
+        "content": {
+          "title": "Pressure",
+          "traces": [
+            {
+              "full": "tank_3.gas.p",
+              "label": "tank_3.gas.p",
+              "color": "#1f77b4",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            }
+          ],
+          "settings": {
+            "title": "Pressure",
+            "legend": true,
+            "legend_pos": "bottom",
+            "title_size": 12,
+            "axis_size": 9,
+            "x_title": "time [s]",
+            "y_title": ""
+          }
+        }
+      }
     ]
   },
   "sim_options": {
     "instantiate": {
       "cse": true,
       "enable_blt": true,
-      "enable_var_scaling": false,
+      "enable_var_scaling": true,
       "max_remove_trival_passes": 1,
       "max_remove_duplicate_passes": 5,
       "max_remove_linear_block_passes": 3
@@ -284,10 +508,10 @@
     },
     "simulate": {
       "strategy": "tr_bdf2",
-      "stop_time": 100.0,
+      "stop_time": 50.0,
       "dt_start": 0.0001,
       "dt_min": 1e-09,
-      "dt_max": 100.0,
+      "dt_max": 1000.0,
       "grow": 1.5,
       "shrink": 0.5,
       "max_retries": 20,

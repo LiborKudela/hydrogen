@@ -32,7 +32,7 @@ import numpy as np
 import sympy as sp
 
 from ...medium import CoolPropMedium
-from ...model import Model, Parameter
+from ...model import Model, Parameter, Variable
 from ...paramspec import ParamSpec
 from ..materials import WallMaterial
 from .flow import PressureVessel, SegmentedChannel, StraightPipe
@@ -239,7 +239,7 @@ class Pipe(Model):
                           relevant_when={"outer_thermal": "fixed"})] = 293.15,
         p_ext: Annotated[float, ParamSpec("Vent partial pressure at the outer "
                         "leaky surface.", unit="Pa",
-                        relevant_when="any_layer_permeable")] = 0.0,
+                        relevant_when="any_layer_permeable")] = 1.0,
         T_wall_init: Annotated[float, ParamSpec("Initial wall temperature.",
                               unit="K")] = 293.15,
         p_init: Annotated[float, ParamSpec("Initial fluid pressure (and "
@@ -589,6 +589,13 @@ class Pipe(Model):
             if self.any_leaky:
                 self.add_component(f'env_{i}', FixedPartialPressure(p_partial=self.p_ext))
 
+        # Total permeation leak to the environment: the sum of every segment's
+        # outer-surface vent flow (positive = mass leaving the pipe into the
+        # environment).  Already includes the `count` multiplicity, since each
+        # wall's permeation is scaled by N.  Only meaningful when permeable.
+        if self.any_leaky:
+            self.add_component('m_dot_leak_env', Variable(0.0, "kg/s"))
+
         # Re-expose the fluid inlet/outlet so a Pipe is drop-in for a StraightPipe.
         # The two engines name their boundary face variables differently:
         # StraightPipe uses pipe-level `p_in`/`p_out`; SegmentedChannel uses the
@@ -646,7 +653,13 @@ class Pipe(Model):
                                  self[f'wall_{i}_{k + 1}'].ports['leak_a'])
                 self.connect(self[f'wall_{i}_{self.n_leaky - 1}'].ports['leak_b'],
                              self[f'env_{i}'].ports['leak'])
-        return []
+
+        eqs = []
+        if self.any_leaky:
+            total = sum(self[f'env_{i}']['m_dot_leak'].symbol
+                        for i in range(self.n_segments))
+            eqs.append(self['m_dot_leak_env'].symbol - total)
+        return eqs
 
 
 class Tank(Model):
@@ -794,7 +807,7 @@ class Tank(Model):
                           relevant_when={"outer_thermal": "fixed"})] = 293.15,
         p_ext: Annotated[float, ParamSpec("Vent partial pressure at the outer "
                         "leaky surface.", unit="Pa",
-                        relevant_when="any_layer_permeable")] = 0.0,
+                        relevant_when="any_layer_permeable")] = 1.0,
         T_wall_init: Annotated[float, ParamSpec("Initial wall temperature.",
                               unit="K")] = 293.15,
         p_init: Annotated[float, ParamSpec("Initial vessel pressure (and "
@@ -967,6 +980,13 @@ class Tank(Model):
                 self.add_component(f'env_{shape}',
                                    FixedPartialPressure(p_partial=self.p_ext))
 
+        # Total permeation leak to the environment: the sum of the barrel and
+        # cap vent flows (positive = mass leaving the tank into the
+        # environment).  Already includes the `count` multiplicity, since each
+        # wall's permeation is scaled by N.  Only meaningful when permeable.
+        if self.any_leaky:
+            self.add_component('m_dot_leak_env', Variable(0.0, "kg/s"))
+
         # Re-expose the vessel inlet as the tank's single fluid port.
         self.add_port('inlet', FluidPort_phm(
             self,
@@ -1012,4 +1032,10 @@ class Tank(Model):
                                  self[f'wall_{shape}_{k + 1}'].ports['leak_a'])
                 self.connect(self[f'wall_{shape}_{self.n_leaky - 1}'].ports['leak_b'],
                              self[f'env_{shape}'].ports['leak'])
-        return []
+
+        eqs = []
+        if self.any_leaky:
+            total = sum(self[f'env_{shape}']['m_dot_leak'].symbol
+                        for shape in self._SHAPES)
+            eqs.append(self['m_dot_leak_env'].symbol - total)
+        return eqs

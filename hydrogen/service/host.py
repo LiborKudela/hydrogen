@@ -34,17 +34,19 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import selectors
 import socket
 import sys
 import threading
 import time
+import warnings
 import queue as _queue
 
 import numpy as np
 
-from ..model import match_name_index, match_name_indices
+from ..model import Model, match_name_index, match_name_indices
 from .protocol import ProtocolError, recv_msg, send_msg
 
 # --- optional MPI ----------------------------------------------------------
@@ -157,6 +159,114 @@ class _capture_logs:
     def __exit__(self, *exc):
         sys.stdout = self._saved
         return False
+
+
+class _capture_warnings:
+    """Context manager: turn Python ``warnings.warn`` calls into WARNING log
+    events on the bus, attributed to the top-level component that emitted them.
+
+    hydrogen components raise ``UserWarning`` for build/run-time modelling
+    issues (e.g. a `SegmentedChannel`'s cell-Peclet check).  These go to stderr
+    by default, so a GUI never sees them.  We install a ``showwarning`` hook
+    that (a) keeps the console behaviour, (b) walks the call stack to find the
+    *direct child of the root model* on the path to the ``warn`` call -- that is
+    the canvas node responsible -- and (c) emits a structured event carrying the
+    component's id so the UI can badge that node and list the message.
+
+    Attribution needs the root model's ``components`` map, which for a fresh
+    ``load_json`` only exists once construction finishes; ``root_provider`` is a
+    callable returning the root model (or ``None`` while it is still being
+    built).  Warnings raised before the root is known are buffered and flushed,
+    resolved, on exit.
+    """
+
+    def __init__(self, bus, system_id, rank, root_provider):
+        self._bus = bus
+        self._sid = system_id
+        self._rank = rank
+        self._root_provider = root_provider
+        self._pending: list = []          # (text, node_instance, where)
+
+    def __enter__(self):
+        self._saved = warnings.showwarning
+        # Force "always" for UserWarning (restored on exit) so every occurrence
+        # is reported -- otherwise Python's once-per-location default would badge
+        # only the first of several components hitting the same modelling issue.
+        # Scoped to UserWarning so unrelated Deprecation/Resource warnings keep
+        # their default suppression and don't flood the run log.
+        self._saved_filters = warnings.filters[:]
+        warnings.filterwarnings("always", category=UserWarning)
+        warnings.showwarning = self._show
+        return self
+
+    def __exit__(self, *exc):
+        warnings.showwarning = self._saved
+        warnings.filters[:] = self._saved_filters
+        # Flush anything we couldn't attribute yet (root not built at the time).
+        idmap = self._component_index()
+        for text, node, where in self._pending:
+            self._emit(text, idmap.get(id(node)) if node is not None else None,
+                       where)
+        self._pending.clear()
+        return False
+
+    # --- internals --------------------------------------------------------
+    def _component_index(self) -> dict:
+        """`{id(child_instance): child_name}` for the root model's direct
+        children (the canvas nodes), or ``{}`` if the root isn't ready."""
+        try:
+            root = self._root_provider()
+        except Exception:
+            root = None
+        comps = getattr(root, "components", None) or {}
+        return {id(v): k for k, v in comps.items()}
+
+    @staticmethod
+    def _emitting_node():
+        """The root model's direct child on the current call stack -- i.e. the
+        node that owns the code raising the warning -- or ``None``.
+
+        Walking outward, the distinct ``self`` Model instances are
+        ``[emitter, ..., node, root]``; the root is the outermost and the node
+        is the one just inside it.
+        """
+        chain, seen = [], set()
+        f = sys._getframe()
+        while f is not None:
+            slf = f.f_locals.get("self")
+            if isinstance(slf, Model) and id(slf) not in seen:
+                seen.add(id(slf))
+                chain.append(slf)
+            f = f.f_back
+        return chain[-2] if len(chain) >= 2 else None
+
+    def _emit(self, text, comp_id, where):
+        self._bus.emit({
+            "type": "log", "system_id": self._sid, "rank": self._rank,
+            "level": "WARNING", "message": text,
+            "component": comp_id, "where": where,
+        })
+
+    def _show(self, message, category, filename, lineno, file=None, line=None):
+        # Preserve the normal stderr output so the console still shows it.
+        try:
+            self._saved(message, category, filename, lineno, file, line)
+        except Exception:
+            pass
+        # Only surface modelling warnings (UserWarning); framework noise such as
+        # DeprecationWarning / ResourceWarning stays on the console only.
+        if not (isinstance(category, type)
+                and issubclass(category, UserWarning)):
+            return
+        node = self._emitting_node()
+        text = f"{getattr(category, '__name__', 'Warning')}: {message}"
+        where = f"{os.path.basename(filename)}:{lineno}"
+        idmap = self._component_index()
+        if idmap:                          # root is ready -> attribute + emit now
+            self._emit(text, idmap.get(id(node)) if node is not None else None,
+                       where)
+        else:                              # still constructing -> resolve on exit
+            self._pending.append((text, node, where))
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +484,9 @@ def _build_var_tree(names):
     * ``full``  -- the exact recorded name (always resolves unambiguously when
       passed back to ``get_series`` / ``get_record`` / ``vars_stream``).
 
-    Children are ordered groups-first, then leaves, each block sorted naturally
-    (embedded integers compare numerically, so ``seg2`` precedes ``seg10``).
+    Children are ordered leaves-first (a level's own, outermost variables), then
+    groups (nested sub-models), each block sorted naturally (embedded integers
+    compare numerically, so ``seg2`` precedes ``seg10``).
     Returns the root group node
     ``{"name": "", "path": "", "leaf": False, "count": N, "children": [...]}``.
     """
@@ -403,8 +514,10 @@ def _build_var_tree(names):
         node["leaf"] = "index" in node
         children = [_finish(kids[k]) for k in kids]
         if children:
-            # Groups first, then leaves; each block natural-sorted by name.
-            children.sort(key=lambda c: (c["leaf"], _natural_key(c["name"])))
+            # Leaves first (a level's own, outermost variables), then groups
+            # (nested sub-models holding deeper variables); each block
+            # natural-sorted by name.
+            children.sort(key=lambda c: (not c["leaf"], _natural_key(c["name"])))
         # A non-leaf always advertises a `children` list (empty only for an
         # empty root) so the UI can treat every group uniformly; pure leaves
         # omit it so the widget knows they are not expandable.
@@ -519,8 +632,13 @@ class _Engine:
     def _cmd_load_json(self, req_id, args):
         from ..serialization import from_json
 
-        model = from_json(args["spec"])
         sid = self._new_id()
+        holder: dict = {}
+        with _capture_logs(self._bus, sid, self._rank), \
+                _capture_warnings(self._bus, sid, self._rank,
+                                  lambda: holder.get("model")):
+            model = from_json(args["spec"])
+            holder["model"] = model        # now resolvable for buffered warnings
         self._systems[sid] = _SystemRuntime(sid, model)
         self._broadcast({"op": "load_json", "spec": args["spec"], "sid": sid})
         self._reply(req_id, sid)
@@ -539,7 +657,9 @@ class _Engine:
         opts = {k: args[k] for k in _INSTANTIATE_OPTS if k in args}
         opts.setdefault("aditional_modules", _gather_modules(rt.model))
         self._broadcast({"op": "instantiate", "sid": rt.id, "opts": opts})
-        with _capture_logs(self._bus, rt.id, self._rank):
+        with _capture_logs(self._bus, rt.id, self._rank), \
+                _capture_warnings(self._bus, rt.id, self._rank,
+                                  lambda: rt.model):
             rt.model.instantiate(**opts)
         rt.phase = "instantiated"
         self._reply(req_id, {"n_vars": int(getattr(rt.model, "n_v", 0)),
@@ -815,8 +935,14 @@ class _Engine:
             # flow asynchronously while the loop advances.
             self._reply(req_id, {"streaming": True, "steps": steps,
                                  "stop_time": stop_time})
+            t0 = time.monotonic()
             self._run_loop(*cfg, stream=True)
-            self._bus.emit({"type": "done", "system_id": rt.id})
+            # Carry the final run stats on `done` (step count, sim time, wall
+            # time, last-solve diagnostics) so the client can print a summary.
+            done = {"type": "done", "elapsed": time.monotonic() - t0}
+            done.update(rt.status())
+            done["type"] = "done"           # status() has no 'type'; keep 'done'
+            self._bus.emit(done)
         else:
             summary = self._run_loop(*cfg, stream=False)
             self._reply(req_id, summary)
@@ -865,7 +991,9 @@ class _Engine:
                 return True
             return False
 
-        with _capture_logs(self._bus, rt.id, self._rank):
+        with _capture_logs(self._bus, rt.id, self._rank), \
+                _capture_warnings(self._bus, rt.id, self._rank,
+                                  lambda: rt.model):
             k = 0
             while not _done(k):
                 self._drain_during_run(sel, rt)

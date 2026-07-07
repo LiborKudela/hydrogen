@@ -35,7 +35,7 @@ _INSTANTIATE_OPTS = [
      "tip": "Common-subexpression elimination during lambdify."},
     {"name": "enable_blt", "type": "bool", "default": True,
      "tip": "Block-lower-triangular reordering of the equation system."},
-    {"name": "enable_var_scaling", "type": "bool", "default": False,
+    {"name": "enable_var_scaling", "type": "bool", "default": True,
      "tip": "Scale variables before the Newton solve."},
     {"name": "max_remove_trival_passes", "type": "int", "default": 1,
      "tip": "Passes of trivial-equation elimination."},
@@ -408,11 +408,15 @@ class SimulateDialog(QtWidgets.QDialog):
     """
 
     def __init__(self, session: SimulationSession, build_system, get_options,
-                 parent=None):
+                 parent=None, log_sink=None):
         super().__init__(parent)
         self._session = session
         self._build_system = build_system   # () -> system spec dict
         self._get_options = get_options     # () -> persisted options dict
+        # Optional shared recorder: when set, every log line is routed through
+        # it (so the run output is persisted and visible even for runs launched
+        # from the toolbar, not this window).  It mirrors back into this panel.
+        self._log_sink = log_sink
         self._worker: _SessionWorker | None = None
         self._op_label = "build"            # current operation, for the cancel label
         self._cancelling = False            # an abort is in flight
@@ -443,6 +447,31 @@ class SimulateDialog(QtWidgets.QDialog):
         self._build_btn.clicked.connect(self._on_build_clicked)
         bar.addWidget(self._build_btn)
 
+        # Force a full re-instantiate / drop the built model, for when the
+        # automatic reuse isn't wanted (e.g. an external code change the
+        # structural signature can't see, or to free the host model).
+        self._more_btn = QtWidgets.QToolButton()
+        self._more_btn.setText("Rebuild ▾")
+        self._more_btn.setToolTip(
+            "Force a full re-instantiation, or reset (drop) the built model.")
+        self._more_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        more_menu = QtWidgets.QMenu(self._more_btn)
+        act_force = more_menu.addAction("Force rebuild (re-instantiate)")
+        act_force.setToolTip(
+            "Re-instantiate the model even if its structure is unchanged.")
+        act_force.triggered.connect(self._on_force_build)
+        act_init = more_menu.addAction("Force initialise (solve to t=0)")
+        act_init.setToolTip(
+            "Re-solve the built model to a consistent state at t=0 "
+            "(no run).")
+        act_init.triggered.connect(self._on_force_init)
+        act_reset = more_menu.addAction("Reset model (drop from host)")
+        act_reset.setToolTip(
+            "Free the built model on the host; the next run instantiates fresh.")
+        act_reset.triggered.connect(self._on_reset_model)
+        self._more_btn.setMenu(more_menu)
+        bar.addWidget(self._more_btn)
+
         self._run_btn = QtWidgets.QPushButton("▶ Run")
         self._run_btn.setToolTip(
             "Build the model if needed, then initialise and run it.")
@@ -452,8 +481,10 @@ class SimulateDialog(QtWidgets.QDialog):
         bar.addStretch(1)
         self._close_btn = QtWidgets.QPushButton("Close")
         self._close_btn.setToolTip(
-            "Close this window (cancels a build in progress first). The built "
-            "model otherwise stays alive on the host.")
+            "Close this window. A streaming run keeps advancing on the host "
+            "(steer it with the ⏸/⏹ controls next to Simulate); only a build / "
+            "initialise still in progress is cancelled first. The built model "
+            "stays alive on the host.")
         self._close_btn.clicked.connect(self._on_close_clicked)
         bar.addWidget(self._close_btn)
         outer.addLayout(bar)
@@ -472,12 +503,25 @@ class SimulateDialog(QtWidgets.QDialog):
                 "instantiate it on the host.")
 
     def _log(self, message: str, level: str = "status"):
-        self._logs.add(message, level)
+        # Route through the shared recorder when present (it mirrors back into
+        # this panel); otherwise write straight to the panel.
+        if self._log_sink is not None:
+            self._log_sink(message, level)
+        else:
+            self._logs.add(message, level)
+
+    def prime_log(self, entries):
+        """Fill the panel with previously-recorded log lines (on open), so a run
+        started from the toolbar is already visible here.  Written straight to
+        the panel to avoid re-recording them in the shared store."""
+        for message, level in entries:
+            self._logs.add(message, level)
 
     def _busy(self, busy: bool):
-        # While busy the Build button turns into a Cancel control; Run is
-        # disabled (only one operation at a time).
+        # While busy the Build button turns into a Cancel control; Run and the
+        # rebuild/reset menu are disabled (only one operation at a time).
         self._run_btn.setEnabled(not busy)
+        self._more_btn.setEnabled(not busy)
         if busy:
             self._build_btn.setText(f"■ Cancel {self._op_label}")
             self._build_btn.setToolTip(
@@ -576,7 +620,65 @@ class SimulateDialog(QtWidgets.QDialog):
             task, lambda outcome: self._log(f"\nready ({outcome})."),
             op_label="build")
 
+    def _on_force_build(self):
+        """Re-instantiate the model unconditionally (no reuse)."""
+        try:
+            system = self._build_system()
+        except Exception as exc:
+            self._log(f"\nFAILED building spec: {type(exc).__name__}: {exc}",
+                      "error")
+            return
+        inst_kw = instantiate_kwargs(self._get_options())
+
+        def task(log):
+            return self._session.force_build(system, inst_kw, log)
+
+        self._start_worker(
+            task, lambda outcome: self._log(f"\nready ({outcome})."),
+            op_label="rebuild")
+
+    def _on_force_init(self):
+        """Re-solve the built model to t=0 without launching a run."""
+        if self._session.run_active:
+            self._log("Stop the run before re-initialising (use the ⏹ "
+                      "control).", "status")
+            return
+        if not self._session.built:
+            self._log("Build the model first.", "status")
+            return
+        init_kw = initialise_kwargs(self._get_options())
+
+        def task(log):
+            return self._session.initialise(init_kw, log)
+
+        self._start_worker(
+            task, lambda outcome: self._log(f"\nready ({outcome})."),
+            op_label="initialise")
+
+    def _on_reset_model(self):
+        """Drop the built model from the host (next run re-instantiates)."""
+        if self._session.run_active:
+            self._log("Stop the run before resetting the model "
+                      "(use the ⏹ control).", "status")
+            return
+        if not self._session.built:
+            self._log("No built model to reset.", "status")
+            return
+
+        def task(log):
+            self._session.reset()
+            log("model reset — dropped from the host; the next run "
+                "re-instantiates it.", "status")
+            return "reset"
+
+        self._start_worker(
+            task, lambda _outcome: self._refresh_status(), op_label="reset")
+
     def _on_run(self):
+        if self._session.run_active:
+            self._log("A run is already in progress — pause or stop it first "
+                      "(the ⏸/⏹ controls next to Simulate).", "status")
+            return
         options = self._get_options()
         run_kw = run_kwargs(options)
         if run_kw.get("stop_time") is None:
@@ -599,10 +701,14 @@ class SimulateDialog(QtWidgets.QDialog):
         def task(log):
             outcome = self._session.ensure_built(system, inst_kw, log)
             log(f"model {outcome}; starting run …", "status")
-            return self._session.run(init_kw, run_kw, log)
+            return self._session.start_run(init_kw, run_kw, log)
 
         self._start_worker(
-            task, lambda summary: self._log(f"\nOK — run summary: {summary}"),
+            task,
+            lambda _ack: self._log(
+                "\nrun started — it streams live and keeps running in the "
+                "background. You can close this window; use the ⏸/⏹ controls "
+                "next to Simulate to pause or stop it."),
             op_label="run")
 
     # --- lifecycle --------------------------------------------------------- #

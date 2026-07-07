@@ -10,10 +10,12 @@ from __future__ import annotations
 import re
 
 from .catalog import MIME_TYPE
-from .items import ConnectionItem, NodeItem, PortItem
+from .items import ConnectionItem, NodeItem, PortItem, display_type_name
+from .plots import VARIABLE_MIME, PlotItem, decode_variables, make_content
 from .properties import PropertiesDialog
 from .qt import QtCore, QtGui, QtWidgets, drop_point, exec_
 from .style import kind_color
+from .varwindow import VariablesWindow
 
 __all__ = ["Canvas"]
 
@@ -100,6 +102,9 @@ class Canvas(QtWidgets.QGraphicsView):
         self._show_types = True        # component-type label
         self._show_params = True       # ui_label parameter labels
         self._show_port_names = True   # per-port name labels
+        self._on_objects_changed = None     # () -> None, set by MainWindow
+        self._var_windows: list = []        # open VariablesWindow refs (keep alive)
+        self._objects: list[PlotItem] = []  # plot/table scene items
         self._scene = QtWidgets.QGraphicsScene(self)
         self._scene.setSceneRect(-2000, -2000, 6800, 5200)
         # The default BSP index caches each item's scene bounds. When a node is
@@ -130,25 +135,36 @@ class Canvas(QtWidgets.QGraphicsView):
             return
         self._zoom = new_zoom
         self.scale(factor, factor)
+        self._rerender_objects()
 
     def reset_zoom(self):
         self.resetTransform()
         self._zoom = 1.0
+        self._rerender_objects()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
 
     def fit_view(self):
-        """Zoom/pan so every placed component fits in the viewport."""
+        """Zoom/pan so every placed component *and* plot/table object fits."""
         nodes = self.nodes()
-        if not nodes:
+        overlays = self.overlays()
+        if not nodes and not overlays:
             self._on_status("Nothing to fit — canvas is empty.")
             return
         rect = QtCore.QRectF()
         for node in nodes:
             box = node.sceneBoundingRect()
             rect = box if rect.isNull() else rect.united(box)
+        for obj in overlays:
+            box = obj.scene_rect()
+            rect = box if rect.isNull() else rect.united(box)
         rect.adjust(-40, -40, 40, 40)   # breathing room around the bounds
         self.fitInView(rect, QtCore.Qt.KeepAspectRatio)
         self._zoom = self.transform().m11()  # keep wheel-zoom clamping in sync
-        self._on_status(f"Fit {len(nodes)} component(s) in view")
+        self._rerender_objects()
+        self._on_status(
+            f"Fit {len(nodes)} component(s), {len(overlays)} object(s) in view")
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.MiddleButton:
@@ -202,7 +218,7 @@ class Canvas(QtWidgets.QGraphicsView):
     # --- drop handling ------------------------------------------------------ #
     def _accepts(self, event) -> bool:
         md = event.mimeData()
-        return md.hasFormat(MIME_TYPE) or md.hasText()
+        return md.hasFormat(MIME_TYPE) or md.hasFormat(VARIABLE_MIME) or md.hasText()
 
     def dragEnterEvent(self, event):
         if self._accepts(event):
@@ -218,6 +234,30 @@ class Canvas(QtWidgets.QGraphicsView):
 
     def dropEvent(self, event):
         md = event.mimeData()
+        # A variable dropped on a plot/table panel is consumed by that widget
+        # directly (normal widget drag-and-drop).  A drop that reaches the view
+        # itself landed on empty canvas -> spin up a fresh table there.
+        if md.hasFormat(VARIABLE_MIME):
+            payloads = decode_variables(md)
+            if not payloads:
+                event.ignore()
+                return
+            scene_pt = self.mapToScene(drop_point(event))
+            target = self._object_at(scene_pt)
+            if target is not None:            # dropped onto an existing object
+                target.consume(payloads)
+                self._on_status(
+                    f"Added {len(payloads)} variable(s) to "
+                    f"'{target.content.title()}'")
+            else:                             # empty canvas -> fresh table
+                overlay = self.add_object("table", scene_pt)
+                overlay.consume(payloads)
+                self._on_status(
+                    f"Added {len(payloads)} variable(s) to "
+                    f"'{overlay.content.title()}'")
+            self._objects_changed()
+            event.acceptProposedAction()
+            return
         if md.hasFormat(MIME_TYPE):
             type_name = bytes(md.data(MIME_TYPE)).decode("utf-8")
         elif md.hasText():
@@ -342,7 +382,8 @@ class Canvas(QtWidgets.QGraphicsView):
              "to": f"{c.dst.node.comp_id}.{c.dst.pname}"}
             for c in self.connections()
         ]
-        return {"nodes": nodes, "connections": connections}
+        objects = [o.to_dict() for o in self.overlays()]
+        return {"nodes": nodes, "connections": connections, "objects": objects}
 
     def load_project(self, data: dict):
         """Rebuild the canvas from :meth:`to_project` output (replacing it)."""
@@ -388,8 +429,18 @@ class Canvas(QtWidgets.QGraphicsView):
             conn = ConnectionItem(src, dst, self)
             self._scene.addItem(conn)
             self._connections.append(conn)
+
+        for od in data.get("objects", []):
+            try:
+                overlay = PlotItem.from_dict(od, self)
+            except Exception as exc:               # unknown kind / bad payload
+                self._on_status(f"Skipped object {od.get('kind')!r}: {exc}")
+                continue
+            self._register_object(overlay)
+        self._objects_changed()
         self._on_status(
-            f"Loaded {len(by_id)} component(s), {len(self._connections)} wire(s)")
+            f"Loaded {len(by_id)} component(s), {len(self._connections)} wire(s), "
+            f"{len(self.overlays())} object(s)")
 
     @staticmethod
     def _port_by_path(by_id: dict, path: str) -> "PortItem | None":
@@ -405,6 +456,12 @@ class Canvas(QtWidgets.QGraphicsView):
     def node_count(self) -> int:
         return len(self.nodes())
 
+    def set_component_warnings(self, warnings_by_id: dict[str, list[str]]):
+        """Apply per-component modelling warnings (``{comp_id: [msg, ...]}``) to
+        the matching nodes; every other node has its warnings cleared."""
+        for node in self.nodes():
+            node.set_warnings(warnings_by_id.get(node.comp_id) or [])
+
     def remove_node(self, node: NodeItem):
         for pi in node.port_items:
             for conn in list(pi.connections):
@@ -414,8 +471,84 @@ class Canvas(QtWidgets.QGraphicsView):
     def clear_nodes(self):
         for node in self.nodes():
             self.remove_node(node)
+        for overlay in list(self._objects):
+            if overlay.scene() is self._scene:
+                self._scene.removeItem(overlay)
+            overlay.dispose()
+        self._objects.clear()
         self._connections.clear()
+        self._objects_changed()
         self._on_status("Canvas cleared")
+
+    # --- plot / table objects ---------------------------------------------- #
+    def set_objects_changed_hook(self, fn):
+        """Register a callable invoked whenever the set of plot/table objects
+        (or their watched variables) changes, so the live pump can re-sync."""
+        self._on_objects_changed = fn
+
+    def _objects_changed(self):
+        if self._on_objects_changed is not None:
+            self._on_objects_changed()
+
+    def overlays(self) -> list[PlotItem]:
+        return list(self._objects)
+
+    def _object_at(self, scene_pt: QtCore.QPointF) -> "PlotItem | None":
+        """Top-most plot/table object under a scene point (or None)."""
+        for obj in self._scene.items(scene_pt):
+            if isinstance(obj, PlotItem):
+                return obj
+        return None
+
+    def _rerender_objects(self):
+        """Re-render every object's pixmap at the current zoom (after the view
+        zooms / fits) so the content text stays crisp."""
+        for obj in self._objects:
+            obj.on_view_scaled()
+
+    def _register_object(self, obj: PlotItem):
+        self._objects.append(obj)
+        self._scene.addItem(obj)
+
+    def add_object(self, kind: str,
+                   scene_pos: QtCore.QPointF | None = None) -> PlotItem:
+        """Create a plot/table object of ``kind`` at ``scene_pos`` (or centre)."""
+        content = make_content(kind)
+        obj = PlotItem(content, self)
+        if scene_pos is None:
+            scene_pos = self.mapToScene(self.viewport().rect().center())
+        # Centre the item on the requested scene point.
+        rect = obj.boundingRect()
+        obj.setPos(scene_pos.x() - rect.width() / 2,
+                   scene_pos.y() - rect.height() / 2)
+        self._register_object(obj)
+        self._objects_changed()
+        self._on_status(f"Added {kind} object")
+        return obj
+
+    def remove_overlay(self, overlay: PlotItem):
+        title = overlay.content.title() if overlay.content is not None else "object"
+        if overlay in self._objects:
+            self._objects.remove(overlay)
+        if overlay.scene() is self._scene:
+            self._scene.removeItem(overlay)
+        overlay.dispose()                      # release the off-screen widget
+        self._objects_changed()
+        self._on_status(f"Removed '{title}' object")
+
+    def open_variables(self, node: NodeItem):
+        """Open the per-component Variables window (a drag source for plots)."""
+        win = VariablesWindow(node.comp_id, node.type_name, node.medium,
+                              node.params, parent=self.window())
+        win.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        win.destroyed.connect(lambda *_: self._forget_var_window(win))
+        self._var_windows.append(win)
+        win.show()
+        win.raise_()
+
+    def _forget_var_window(self, win):
+        if win in self._var_windows:
+            self._var_windows.remove(win)
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_Escape and self._temp is not None:
@@ -552,6 +685,12 @@ class Canvas(QtWidgets.QGraphicsView):
         items_at = self.items(event.pos())
         top = items_at[0] if items_at else None
 
+        # Right-click on a plot/table object -> let the scene deliver the event
+        # to the item's own contextMenuEvent (its edit menu).
+        if self._object_at(self.mapToScene(event.pos())) is not None:
+            super().contextMenuEvent(event)
+            return
+
         # Right-click on a wire -> just a Delete action.
         if isinstance(top, ConnectionItem):
             menu = QtWidgets.QMenu(self)
@@ -568,6 +707,13 @@ class Canvas(QtWidgets.QGraphicsView):
             return
         menu = QtWidgets.QMenu(self)
         act_props = menu.addAction("Properties…")
+        act_vars = menu.addAction("Variables…")
+
+        act_warn = None
+        if node.has_warnings:
+            n = len(node.warning_messages())
+            act_warn = menu.addAction(
+                f"\u26a0 Show warning{'s' if n != 1 else ''} ({n})…")
 
         tmenu = menu.addMenu("Transforms")
         tmenu.setIcon(_transform_icon("transforms"))
@@ -589,6 +735,10 @@ class Canvas(QtWidgets.QGraphicsView):
         chosen = exec_(menu, event.globalPos())
         if chosen == act_props:
             self.open_properties(node)
+        elif chosen == act_vars:
+            self.open_variables(node)
+        elif act_warn is not None and chosen == act_warn:
+            self.show_warnings(node)
         elif chosen == act_cw:
             node.rotate_by(90)
             self._on_status(f"Rotated '{node.comp_id}' to {node._rot}°")
@@ -621,6 +771,21 @@ class Canvas(QtWidgets.QGraphicsView):
         to populate the medium selector in the per-node properties dialog."""
         self._media_provider = fn
 
+    def show_warnings(self, node: NodeItem):
+        """Pop up the modelling warnings the host raised for ``node``."""
+        msgs = node.warning_messages()
+        if not msgs:
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle(f"Warnings — {node.comp_id}")
+        n = len(msgs)
+        box.setText(f"{node.comp_id} ({node.type_name}) raised "
+                    f"{n} warning{'s' if n != 1 else ''}:")
+        box.setInformativeText("\n\n".join(f"• {m}" for m in msgs))
+        box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        exec_(box)
+
     def open_properties(self, node: NodeItem):
         media_keys = self._media_provider() if self._media_provider else None
         dlg = PropertiesDialog(node, media_keys=media_keys, parent=self)
@@ -642,5 +807,5 @@ class Canvas(QtWidgets.QGraphicsView):
     def _report_selection(self):
         sel = [i for i in self._scene.selectedItems() if isinstance(i, NodeItem)]
         if len(sel) == 1:
-            self._on_status(f"{sel[0].entry['type']} — "
+            self._on_status(f"{display_type_name(sel[0].entry)} — "
                             f"{sel[0].entry.get('summary', '')}")
