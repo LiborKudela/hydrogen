@@ -658,7 +658,7 @@ class Pipe(Model):
         if self.any_leaky:
             total = sum(self[f'env_{i}']['m_dot_leak'].symbol
                         for i in range(self.n_segments))
-            eqs.append(self['m_dot_leak_env'].symbol - total)
+            eqs.append(self['m_dot_leak_env'].symbol + total)
         return eqs
 
 
@@ -1037,5 +1037,5 @@ class Tank(Model):
         if self.any_leaky:
             total = sum(self[f'env_{shape}']['m_dot_leak'].symbol
                         for shape in self._SHAPES)
-            eqs.append(self['m_dot_leak_env'].symbol - total)
+            eqs.append(self['m_dot_leak_env'].symbol + total)
         return eqs

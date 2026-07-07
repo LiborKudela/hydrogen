@@ -354,6 +354,9 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         # Modelling warnings the host raised for this component (build/run), each
         # a formatted message; drives the amber warning badge + its dialog.
         self._warnings: list[str] = []
+        # Client-side derived variables created in the Variables window for this
+        # component (persisted in the project file).
+        self.derived_variables: list[dict] = []
         # Custom port placements: pname -> (x, y, side); empty = use defaults.
         self._port_layout: dict[str, tuple] = {}
         # Visual transform state (applied around the node's centre).

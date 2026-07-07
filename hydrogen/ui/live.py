@@ -25,8 +25,9 @@ import threading
 
 import numpy as np
 
+from .derived import compute_series, is_derived
 from .plots import (
-    PROGRESS_KEY, STEP_KEY, STEPSIZE_KEY, TIME_KEY, WALLTIME_KEY)
+    PROGRESS_KEY, SPECIAL_KEYS, STEP_KEY, STEPSIZE_KEY, TIME_KEY, WALLTIME_KEY)
 from .qt import QtCore, Signal
 
 __all__ = ["LiveController"]
@@ -66,7 +67,9 @@ class LiveController(QtCore.QObject):
         self._stream = None
         self._sysp_key = None                # id() of the sysp the stream belongs to
         self._time = None                    # StreamHandle over time
-        self._handles: dict = {}             # full_name -> StreamHandle
+        self._handles: dict = {}             # full_name -> StreamHandle (1-D)
+        self._values_handles: dict = {}      # pattern -> StreamHandle (2-D)
+        self._derived_specs: dict = {}       # derived full -> agg spec
         self._failed = False                 # stream open failed for this sysp
         self._log_sink = None                # optional callable(msg, level)
         self._last_phase = None              # last phase we announced
@@ -188,6 +191,19 @@ class LiveController(QtCore.QObject):
                 i = max(0, min(self._start_index, n))
                 snap[full] = (t[i:n], a[i:n])
                 latest[full] = float(a[-1]) if len(a) else None
+            for dfull, agg in self._derived_specs.items():
+                try:
+                    ts, ys = compute_series(
+                        agg,
+                        time_array=t,
+                        start_index=self._start_index,
+                        series_handles=self._handles,
+                        values_handles=self._values_handles,
+                    )
+                    snap[dfull] = (ts, ys)
+                    latest[dfull] = float(ys[-1]) if len(ys) else None
+                except Exception:
+                    pass
             # The current simulation time + last step size dt, for the table's
             # time / step-size rows (dt is the gap between the last two samples;
             # a run restart's backward jump is ignored).
@@ -254,27 +270,64 @@ class LiveController(QtCore.QObject):
             self._stream = sysp.vars_stream()
             self._time = self._stream.time()
             self._handles = {}
+            self._values_handles = {}
         except Exception:
             self._stream = None
             self._time = None
             self._failed = True
 
-    def _register_needed(self):
-        needed = set()
+    def _collect_stream_requests(self):
+        """Raw series names + derived aggregation specs requested by plot objects."""
+        needed: set[str] = set()
+        derived: dict = {}
         with self._contents_lock:
             contents = list(self._contents)
         for c in contents:
             try:
-                needed.update(c.variable_names())
+                for full in c.variable_names():
+                    if full in SPECIAL_KEYS or is_derived(full):
+                        continue
+                    needed.add(full)
+                specs = getattr(c, "derived_specs", None)
+                if callable(specs):
+                    derived.update(specs())
             except Exception:
                 pass
+        return needed, derived
+
+    def _register_needed(self):
+        needed, derived = self._collect_stream_requests()
+        self._derived_specs = derived
+
         for full in needed - set(self._handles):
             try:
                 self._handles[full] = self._stream.series(full)
             except Exception:
-                # Unknown / not-yet-recorded name: skip; retried next cycle only
-                # if it is still requested (kept out of _handles).
                 pass
+
+        for agg in derived.values():
+            axis = agg.get("axis", "instances")
+            if axis == "time":
+                for src in agg.get("sources") or []:
+                    if src not in self._handles:
+                        try:
+                            self._handles[src] = self._stream.series(src)
+                        except Exception:
+                            pass
+                continue
+            pattern = agg.get("pattern")
+            if pattern and pattern not in self._values_handles:
+                try:
+                    self._values_handles[pattern] = self._stream.series_values(
+                        pattern)
+                except Exception:
+                    pass
+            for src in agg.get("sources") or []:
+                if src not in self._handles:
+                    try:
+                        self._handles[src] = self._stream.series(src)
+                    except Exception:
+                        pass
 
     def _close_stream(self):
         if self._stream is not None:
@@ -285,6 +338,8 @@ class LiveController(QtCore.QObject):
         self._stream = None
         self._time = None
         self._handles = {}
+        self._values_handles = {}
+        self._derived_specs = {}
         self._start_index = 0
         self._reset_index = 0
 

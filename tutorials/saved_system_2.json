@@ -7,8 +7,8 @@
       {
         "comp_id": "pressuresource_5",
         "type": "hydrogen.thermofluid.PressureSource",
-        "x": 277.2619476297925,
-        "y": 592.3325039267571,
+        "x": 453.6357909248202,
+        "y": 570.8513804200315,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -30,13 +30,38 @@
             0.0
           ]
         },
-        "ports": {}
+        "ports": {},
+        "derived_variables": []
+      },
+      {
+        "comp_id": "compressiblevalve_4",
+        "type": "hydrogen.thermofluid.CompressibleValve",
+        "x": 676.1800951457715,
+        "y": 577.894357498732,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": null,
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.7322517488694302,
+            96.00499192829477
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {},
+        "derived_variables": []
       },
       {
         "comp_id": "ramp_6",
         "type": "hydrogen.control.Ramp",
-        "x": 383.06442964780234,
-        "y": 465.21838692585163,
+        "x": 559.43827294283,
+        "y": 443.73726341912607,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -60,107 +85,15 @@
           ]
         },
         "ports": {},
+        "derived_variables": [],
         "w": 150.0,
         "h": 78.0
       },
       {
-        "comp_id": "compressiblevalve_4",
-        "type": "hydrogen.thermofluid.CompressibleValve",
-        "x": 499.80625185074376,
-        "y": 599.3754810054576,
-        "rot": 0,
-        "mirror_x": false,
-        "mirror_y": false,
-        "medium": "Hydrogen",
-        "params": null,
-        "ports_locked": true,
-        "label_offsets": {
-          "title": [
-            0.7322517488694302,
-            96.00499192829477
-          ],
-          "params": [
-            0.0,
-            0.0
-          ]
-        },
-        "ports": {}
-      },
-      {
-        "comp_id": "tank_3",
-        "type": "hydrogen.thermofluid.Tank",
-        "x": 962.530672998794,
-        "y": 477.7328917232212,
-        "rot": -90,
-        "mirror_x": false,
-        "mirror_y": false,
-        "medium": "Hydrogen",
-        "params": {
-          "volume": 0.05,
-          "diameter": 0.3,
-          "layers": [
-            {
-              "__type__": "WallLayer",
-              "material": {
-                "__type__": "WallMaterial",
-                "name": "AISI 316/316L",
-                "rho": 7990.0,
-                "cp": 500.0,
-                "k": 15.0
-              },
-              "thickness": 0.002,
-              "permeation": {
-                "__type__": "TransientDiffusion",
-                "transport_fit": {
-                  "__type__": "TransportFit",
-                  "permeant": {
-                    "__type__": "Permeant",
-                    "name": "H2",
-                    "M": 0.00201588,
-                    "solubility_exponent": 2.0
-                  },
-                  "Phi0": 5.285149e-08,
-                  "E_Phi": 59800.0,
-                  "D0": 6.180331e-07,
-                  "E_D": 53900.0,
-                  "name": "H2 in AISI 316"
-                },
-                "n_nodes": 5,
-                "C_init": 0.0
-              },
-              "dynamic": true,
-              "capacity_split": "uniform"
-            }
-          ],
-          "h_inner": 50.0,
-          "count": 2,
-          "outer_thermal": "adiabatic",
-          "h_ext": 10.0,
-          "T_ext": 293.15,
-          "T_outer": 293.15,
-          "p_ext": 1.0,
-          "T_wall_init": 293.15,
-          "p_init": 101325.0,
-          "T_init": 293.15
-        },
-        "ports_locked": true,
-        "label_offsets": {
-          "title": [
-            -116.02299837396492,
-            7.41144477858893
-          ],
-          "params": [
-            -97.30962951573201,
-            -135.20844865877132
-          ]
-        },
-        "ports": {}
-      },
-      {
         "comp_id": "pipe_2",
         "type": "hydrogen.thermofluid.Pipe",
-        "x": 761.0963218055224,
-        "y": 606.0865170590747,
+        "x": 937.47016510055,
+        "y": 584.6053935523491,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -244,7 +177,96 @@
             -21.0
           ]
         },
-        "ports": {}
+        "ports": {},
+        "derived_variables": [
+          {
+            "agg": {
+              "axis": "time",
+              "op": "integral",
+              "sources": [
+                "pipe_2.m_dot_leak_env"
+              ]
+            },
+            "description": "integral of pipe_2.m_dot_leak_env",
+            "full": "__derived__:83ff99d48fc3",
+            "kind": "derived",
+            "label": "pipe_2.m_dot_leak_env (integral)",
+            "name": "m_dot_leak_env (integral)",
+            "unit": "kg",
+            "value": null
+          }
+        ]
+      },
+      {
+        "comp_id": "tank_3",
+        "type": "hydrogen.thermofluid.Tank",
+        "x": 1138.9045162938216,
+        "y": 456.2517682164953,
+        "rot": -90,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": {
+          "volume": 0.05,
+          "diameter": 0.3,
+          "layers": [
+            {
+              "__type__": "WallLayer",
+              "material": {
+                "__type__": "WallMaterial",
+                "name": "AISI 316/316L",
+                "rho": 7990.0,
+                "cp": 500.0,
+                "k": 15.0
+              },
+              "thickness": 0.002,
+              "permeation": {
+                "__type__": "TransientDiffusion",
+                "transport_fit": {
+                  "__type__": "TransportFit",
+                  "permeant": {
+                    "__type__": "Permeant",
+                    "name": "H2",
+                    "M": 0.00201588,
+                    "solubility_exponent": 2.0
+                  },
+                  "Phi0": 5.285149e-08,
+                  "E_Phi": 59800.0,
+                  "D0": 6.180331e-07,
+                  "E_D": 53900.0,
+                  "name": "H2 in AISI 316"
+                },
+                "n_nodes": 5,
+                "C_init": 0.0
+              },
+              "dynamic": true,
+              "capacity_split": "uniform"
+            }
+          ],
+          "h_inner": 50.0,
+          "count": 2,
+          "outer_thermal": "adiabatic",
+          "h_ext": 10.0,
+          "T_ext": 293.15,
+          "T_outer": 293.15,
+          "p_ext": 1.0,
+          "T_wall_init": 293.15,
+          "p_init": 101325.0,
+          "T_init": 293.15
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            -116.02299837396492,
+            7.41144477858893
+          ],
+          "params": [
+            -97.30962951573201,
+            -135.20844865877132
+          ]
+        },
+        "ports": {},
+        "derived_variables": []
       }
     ],
     "connections": [
@@ -268,10 +290,10 @@
     "objects": [
       {
         "kind": "table",
-        "x": -394.65005613428644,
-        "y": 413.00738455571184,
-        "w": 554.5267592267227,
-        "h": 296.68893102916974,
+        "x": 701.3010037813223,
+        "y": 1096.7384678503677,
+        "w": 551.2773937922708,
+        "h": 353.941288032366,
         "content": {
           "title": "Variables",
           "rows": [
@@ -329,45 +351,8 @@
       },
       {
         "kind": "timeseries",
-        "x": -399.77618010252405,
-        "y": 731.363322070746,
-        "w": 553.9945825321616,
-        "h": 358.1376903628543,
-        "content": {
-          "title": "Leak flow",
-          "traces": [
-            {
-              "full": "pipe_2.m_dot_leak_env",
-              "label": "pipe_2.m_dot_leak_env",
-              "color": "#1f77b4",
-              "width": 2.0,
-              "dash": "dashdotdot",
-              "visible": true
-            },
-            {
-              "full": "tank_3.m_dot_leak_env",
-              "label": "tank_3.m_dot_leak_env",
-              "color": "#d62728",
-              "width": 2.0,
-              "dash": "solid",
-              "visible": true
-            }
-          ],
-          "settings": {
-            "title": "Leak flow",
-            "legend": true,
-            "legend_pos": "bottom",
-            "title_size": 12,
-            "axis_size": 9,
-            "x_title": "time [s]",
-            "y_title": ""
-          }
-        }
-      },
-      {
-        "kind": "timeseries",
-        "x": 167.91427706661432,
-        "y": 728.6454501346332,
+        "x": 133.59242801673116,
+        "y": 730.3615425871272,
         "w": 554.7652160469321,
         "h": 360.7358539760842,
         "content": {
@@ -403,10 +388,10 @@
       },
       {
         "kind": "timeseries",
-        "x": -408.00759493944565,
-        "y": 1102.1430135952764,
-        "w": 561.016233659511,
-        "h": 366.00201756500996,
+        "x": -491.62264480094336,
+        "y": 1099.6092242055338,
+        "w": 609.7795381355047,
+        "h": 351.98547734342947,
         "content": {
           "title": "Mass flow",
           "traces": [
@@ -432,8 +417,8 @@
       },
       {
         "kind": "timeseries",
-        "x": 165.39788596000324,
-        "y": 1102.5404293853996,
+        "x": 131.07603691011997,
+        "y": 1099.108244480411,
         "w": 560.1460412988953,
         "h": 359.6788623014031,
         "content": {
@@ -461,9 +446,9 @@
       },
       {
         "kind": "timeseries",
-        "x": 733.1607598841797,
-        "y": 731.2856561739463,
-        "w": 527.7707299588731,
+        "x": 698.8389108342965,
+        "y": 727.853471268958,
+        "w": 555.2282091987797,
         "h": 356.68946948711766,
         "content": {
           "title": "Pressure",
@@ -479,6 +464,88 @@
           ],
           "settings": {
             "title": "Pressure",
+            "legend": true,
+            "legend_pos": "bottom",
+            "title_size": 12,
+            "axis_size": 9,
+            "x_title": "time [s]",
+            "y_title": ""
+          }
+        }
+      },
+      {
+        "kind": "pie",
+        "x": -495.1153697854391,
+        "y": 335.8062975834083,
+        "w": 850.4087840386993,
+        "h": 372.93510992877964,
+        "content": {
+          "title": "Pie chart",
+          "entries": [
+            {
+              "full": "__derived__:0916d4670b2c",
+              "label": "pipe_2.m_dot_leak_env (integral)",
+              "color": "#1f77b4",
+              "visible": true,
+              "agg": {
+                "axis": "time",
+                "op": "integral",
+                "sources": [
+                  "pipe_2.m_dot_leak_env"
+                ]
+              }
+            },
+            {
+              "full": "__derived__:057556e2a84e",
+              "label": "tank_3.m_dot_leak_env (integral)",
+              "color": "#d62728",
+              "visible": true,
+              "agg": {
+                "axis": "time",
+                "op": "integral",
+                "sources": [
+                  "tank_3.m_dot_leak_env"
+                ]
+              }
+            }
+          ],
+          "settings": {
+            "title": "Pie chart",
+            "legend": true,
+            "legend_pos": "right",
+            "title_size": 12,
+            "show_percent": true
+          }
+        }
+      },
+      {
+        "kind": "timeseries",
+        "x": -491.13316026646004,
+        "y": 729.3235958985434,
+        "w": 614.4408916964131,
+        "h": 348.7330056732326,
+        "content": {
+          "title": "Timeseries",
+          "traces": [
+            {
+              "full": "pipe_2.m_dot_leak_env",
+              "label": "pipe_2.m_dot_leak_env",
+              "color": "#1f77b4",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            },
+            {
+              "full": "tank_3.m_dot_leak_env",
+              "label": "tank_3.m_dot_leak_env",
+              "color": "#d62728",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            }
+          ],
+          "settings": {
+            "title": "Timeseries",
             "legend": true,
             "legend_pos": "bottom",
             "title_size": 12,

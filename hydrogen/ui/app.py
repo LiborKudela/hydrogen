@@ -278,6 +278,12 @@ class MainWindow(QtWidgets.QMainWindow):
         add_ts = plots_menu.addAction("Add T&imeseries")
         add_ts.setToolTip("Add a live timeseries chart to the canvas.")
         add_ts.triggered.connect(lambda: self._add_object("timeseries"))
+        add_bar = plots_menu.addAction("Add &Bar chart")
+        add_bar.setToolTip("Add a bar chart of each variable's latest value.")
+        add_bar.triggered.connect(lambda: self._add_object("bar"))
+        add_pie = plots_menu.addAction("Add &Pie chart")
+        add_pie.setToolTip("Add a pie chart of each variable's latest value.")
+        add_pie.triggered.connect(lambda: self._add_object("pie"))
 
     def _svg_icon(self, svg: str, fallback) -> QtGui.QIcon:
         """Build a crisp `QIcon` from an inline SVG string, falling back to a
@@ -757,7 +763,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # keep the Qt event loop alive after this window closes.
         for overlay in self._canvas.overlays():
             overlay.dispose()
-        for win in list(getattr(self._canvas, "_var_windows", [])):
+        for win in list(getattr(self._canvas, "_var_windows", {}).values()):
             win.close()
         super().closeEvent(event)
         # This is the application's main window: closing it ends the session.

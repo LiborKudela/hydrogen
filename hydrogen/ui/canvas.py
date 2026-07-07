@@ -7,6 +7,7 @@ interaction loop (drag-to-wire, zoom/pan, per-node context menu, selection).
 
 from __future__ import annotations
 
+import copy
 import re
 
 from .catalog import MIME_TYPE
@@ -103,7 +104,7 @@ class Canvas(QtWidgets.QGraphicsView):
         self._show_params = True       # ui_label parameter labels
         self._show_port_names = True   # per-port name labels
         self._on_objects_changed = None     # () -> None, set by MainWindow
-        self._var_windows: list = []        # open VariablesWindow refs (keep alive)
+        self._var_windows: dict[str, VariablesWindow] = {}  # comp_id -> open window
         self._objects: list[PlotItem] = []  # plot/table scene items
         self._scene = QtWidgets.QGraphicsScene(self)
         self._scene.setSceneRect(-2000, -2000, 6800, 5200)
@@ -372,6 +373,7 @@ class Canvas(QtWidgets.QGraphicsView):
                 },
                 "ports": {name: list(layout)
                           for name, layout in n._port_layout.items()},
+                "derived_variables": copy.deepcopy(n.derived_variables),
             }
             if n._custom_size is not None:
                 node["w"] = n.rect().width()
@@ -411,6 +413,7 @@ class Canvas(QtWidgets.QGraphicsView):
             node._mirror_x = bool(nd.get("mirror_x", False))
             node._mirror_y = bool(nd.get("mirror_y", False))
             node.set_ports_locked(bool(nd.get("ports_locked", node.ports_locked)))
+            node.derived_variables = copy.deepcopy(nd.get("derived_variables", []))
             self._apply_marker_visibility(node)
             node.apply_transform()
             self._scene.addItem(node)
@@ -538,17 +541,28 @@ class Canvas(QtWidgets.QGraphicsView):
 
     def open_variables(self, node: NodeItem):
         """Open the per-component Variables window (a drag source for plots)."""
-        win = VariablesWindow(node.comp_id, node.type_name, node.medium,
-                              node.params, parent=self.window())
+        existing = self._var_windows.get(node.comp_id)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = VariablesWindow(
+            node.comp_id, node.type_name, node.medium, node.params,
+            derived=node.derived_variables,
+            on_derived_changed=lambda payloads, n=node: self._set_derived(n, payloads),
+            parent=self.window())
         win.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-        win.destroyed.connect(lambda *_: self._forget_var_window(win))
-        self._var_windows.append(win)
+        win.destroyed.connect(lambda *_: self._forget_var_window(node.comp_id))
+        self._var_windows[node.comp_id] = win
         win.show()
         win.raise_()
 
-    def _forget_var_window(self, win):
-        if win in self._var_windows:
-            self._var_windows.remove(win)
+    def _set_derived(self, node: NodeItem, payloads: list[dict]):
+        node.derived_variables = copy.deepcopy(payloads)
+
+    def _forget_var_window(self, comp_id: str):
+        self._var_windows.pop(comp_id, None)
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_Escape and self._temp is not None:

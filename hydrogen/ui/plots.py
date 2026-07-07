@@ -17,6 +17,10 @@ Three layers:
 * :class:`TimeseriesChart` -- a ``QtCharts`` line chart; each dragged variable
   becomes a trace with a fully editable pen (colour / width / dash / legend
   name), plus chart-level title / legend / font settings.
+* :class:`BarChart` -- a bar chart of each variable's *latest* value (live
+  snapshot comparison).
+* :class:`PieChart` -- a pie chart of the latest values (proportional slices
+  with optional percentage labels on each slice).
 
 Content widgets accept variable drops directly (normal widget drag-and-drop) and
 announce changes via a ``changed`` signal; live values arrive via
@@ -36,7 +40,7 @@ from .qt import QtCharts, QtCore, QtGui, QtWidgets, Signal, exec_
 __all__ = [
     "VARIABLE_MIME", "TIME_KEY", "STEP_KEY", "PROGRESS_KEY", "STEPSIZE_KEY",
     "WALLTIME_KEY", "SPECIAL_KEYS", "encode_variables", "decode_variables",
-    "PlotItem", "VariableTable", "TimeseriesChart",
+    "PlotItem", "VariableTable", "TimeseriesChart", "BarChart", "PieChart",
     "make_content", "content_from_dict",
 ]
 
@@ -213,13 +217,16 @@ class VariableTable(QtWidgets.QWidget):
             full = p.get("full")
             if not full or any(r["full"] == full for r in self._rows):
                 continue
-            self._rows.append({
+            row = {
                 "full": full,
                 "label": p.get("label", full),
                 "unit": p.get("unit", ""),
                 "description": p.get("description", ""),
                 "value": p.get("value"),
-            })
+            }
+            if p.get("agg"):
+                row["agg"] = dict(p["agg"])
+            self._rows.append(row)
             added = True
         self._rebuild()
         if added:
@@ -228,6 +235,12 @@ class VariableTable(QtWidgets.QWidget):
     def variable_names(self) -> list[str]:
         # Run-status rows are resolved by the live source, not watched as series.
         return [r["full"] for r in self._rows if r["full"] not in SPECIAL_KEYS]
+
+    def derived_specs(self) -> dict[str, dict]:
+        """``{derived_full: agg}`` for client-side computed rows."""
+        return {r["full"]: dict(r["agg"])
+                for r in self._rows
+                if r.get("agg") and r["full"] not in SPECIAL_KEYS}
 
     def _add_special_row(self, full, label, unit, description):
         if any(r["full"] == full for r in self._rows):
@@ -291,7 +304,7 @@ class VariableTable(QtWidgets.QWidget):
             return None
         self._commit_edits()
         r = self._rows[row]
-        return {
+        payload = {
             "full": r["full"],
             "label": r.get("label", r["full"]),
             "name": r.get("label", r["full"]).rsplit(".", 1)[-1],
@@ -299,6 +312,9 @@ class VariableTable(QtWidgets.QWidget):
             "description": r.get("description", ""),
             "value": r.get("value"),
         }
+        if r.get("agg"):
+            payload["agg"] = dict(r["agg"])
+        return payload
 
     def drag_mime_at(self, pos: "QtCore.QPoint"):
         """MIME payload for a drag that starts at ``pos`` (this widget's own
@@ -659,6 +675,8 @@ class TimeseriesChart(QtWidgets.QWidget):
                 "dash": "solid",
                 "visible": True,
             }
+            if p.get("agg"):
+                trace["agg"] = dict(p["agg"])
             self._traces.append(trace)
             self._add_series(trace)
             added = True
@@ -668,6 +686,10 @@ class TimeseriesChart(QtWidgets.QWidget):
 
     def variable_names(self) -> list[str]:
         return [t["full"] for t in self._traces]
+
+    def derived_specs(self) -> dict[str, dict]:
+        return {t["full"]: dict(t["agg"])
+                for t in self._traces if t.get("agg")}
 
     # --- drop target ------------------------------------------------------- #
     def dragEnterEvent(self, event):
@@ -881,16 +903,522 @@ class TimeseriesChart(QtWidgets.QWidget):
 
 
 # --------------------------------------------------------------------------- #
+# Shared helpers / dialogs for snapshot charts (bar / pie).
+# --------------------------------------------------------------------------- #
+class EntryStyleDialog(QtWidgets.QDialog):
+    """Edit one bar/pie entry's label, colour and visibility."""
+
+    def __init__(self, entry: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Entry style")
+        self._entry = dict(entry)
+        form = QtWidgets.QFormLayout(self)
+
+        self._legend = QtWidgets.QLineEdit(entry.get("label", ""))
+        form.addRow("Label", self._legend)
+
+        self._color = entry.get("color", "#1f77b4")
+        self._color_btn = QtWidgets.QPushButton()
+        self._color_btn.clicked.connect(self._pick_color)
+        self._sync_color_btn()
+        form.addRow("Colour", self._color_btn)
+
+        self._visible = QtWidgets.QCheckBox("Visible")
+        self._visible.setChecked(bool(entry.get("visible", True)))
+        form.addRow("", self._visible)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _sync_color_btn(self):
+        self._color_btn.setText(self._color)
+        self._color_btn.setStyleSheet(
+            f"background-color: {self._color}; color: #fff;")
+
+    def _pick_color(self):
+        c = QtWidgets.QColorDialog.getColor(
+            QtGui.QColor(self._color), self, "Pick colour")
+        if c.isValid():
+            self._color = c.name()
+            self._sync_color_btn()
+
+    def result_entry(self) -> dict:
+        out = dict(self._entry)
+        out["label"] = self._legend.text()
+        out["color"] = self._color
+        out["visible"] = self._visible.isChecked()
+        return out
+
+
+class _SnapshotChartSettingsDialog(QtWidgets.QDialog):
+    """Title + legend settings shared by bar and pie charts."""
+
+    def __init__(self, settings: dict, parent=None, *, y_label=False,
+                 pie_options=False):
+        super().__init__(parent)
+        self.setWindowTitle("Chart settings")
+        self._s = dict(settings)
+        form = QtWidgets.QFormLayout(self)
+
+        self._title = QtWidgets.QLineEdit(settings.get("title", ""))
+        form.addRow("Title", self._title)
+
+        self._title_size = QtWidgets.QSpinBox()
+        self._title_size.setRange(8, 24)
+        self._title_size.setValue(int(settings.get("title_size", 12)))
+        form.addRow("Title size", self._title_size)
+
+        self._legend = QtWidgets.QCheckBox("Show legend")
+        self._legend.setChecked(bool(settings.get("legend", True)))
+        form.addRow("", self._legend)
+
+        self._legend_pos = QtWidgets.QComboBox()
+        self._legend_pos.addItems(["bottom", "top", "left", "right"])
+        self._legend_pos.setCurrentText(settings.get("legend_pos", "bottom"))
+        form.addRow("Legend position", self._legend_pos)
+
+        self._y_title = None
+        if y_label:
+            self._y_title = QtWidgets.QLineEdit(settings.get("y_title", ""))
+            form.addRow("Y axis title", self._y_title)
+
+        self._show_percent = None
+        if pie_options:
+            self._show_percent = QtWidgets.QCheckBox(
+                "Show percentages on slices")
+            self._show_percent.setChecked(
+                bool(settings.get("show_percent", True)))
+            form.addRow("", self._show_percent)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def result_settings(self) -> dict:
+        self._s.update({
+            "title": self._title.text(),
+            "title_size": self._title_size.value(),
+            "legend": self._legend.isChecked(),
+            "legend_pos": self._legend_pos.currentText(),
+        })
+        if self._y_title is not None:
+            self._s["y_title"] = self._y_title.text()
+        if self._show_percent is not None:
+            self._s["show_percent"] = self._show_percent.isChecked()
+        return self._s
+
+
+def _pie_slice_label(label: str, pct: float, *, show_percent: bool) -> str:
+    if show_percent:
+        return f"{label} ({pct:.1f}%)"
+    return label
+
+
+def _style_pie_slice(sl, *, text: str, show_label: bool, inside: bool):
+    """Apply readable slice labels for the canvas pixmap size."""
+    sl.setLabel(text)
+    sl.setLabelVisible(show_label)
+    if not show_label:
+        return
+    pos = (QtCharts.QPieSlice.LabelPosition.LabelInsideHorizontal if inside
+           else QtCharts.QPieSlice.LabelPosition.LabelOutside)
+    sl.setLabelPosition(pos)
+    if inside:
+        sl.setLabelColor(QtGui.QColor("#ffffff"))
+    else:
+        sl.setLabelArmLengthFactor(0.12)
+    font = sl.labelFont()
+    font.setPointSize(9 if inside else 8)
+    sl.setLabelFont(font)
+
+
+def _snapshot_value(source, full: str) -> float | None:
+    if source is None:
+        return None
+    val = source.latest(full)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _entry_from_payload(p: dict, index: int) -> dict:
+    entry = {
+        "full": p["full"],
+        "label": p.get("label", p["full"]),
+        "color": _PALETTE[index % len(_PALETTE)],
+        "visible": True,
+    }
+    if p.get("agg"):
+        entry["agg"] = dict(p["agg"])
+    return entry
+
+
+class _SnapshotChartBase(QtWidgets.QWidget):
+    """Shared drag/drop + live-source wiring for bar and pie charts."""
+
+    changed = Signal()
+
+    def __init__(self, default_title: str):
+        super().__init__()
+        self._title = default_title
+        self._entries: list[dict] = []
+        self._source = None
+        self._render_hook = None
+        self._dialog_parent = None
+        self._dialog_anchor = None
+        self.setAcceptDrops(True)
+
+    def title(self) -> str:
+        return self._title
+
+    def set_title(self, title: str):
+        self._title = title or self.DEFAULT_TITLE
+        self._settings["title"] = self._title
+        self._apply_settings()
+
+    def consume_payload(self, payloads: list[dict]):
+        added = False
+        for p in payloads:
+            full = p.get("full")
+            if not full or any(e["full"] == full for e in self._entries):
+                continue
+            self._entries.append(_entry_from_payload(p, len(self._entries)))
+            added = True
+        if added:
+            self._rebuild_entries()
+            self.changed.emit()
+
+    def variable_names(self) -> list[str]:
+        return [e["full"] for e in self._entries]
+
+    def derived_specs(self) -> dict[str, dict]:
+        return {e["full"]: dict(e["agg"])
+                for e in self._entries if e.get("agg")}
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(VARIABLE_MIME):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(VARIABLE_MIME):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        payloads = decode_variables(event.mimeData())
+        if payloads:
+            self.consume_payload(payloads)
+            event.acceptProposedAction()
+
+    def set_live_source(self, source):
+        self._source = source
+        self.refresh_live()
+
+    def set_render_hook(self, fn):
+        self._render_hook = fn
+
+    def _notify_render(self):
+        if self._render_hook is not None:
+            self._render_hook()
+
+    def set_dialog_context(self, parent, anchor):
+        self._dialog_parent = parent
+        self._dialog_anchor = anchor
+
+    def _visible_entries(self) -> list[dict]:
+        return [e for e in self._entries if e.get("visible", True)]
+
+    def _edit_entry(self, entry: dict):
+        dlg = EntryStyleDialog(entry, self._dialog_parent)
+        if _exec_beside(dlg, self._dialog_anchor):
+            entry.update(dlg.result_entry())
+            self._rebuild_entries()
+
+    def _remove_entry(self, entry: dict):
+        if entry in self._entries:
+            self._entries.remove(entry)
+            self.changed.emit()
+            self._rebuild_entries()
+
+    def populate_menu(self, menu: "QtWidgets.QMenu"):
+        if self._chart is None:
+            return
+        settings_act = menu.addAction("Chart settings…")
+        settings_act.triggered.connect(self._edit_settings)
+        if self._entries:
+            entries_menu = menu.addMenu("Entries")
+            for e in list(self._entries):
+                sub = entries_menu.addMenu(e.get("label", e["full"]))
+                sub.addAction("Edit style…").triggered.connect(
+                    lambda _=False, ent=e: self._edit_entry(ent))
+                sub.addAction("Remove").triggered.connect(
+                    lambda _=False, ent=e: self._remove_entry(ent))
+
+    def _rebuild_entries(self):
+        raise NotImplementedError
+
+    def _apply_settings(self):
+        raise NotImplementedError
+
+    def refresh_live(self):
+        raise NotImplementedError
+
+    def _edit_settings(self):
+        raise NotImplementedError
+
+
+class BarChart(_SnapshotChartBase):
+    """Bar chart of each variable's latest (live) value."""
+
+    KIND = "bar"
+    DEFAULT_TITLE = "Bar chart"
+
+    def __init__(self):
+        super().__init__(self.DEFAULT_TITLE)
+        self._settings = {
+            "title": self._title, "legend": True, "legend_pos": "bottom",
+            "title_size": 12, "y_title": "",
+        }
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        if QtCharts is None:
+            self._chart = None
+            self._view = None
+            self._bar_series = None
+            lay.addWidget(QtWidgets.QLabel(
+                "QtCharts is not available in this Qt build."))
+            return
+
+        self._chart = QtCharts.QChart()
+        self._bar_series: QtCharts.QBarSeries | None = None
+        self._axis_x = QtCharts.QBarCategoryAxis()
+        self._axis_y = QtCharts.QValueAxis()
+        self._chart.addAxis(self._axis_x, QtCore.Qt.AlignBottom)
+        self._chart.addAxis(self._axis_y, QtCore.Qt.AlignLeft)
+        self._view = QtCharts.QChartView(self._chart)
+        self._view.setRenderHint(QtGui.QPainter.Antialiasing)
+        self._view.setAcceptDrops(False)
+        lay.addWidget(self._view, 1)
+        self._apply_settings()
+
+    def _apply_settings(self):
+        if self._chart is None:
+            return
+        s = self._settings
+        self._chart.setTitle(s.get("title", ""))
+        tf = self._chart.titleFont()
+        tf.setPointSize(int(s.get("title_size", 12)))
+        tf.setBold(True)
+        self._chart.setTitleFont(tf)
+        legend = self._chart.legend()
+        legend.setVisible(bool(s.get("legend", True)))
+        legend.setAlignment(
+            TimeseriesChart._LEGEND_ALIGN.get(s.get("legend_pos", "bottom"),
+                                            QtCore.Qt.AlignBottom))
+        self._axis_y.setTitleText(s.get("y_title", ""))
+        self._axis_y.setTitleVisible(bool(s.get("y_title")))
+        self._notify_render()
+
+    def _edit_settings(self):
+        dlg = _SnapshotChartSettingsDialog(
+            self._settings, self._dialog_parent, y_label=True)
+        if _exec_beside(dlg, self._dialog_anchor):
+            self._settings = dlg.result_settings()
+            self._title = self._settings.get("title") or self.DEFAULT_TITLE
+            self._apply_settings()
+
+    def _rebuild_entries(self):
+        self.refresh_live()
+
+    def refresh_live(self):
+        if self._chart is None:
+            return
+        entries = self._visible_entries()
+        labels: list[str] = []
+        values: list[float] = []
+        for e in entries:
+            val = _snapshot_value(self._source, e["full"])
+            if val is None:
+                val = 0.0
+            labels.append(e.get("label", e["full"]))
+            values.append(val)
+
+        self._chart.removeAllSeries()
+        self._bar_series = QtCharts.QBarSeries()
+        if len(values) == 1:
+            bs = QtCharts.QBarSet(labels[0])
+            bs.append(values[0])
+            bs.setColor(QtGui.QColor(entries[0].get("color", "#1f77b4")))
+            self._bar_series.append(bs)
+            self._axis_x.clear()
+            self._axis_x.append(labels)
+        elif values:
+            for e, label, val in zip(entries, labels, values):
+                bs = QtCharts.QBarSet(label)
+                bs.append(val)
+                bs.setColor(QtGui.QColor(e.get("color", "#1f77b4")))
+                self._bar_series.append(bs)
+            self._axis_x.clear()
+            self._axis_x.append([""])
+        else:
+            self._axis_x.clear()
+        self._chart.addSeries(self._bar_series)
+        self._bar_series.attachAxis(self._axis_x)
+        self._bar_series.attachAxis(self._axis_y)
+        if values:
+            lo = min(0.0, min(values))
+            hi = max(values)
+            pad = (hi - lo) * 0.08 or (abs(hi) * 0.08 or 1.0)
+            self._axis_y.setRange(lo - pad * 0.2, hi + pad)
+            self._axis_y.setLabelFormat(
+                TimeseriesChart._axis_label_format(lo, hi))
+        self._notify_render()
+
+    def to_dict(self) -> dict:
+        return {"title": self._title, "entries": self._entries,
+                "settings": self._settings}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BarChart":
+        w = cls()
+        w._settings.update(d.get("settings", {}))
+        w._title = d.get("title", cls.DEFAULT_TITLE)
+        w._entries = [dict(e) for e in d.get("entries", [])]
+        w._apply_settings()
+        w.refresh_live()
+        return w
+
+
+class PieChart(_SnapshotChartBase):
+    """Pie chart of each variable's latest value (proportional slices)."""
+
+    KIND = "pie"
+    DEFAULT_TITLE = "Pie chart"
+
+    def __init__(self):
+        super().__init__(self.DEFAULT_TITLE)
+        self._settings = {
+            "title": self._title, "legend": True, "legend_pos": "right",
+            "title_size": 12, "show_percent": True,
+        }
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        if QtCharts is None:
+            self._chart = None
+            self._view = None
+            self._pie_series = None
+            lay.addWidget(QtWidgets.QLabel(
+                "QtCharts is not available in this Qt build."))
+            return
+
+        self._chart = QtCharts.QChart()
+        self._pie_series = QtCharts.QPieSeries()
+        self._pie_series.setPieSize(0.68)
+        self._chart.addSeries(self._pie_series)
+        self._chart.setMargins(QtCore.QMargins(12, 12, 12, 12))
+        self._view = QtCharts.QChartView(self._chart)
+        self._view.setRenderHint(QtGui.QPainter.Antialiasing)
+        self._view.setAcceptDrops(False)
+        lay.addWidget(self._view, 1)
+        self._apply_settings()
+
+    def _apply_settings(self):
+        if self._chart is None:
+            return
+        s = self._settings
+        self._chart.setTitle(s.get("title", ""))
+        tf = self._chart.titleFont()
+        tf.setPointSize(int(s.get("title_size", 12)))
+        tf.setBold(True)
+        self._chart.setTitleFont(tf)
+        legend = self._chart.legend()
+        legend.setVisible(bool(s.get("legend", True)))
+        legend.setAlignment(
+            TimeseriesChart._LEGEND_ALIGN.get(s.get("legend_pos", "right"),
+                                            QtCore.Qt.AlignRight))
+        show_pct = bool(s.get("show_percent", True))
+        if self._pie_series is not None:
+            self._pie_series.setLabelsVisible(show_pct)
+            # Leave room for outside callout labels when percentages are on.
+            self._pie_series.setPieSize(0.62 if show_pct else 0.78)
+        self._notify_render()
+
+    def _edit_settings(self):
+        dlg = _SnapshotChartSettingsDialog(
+            self._settings, self._dialog_parent, pie_options=True)
+        if _exec_beside(dlg, self._dialog_anchor):
+            self._settings = dlg.result_settings()
+            self._title = self._settings.get("title") or self.DEFAULT_TITLE
+            self._apply_settings()
+            self.refresh_live()
+
+    def _rebuild_entries(self):
+        self.refresh_live()
+
+    def refresh_live(self):
+        if self._chart is None:
+            return
+        self._pie_series.clear()
+        show_pct = bool(self._settings.get("show_percent", True))
+        slices: list[tuple[str, float, str]] = []
+        for e in self._visible_entries():
+            val = _snapshot_value(self._source, e["full"])
+            if val is None:
+                val = 0.0
+            display = max(0.0, float(val))
+            label = e.get("label", e["full"])
+            slices.append((label, display, e.get("color", "#1f77b4")))
+        total = sum(v for _, v, _ in slices)
+        legend_on = bool(self._settings.get("legend", True))
+        use_inside = show_pct and len(slices) > 3
+        for label, display, color in slices:
+            pct = 100.0 * display / total if total > 0 else 0.0
+            sl = self._pie_series.append(label, display)
+            sl.setColor(QtGui.QColor(color))
+            if show_pct and total > 0:
+                text = (f"{pct:.1f}%" if use_inside
+                        else _pie_slice_label(label, pct, show_percent=True))
+                _style_pie_slice(sl, text=text, show_label=True, inside=use_inside)
+            else:
+                _style_pie_slice(
+                    sl, text=label, show_label=not legend_on, inside=False)
+        self._notify_render()
+
+    def to_dict(self) -> dict:
+        return {"title": self._title, "entries": self._entries,
+                "settings": self._settings}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PieChart":
+        w = cls()
+        w._settings.update(d.get("settings", {}))
+        w._title = d.get("title", cls.DEFAULT_TITLE)
+        w._entries = [dict(e) for e in d.get("entries", [])]
+        w._apply_settings()
+        w.refresh_live()
+        return w
+
+
+# --------------------------------------------------------------------------- #
 # Content factory.
 # --------------------------------------------------------------------------- #
 _CONTENT_TYPES = {
     VariableTable.KIND: VariableTable,
     TimeseriesChart.KIND: TimeseriesChart,
+    BarChart.KIND: BarChart,
+    PieChart.KIND: PieChart,
 }
 
 
 def make_content(kind: str):
-    """Fresh content widget for a kind (``"table"`` / ``"timeseries"``)."""
+    """Fresh content widget for a kind (``"table"`` / ``"timeseries"`` / …)."""
     return _CONTENT_TYPES[kind]()
 
 
@@ -912,7 +1440,8 @@ def content_from_dict(kind: str, d: dict):
 class PlotItem(QtWidgets.QGraphicsObject):
     """A titled, movable, resizable scene item hosting one content widget.
 
-    The content (:class:`VariableTable` / :class:`TimeseriesChart`) is kept
+    The content (:class:`VariableTable`, :class:`TimeseriesChart`,
+    :class:`BarChart`, or :class:`PieChart`) is kept
     off-screen and painted as a pixmap.  Structural edits happen through the
     right-click menu (and an ``Edit…`` pop-out that re-attaches the live widget
     for full interaction); drops of variables are consumed directly.
