@@ -95,6 +95,74 @@ def test_signal_controlled_opening_drives_valve():
     assert val('.v.m_dot_in') > 0.0
 
 
+class _ChokedLiquidRig(Model):
+    """Water valve near-vacuum discharge: with `p_vap` set, the ISA liquid
+    choking clamps dp at FL^2*(p_up - FF*p_vap)."""
+
+    def __init__(self, p_out, p_vap=None, trim_exp=1.0, opening=1.0):
+        self._p_out = p_out
+        self._p_vap = p_vap
+        self._trim_exp = trim_exp
+        self._opening = opening
+        super().__init__()
+
+    def declare_components(self):
+        self.add_component('src', PressureSource(
+            _WATER, p_source=3e5, T_source=300.0, A=1e-2))
+        self.add_component('v', IncompressibleValve(
+            _WATER, Kv=10.0, D=0.02, p_vap=self._p_vap,
+            trim_exp=self._trim_exp, FL=0.9, FF=0.96, p_eps=100.0,
+            multiphase="HEM"))
+        self.add_component('out', PressureOutlet(
+            _WATER, p_ambient=self._p_out, T_ambient=300.0))
+        self.add_component('cmd', Constant(k=self._opening))
+
+    def declare_equations(self):
+        self.connect(self['src'].ports['outlet'], self['v'].ports['inlet'])
+        self.connect(self['v'].ports['outlet'], self['out'].ports['inlet'])
+        self.connect(self['cmd'].ports['y'], self['v'].ports['opening'])
+        return []
+
+
+def test_liquid_valve_chokes_at_vapor_pressure():
+    """With p_vap set, the liquid flow saturates once the downstream pressure
+    falls below p_up - FL^2*(p_up - FF*p_vap): valve cavitation (flashing)
+    makes the flow independent of the back pressure."""
+    pv = 3536.0                                    # ~ p_sat(water, 300 K)
+    m_mild = _solve(_ChokedLiquidRig(p_out=2.0e5, p_vap=pv),
+                    _WATER)('.v.m_dot_in')         # dp=1 bar, not choked
+    m_choke1 = _solve(_ChokedLiquidRig(p_out=0.5e5, p_vap=pv),
+                      _WATER)('.v.m_dot_in')       # dp > dp_choked
+    m_choke2 = _solve(_ChokedLiquidRig(p_out=0.1e5, p_vap=pv),
+                      _WATER)('.v.m_dot_in')       # deeper vacuum
+    assert m_mild < m_choke1
+    # Choked: further lowering p_out barely changes the flow.
+    assert m_choke2 == pytest.approx(m_choke1, rel=1e-2)
+    # And the choked flow matches the ISA clamp value.
+    dp_choked = 0.9 ** 2 * (3.0e5 - 0.96 * pv)
+    expected = (10.0 / 36000.0) * np.sqrt(996.5) * np.sqrt(dp_choked)
+    assert m_choke2 == pytest.approx(expected, rel=2e-2)
+
+
+def test_unchoked_flow_matches_plain_kv_law():
+    """Away from the choke point the p_vap-enabled law reduces to the plain
+    Kv law (same rig with and without p_vap agree)."""
+    m_plain = _solve(_ChokedLiquidRig(p_out=2.5e5), _WATER)('.v.m_dot_in')
+    m_choked = _solve(_ChokedLiquidRig(p_out=2.5e5, p_vap=3536.0),
+                      _WATER)('.v.m_dot_in')
+    assert m_choked == pytest.approx(m_plain, rel=1e-3)
+
+
+def test_trim_exponent_shapes_opening_curve():
+    """trim_exp=2 gives quadratic (ball-valve-like) opening behaviour: at
+    half opening the flow is ~ 25 % of full (linear trim gives ~ 50 %)."""
+    full = _solve(_ChokedLiquidRig(p_out=2.0e5, trim_exp=2.0),
+                  _WATER)('.v.m_dot_in')
+    half = _solve(_ChokedLiquidRig(p_out=2.0e5, trim_exp=2.0, opening=0.5),
+                  _WATER)('.v.m_dot_in')
+    assert half / full == pytest.approx(0.25, abs=2e-2)
+
+
 class _GasRig(Model):
     def __init__(self, p_out, xT=0.7):
         self._p_out = p_out

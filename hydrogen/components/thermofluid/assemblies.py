@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Annotated
 
 import numpy as np
+import sympy as sp
 
 from ...medium import CoolPropMedium
 from ...model import Model, Parameter
@@ -82,6 +83,11 @@ class WallLayer:
     dynamic: Annotated[bool, ParamSpec(
         "If true the layer carries thermal mass (heat-up transient); if "
         "false it conducts quasi-statically.")] = True
+    capacity_split: Annotated[str, ParamSpec(
+        "How the layer's thermal mass is lumped onto its two surface nodes: "
+        "'uniform' (50/50) or 'fem_logmean' (FEM log-mean radius split, more "
+        "accurate for thick layers).", choices=("uniform", "fem_logmean"))] = (
+        "uniform")
 
     def to_spec(self) -> dict:
         """Serializable value spec (see `hydrogen.serialization`)."""
@@ -92,6 +98,7 @@ class WallLayer:
             "permeation": (self.permeation.to_spec()
                            if self.permeation is not None else None),
             "dynamic": self.dynamic,
+            "capacity_split": self.capacity_split,
         }
 
     @classmethod
@@ -104,6 +111,7 @@ class WallLayer:
             thickness=d["thickness"],
             permeation=(permeation_flux_from_spec(perm) if perm else None),
             dynamic=d.get("dynamic", True),
+            capacity_split=d.get("capacity_split", "uniform"),
         )
 
 
@@ -255,10 +263,93 @@ class Pipe(Model):
         dynamic: Annotated[str, ParamSpec("Flow dynamic level (segmented engine "
                        "only): 'static' (quasi-steady, default), 'advective' "
                        "(transient cell energy: conduction + dispersion + "
-                       "enthalpy storage), or 'compressible' (not yet "
-                       "implemented).",
-                       choices=("static", "advective", "compressible"),
+                       "enthalpy storage), 'compressible' (advective + per-cell "
+                       "mass storage with a free cell pressure and staggered "
+                       "momentum -- use for a gas / two-phase medium whose "
+                       "density changes appreciably in time), or 'acoustic' "
+                       "(compressible + transient interior-face momentum "
+                       "inertia -- the exact all-regime option, well-conditioned "
+                       "even for an incompressible liquid, but the most "
+                       "expensive).",
+                       choices=("static", "advective", "compressible",
+                                "acoustic"),
                        structural=True)] = "static",
+        dispersion: Annotated[str, ParamSpec("Axial diffusion/dispersion "
+                       "closure for the advective level: 'general' (the default; "
+                       "a regime-blended laminar Taylor-Aris / turbulent Taylor "
+                       "model built from local properties, valid for any medium "
+                       "and all flow regimes -- adds the physical dispersion "
+                       "that damps sharp-front oscillations), 'conduction' "
+                       "(molecular thermal diffusivity only), 'taylor_aris' "
+                       "(laminar shear enhancement (w*Dh)^2/(192*alpha) only), "
+                       "'turbulent' (laminar Taylor-Aris below Re~1000 blended "
+                       "into Dh*|w|*(1.17e9*Re^-2.5 + 0.41) above), or "
+                       "'constant' (impose `D_axial`).  Ignored for "
+                       "dynamic='static'.",
+                       choices=("general", "conduction", "taylor_aris",
+                                "turbulent", "constant"),
+                       structural=True)] = "general",
+        D_axial: Annotated[float, ParamSpec("Imposed constant effective axial "
+                       "diffusivity used when dispersion='constant'.",
+                       unit="m^2/s",
+                       relevant_when={"dispersion": "constant"})] = 0.0,
+        advection_scheme: Annotated[str, ParamSpec("Face-enthalpy "
+                       "reconstruction stencil for the advective level "
+                       "('U<n_up>D<n_down>', e.g. 'U1D0' first-order upwind, "
+                       "'U2D1' the default).", structural=True)] = "U2D1",
+        wall_elasticity: Annotated[bool, ParamSpec(
+                       "Korteweg hoop compliance of the pipe wall "
+                       "(compressible/acoustic levels): lowers the pressure-"
+                       "wave speed to the classic elastic-line value -- "
+                       "required for quantitative water hammer in real pipes.",
+                       structural=True)] = False,
+        wall_E: Annotated[float, ParamSpec(
+                       "Young's modulus of the structural wall "
+                       "(wall_elasticity).", unit="Pa",
+                       relevant_when={"wall_elasticity": True})] = 200e9,
+        wall_e: Annotated[float | None, ParamSpec(
+                       "Structural wall thickness for the Korteweg term; "
+                       "None (default) takes the innermost layer's thickness.",
+                       unit="m",
+                       relevant_when={"wall_elasticity": True})] = None,
+        wall_c1: Annotated[float, ParamSpec(
+                       "Pipe-anchoring constraint factor in the Korteweg "
+                       "formula (1 = expansion joints).",
+                       relevant_when={"wall_elasticity": True})] = 1.0,
+        unsteady_friction: Annotated[bool, ParamSpec(
+                       "TESTING: Brunone unsteady wall friction on the "
+                       "acoustic level.", structural=True)] = False,
+        k_uf: Annotated[float, ParamSpec(
+                       "Brunone unsteady-friction coefficient.",
+                       relevant_when={"unsteady_friction": True})] = 0.033,
+        viscoelastic_wall: Annotated[bool, ParamSpec(
+                       "TESTING: Kelvin-Voigt viscoelastic wall creep "
+                       "(polymer pipes; compressible/acoustic levels).",
+                       structural=True)] = False,
+        J_ve: Annotated[float, ParamSpec(
+                       "Kelvin-Voigt hoop-strain creep compliance per Pa "
+                       "of gauge pressure.", unit="1/Pa",
+                       relevant_when={"viscoelastic_wall": True})] = 0.0,
+        tau_ve: Annotated[float, ParamSpec(
+                       "Kelvin-Voigt retardation time.", unit="s",
+                       relevant_when={"viscoelastic_wall": True})] = 1.0,
+        cavitation: Annotated[bool, ParamSpec(
+                       "Vapor-cavity (column-separation) handling on the "
+                       "acoustic level: per-cell discrete vapor cavities with "
+                       "a smoothed complementarity clamp at p_vap (the "
+                       "DVCM/DGCM of the water-hammer literature).  Lets a "
+                       "water-hammer run continue straight through column "
+                       "separation and cavity collapse.",
+                       structural=True)] = False,
+        p_vap: Annotated[float | None, ParamSpec(
+                       "Cavity opening pressure; None (default) evaluates "
+                       "the fluid's saturation pressure at T_wall_init via "
+                       "CoolProp.", unit="Pa",
+                       relevant_when={"cavitation": True})] = None,
+        cav_eps: Annotated[float, ParamSpec(
+                       "Dimensionless smoothing of the cavity "
+                       "complementarity switch (smaller = sharper clamp).",
+                       relevant_when={"cavitation": True})] = 1e-2,
     ):
         if channel_engine not in ("straight", "segmented"):
             raise ValueError(
@@ -312,6 +403,41 @@ class Pipe(Model):
         self.count = int(count)
         self.channel_engine = channel_engine
         self.dynamic = dynamic
+        if dispersion not in ("general", "conduction", "taylor_aris",
+                              "turbulent", "constant"):
+            raise ValueError(
+                f"Pipe: dispersion must be 'general', 'conduction', "
+                f"'taylor_aris', 'turbulent' or 'constant', got {dispersion!r}")
+        if dispersion == "constant" and D_axial < 0.0:
+            raise ValueError(
+                f"Pipe: D_axial must be >= 0 for dispersion='constant'; "
+                f"got {D_axial}")
+        self.dispersion = dispersion
+        self.D_axial = D_axial
+        self.advection_scheme = advection_scheme
+        self.wall_elasticity = bool(wall_elasticity)
+        self.wall_E = wall_E
+        # Default the Korteweg structural thickness to the innermost layer.
+        if wall_elasticity and wall_e is None:
+            if not layers:
+                raise ValueError(
+                    "Pipe(wall_elasticity=True): give wall_e explicitly or "
+                    "provide at least one wall layer to take its thickness.")
+            wall_e = layers[0].thickness
+        self.wall_e = wall_e
+        self.wall_c1 = wall_c1
+        self.unsteady_friction = bool(unsteady_friction)
+        self.k_uf = k_uf
+        self.viscoelastic_wall = bool(viscoelastic_wall)
+        self.J_ve = J_ve
+        self.tau_ve = tau_ve
+        self.cavitation = bool(cavitation)
+        if self.cavitation and p_vap is None:
+            # Default the cavity opening pressure to the saturation pressure
+            # at the initial (wall = fluid) temperature.
+            p_vap = self._saturation_pressure(medium, T_wall_init)
+        self.p_vap = p_vap
+        self.cav_eps = cav_eps
         self.n_leaky = n_leaky
         self.any_leaky = n_leaky > 0
         # Radial geometry: cumulative radii r[0]=D/2, r[k+1]=r[k]+thickness_k.
@@ -321,6 +447,48 @@ class Pipe(Model):
             r.append(r[-1] + layer.thickness)
         self.radii = r
         super().__init__()
+
+    @staticmethod
+    def _saturation_pressure(medium, T):
+        """Saturation pressure [Pa] of `medium`'s fluid at temperature `T`,
+        for the `cavitation` default `p_vap`.  Uses CoolProp directly (both
+        `CoolPropMedium` and `FeosMedium` carry a CoolProp fluid name)."""
+        fluid = getattr(medium, "transport_fluid", None) or getattr(
+            medium, "medium", None)
+        try:
+            import CoolProp.CoolProp as CP
+            return float(CP.PropsSI("P", "T", float(T), "Q", 0, str(fluid)))
+        except Exception as exc:
+            raise ValueError(
+                f"Pipe(cavitation=True): could not evaluate the saturation "
+                f"pressure of {fluid!r} at T_wall_init={T!r} K via CoolProp "
+                f"({exc}); pass p_vap explicitly.") from exc
+
+    def _dispersion_func(self):
+        """Build the channel's `dispersion_func` callable from the `dispersion`
+        / `D_axial` knobs (returns ``None`` for the conduction-only default so
+        the channel keeps its own robust default)."""
+        # 'general' (and 'static', which ignores dispersion) -> None, so the
+        # channel uses its own robust default (`get_general_dispersion`).
+        if self.dynamic == "static" or self.dispersion == "general":
+            return None
+        if self.dispersion == "conduction":
+            return lambda w, Dh, alpha, nu: alpha
+        if self.dispersion == "taylor_aris":
+            return lambda w, Dh, alpha, nu: alpha + (w * Dh) ** 2 / (192 * alpha)
+        if self.dispersion == "turbulent":
+            # Legacy IBPSA/ULg correlation, now fed the *local* kinematic
+            # viscosity `nu` (so Re is medium-consistent rather than lumped).
+            def _disp(w, Dh, alpha, nu):
+                Re = sp.Abs(w) * Dh / nu + 0.1
+                lam = alpha + (Dh ** 2 / 4.0) * w ** 2 / (48.0 * alpha)
+                turb = alpha + Dh * sp.Abs(w) * (1.17e9 * Re ** (-2.5) + 0.41)
+                phi = sp.Max(0.0, sp.Min(1.0, (Re - 1000.0) / 1000.0))
+                return (1.0 - phi) * lam + phi * turb
+
+            return _disp
+        D = self.D_axial                       # 'constant': impose D_eff = D_axial
+        return lambda w, Dh, alpha, nu: D
 
     def declare_components(self):
         # `count` identical pipes in parallel are simulated as one representative
@@ -342,7 +510,17 @@ class Pipe(Model):
                 self.medium, D=self.D, L=self.L, epsilon=self.epsilon,
                 z_in=self.z_in, z_out=self.z_out, N=self.n_segments,
                 heat_port=True, leaky=self.any_leaky, multiphase=self.multiphase,
-                dynamic=self.dynamic, count=N))
+                dynamic=self.dynamic, dispersion_func=self._dispersion_func(),
+                advection_scheme=self.advection_scheme, p_init=self.p_init,
+                wall_elasticity=self.wall_elasticity, wall_E=self.wall_E,
+                wall_e=(self.wall_e if self.wall_e is not None else 0.002),
+                wall_c1=self.wall_c1,
+                unsteady_friction=self.unsteady_friction, k_uf=self.k_uf,
+                viscoelastic_wall=self.viscoelastic_wall, J_ve=self.J_ve,
+                tau_ve=self.tau_ve,
+                cavitation=self.cavitation, p_vap=self.p_vap,
+                cav_eps=self.cav_eps,
+                count=N))
         else:
             self.add_component('pipe', StraightPipe(
                 self.medium, D=self.D, L=self.L, epsilon=self.epsilon,
@@ -376,6 +554,7 @@ class Pipe(Model):
                     layer.material.rho, layer.material.cp, layer.material.k,
                     r[k], r[k + 1], self.L_segment,
                     T_init=self.T_wall_init, dynamic=layer.dynamic,
+                    capacity_split=layer.capacity_split,
                     count=N,
                     leaky=layer.permeation is not None,
                     permeation_flux=layer.permeation,

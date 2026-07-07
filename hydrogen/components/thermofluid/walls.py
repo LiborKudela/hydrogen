@@ -76,6 +76,13 @@ _SPEC_P_IN_INIT = ParamSpec(
 _SPEC_P_OUT_INIT = ParamSpec(
     "Initial outer-surface partial pressure (only used when leaky).",
     unit="Pa", relevant_when={"leaky": True})
+_SPEC_CAPACITY_SPLIT = ParamSpec(
+    "How a layer's thermal mass is lumped onto its two surface nodes: "
+    "'uniform' splits it 50/50 (thin-wall lumped-capacitance); 'fem_logmean' "
+    "uses the FEM log-mean radius split (mass allocated by the steady "
+    "logarithmic radial profile), which matches the thin-wall limit but "
+    "shifts mass outward for thick layers.",
+    structural=True, choices=("uniform", "fem_logmean"))
 
 
 # ---------------------------------------------------------------------------
@@ -503,9 +510,10 @@ class TwoNodeWall(Model):
             # thermal mass.  Conduction is positive hotter node -> colder one.
             der_T_a = self['der_T_a'].symbol
             der_T_b = self['der_T_b'].symbol
-            C_node = self._node_capacity()
-            eqs = [C_node * der_T_a - (Q_dot_a - G * (T_a - T_b)),
-                   C_node * der_T_b - (Q_dot_b - G * (T_b - T_a))]
+            C_a = self._node_capacity_a()
+            C_b = self._node_capacity_b()
+            eqs = [C_a * der_T_a - (Q_dot_a - G * (T_a - T_b)),
+                   C_b * der_T_b - (Q_dot_b - G * (T_b - T_a))]
 
         # Permeation residuals (bind m_dot_*_leak to the injected flux model),
         # geometry-agnostic: the flux model asks the wall for its shape terms.
@@ -554,6 +562,20 @@ class TwoNodeWall(Model):
     def _node_capacity(self):
         """Return the symbolic per-node heat capacity `C_node` [J/K]."""
         raise NotImplementedError
+
+    def _node_capacity_a(self):
+        """Heat capacity lumped at the inner node (`port_a`) [J/K].
+
+        Defaults to the symmetric `_node_capacity()` (a 50/50 split of the
+        element mass); shapes that allocate mass asymmetrically between their
+        two surface nodes (e.g. the FEM log-mean split for a thick cylindrical
+        shell) override this and `_node_capacity_b`."""
+        return self._node_capacity()
+
+    def _node_capacity_b(self):
+        """Heat capacity lumped at the outer node (`port_b`) [J/K].  See
+        `_node_capacity_a`."""
+        return self._node_capacity()
 
     def _conductance(self):
         """Return the symbolic node-to-node conductance `G` [W/K]."""
@@ -715,6 +737,7 @@ class CylindricalWall(TwoNodeWall):
                          "segment.", unit="m")],
         T_init: Annotated[float, _SPEC_T_INIT] = 293.15,
         dynamic: Annotated[bool, _SPEC_DYNAMIC] = True,
+        capacity_split: Annotated[str, _SPEC_CAPACITY_SPLIT] = "uniform",
         angle_fraction: Annotated[float, ParamSpec("Fraction of the full 2*pi "
                        "tube the wall sweeps (1 = full tube, 0.5 = half, ...); "
                        "scales all extensive terms (mass, conductance, leak).",
@@ -741,6 +764,11 @@ class CylindricalWall(TwoNodeWall):
         if not (getattr(count, 'value', count) >= 1):
             raise ValueError(
                 f"CylindricalWall requires count >= 1; got count={count}")
+        if capacity_split not in ("uniform", "fem_logmean"):
+            raise ValueError(
+                f"CylindricalWall capacity_split must be 'uniform' or "
+                f"'fem_logmean'; got {capacity_split!r}")
+        self.capacity_split = capacity_split
         self.rho = rho
         self.cp = cp
         self.k = k
@@ -765,13 +793,43 @@ class CylindricalWall(TwoNodeWall):
             self.count, **spec['count'].param_kwargs()))
 
     def _node_capacity(self):
-        # Annular thermal mass split across the two surface nodes (sector f).
+        # Annular thermal mass split 50/50 across the two surface nodes
+        # (sector f).  Used by the 'uniform' capacity_split (and as the
+        # symmetric default for both nodes).
         f = self['angle_fraction'].symbol * self['count'].symbol
         r_in = self['r_in'].symbol
         r_out = self['r_out'].symbol
         length = self['length'].symbol
         V = f * sp.pi * (r_out ** 2 - r_in ** 2) * length
         return self['rho'].symbol * self['cp'].symbol * V / 2
+
+    def _logmean_split_radius_sq(self):
+        # r_split^2 = (r_out^2 - r_in^2) / (2 ln(r_out/r_in)): the radius that
+        # divides the annular mass consistently with the steady logarithmic
+        # radial temperature profile (FEM lumped-mass allocation).
+        r_in = self['r_in'].symbol
+        r_out = self['r_out'].symbol
+        return (r_out ** 2 - r_in ** 2) / (2 * sp.log(r_out / r_in))
+
+    def _node_capacity_a(self):
+        # Inner node (port_a).
+        if self.capacity_split == "uniform":
+            return self._node_capacity()
+        f = self['angle_fraction'].symbol * self['count'].symbol
+        r_in = self['r_in'].symbol
+        length = self['length'].symbol
+        c = f * self['rho'].symbol * self['cp'].symbol * sp.pi * length
+        return c * (self._logmean_split_radius_sq() - r_in ** 2)
+
+    def _node_capacity_b(self):
+        # Outer node (port_b).
+        if self.capacity_split == "uniform":
+            return self._node_capacity()
+        f = self['angle_fraction'].symbol * self['count'].symbol
+        r_out = self['r_out'].symbol
+        length = self['length'].symbol
+        c = f * self['rho'].symbol * self['cp'].symbol * sp.pi * length
+        return c * (r_out ** 2 - self._logmean_split_radius_sq())
 
     def _conductance(self):
         # Exact radial conduction conductance of a hollow cylinder sector.

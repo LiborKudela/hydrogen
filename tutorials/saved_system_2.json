@@ -1,14 +1,14 @@
 {
   "format": "hydrogen-ui-project",
-  "version": 1,
+  "version": 2,
   "hydrogen_version": "0.1.0",
   "canvas": {
     "nodes": [
       {
         "comp_id": "ramp_6",
         "type": "hydrogen.control.Ramp",
-        "x": 1022.8521367969888,
-        "y": 410.37733077499615,
+        "x": 990.0,
+        "y": 406.0,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -32,14 +32,14 @@
           ]
         },
         "ports": {},
-        "w": 150.0,
-        "h": 78.0
+        "w": 132.0,
+        "h": 66.0
       },
       {
         "comp_id": "pressuresource_5",
         "type": "hydrogen.thermofluid.PressureSource",
-        "x": 881.1096804488066,
-        "y": 544.8269564127913,
+        "x": 891.1096804488066,
+        "y": 568.8269564127913,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -66,8 +66,8 @@
       {
         "comp_id": "compressiblevalve_4",
         "type": "hydrogen.thermofluid.CompressibleValve",
-        "x": 1151.4546616148275,
-        "y": 564.8935814800557,
+        "x": 1142.4546616148273,
+        "y": 560.8935814800557,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
@@ -95,7 +95,54 @@
         "mirror_x": false,
         "mirror_y": false,
         "medium": "Hydrogen",
-        "params": null,
+        "params": {
+          "volume": 0.05,
+          "diameter": 0.3,
+          "layers": [
+            {
+              "__type__": "WallLayer",
+              "material": {
+                "__type__": "WallMaterial",
+                "name": "AISI 316/316L",
+                "rho": 7990.0,
+                "cp": 500.0,
+                "k": 15.0
+              },
+              "thickness": 0.002,
+              "permeation": {
+                "__type__": "TransientDiffusion",
+                "transport_fit": {
+                  "__type__": "TransportFit",
+                  "permeant": {
+                    "__type__": "Permeant",
+                    "name": "H2",
+                    "M": 0.00201588,
+                    "solubility_exponent": 2.0
+                  },
+                  "Phi0": 5.285149e-08,
+                  "E_Phi": 59800.0,
+                  "D0": 6.180331e-07,
+                  "E_D": 53900.0,
+                  "name": "H2 in AISI 316"
+                },
+                "n_nodes": 5,
+                "C_init": 0.0
+              },
+              "dynamic": true,
+              "capacity_split": "uniform"
+            }
+          ],
+          "h_inner": 50.0,
+          "count": 1,
+          "outer_thermal": "adiabatic",
+          "h_ext": 10.0,
+          "T_ext": 293.15,
+          "T_outer": 293.15,
+          "p_ext": 0.0,
+          "T_wall_init": 293.15,
+          "p_init": 101325.0,
+          "T_init": 293.15
+        },
         "ports_locked": true,
         "label_offsets": {
           "title": [
@@ -118,7 +165,74 @@
         "mirror_x": false,
         "mirror_y": false,
         "medium": "Hydrogen",
-        "params": null,
+        "params": {
+          "D": 0.01,
+          "L": 1.0,
+          "epsilon": 1e-06,
+          "z_in": 0.0,
+          "z_out": 0.0,
+          "n_segments": 100,
+          "layers": [
+            {
+              "__type__": "WallLayer",
+              "material": {
+                "__type__": "WallMaterial",
+                "name": "AISI 316/316L",
+                "rho": 7990.0,
+                "cp": 500.0,
+                "k": 15.0
+              },
+              "thickness": 0.002,
+              "permeation": {
+                "__type__": "TransientDiffusion",
+                "transport_fit": {
+                  "__type__": "TransportFit",
+                  "permeant": {
+                    "__type__": "Permeant",
+                    "name": "H2",
+                    "M": 0.00201588,
+                    "solubility_exponent": 2.0
+                  },
+                  "Phi0": 5.285149e-08,
+                  "E_Phi": 59800.0,
+                  "D0": 6.180331e-07,
+                  "E_D": 53900.0,
+                  "name": "H2 in AISI 316"
+                },
+                "n_nodes": 5,
+                "C_init": 0.0
+              },
+              "dynamic": true,
+              "capacity_split": "uniform"
+            }
+          ],
+          "multiphase": "single",
+          "outer_thermal": "adiabatic",
+          "h_ext": 10.0,
+          "T_ext": 293.15,
+          "T_outer": 293.15,
+          "p_ext": 0.0,
+          "T_wall_init": 293.15,
+          "p_init": 101325.0,
+          "count": 1,
+          "channel_engine": "segmented",
+          "dynamic": "static",
+          "dispersion": "general",
+          "D_axial": 0.0,
+          "advection_scheme": "U2D1",
+          "wall_elasticity": false,
+          "wall_E": 200000000000.0,
+          "wall_e": null,
+          "wall_c1": 1.0,
+          "unsteady_friction": false,
+          "k_uf": 0.033,
+          "viscoelastic_wall": false,
+          "J_ve": 0.0,
+          "tau_ve": 1.0,
+          "cavitation": false,
+          "p_vap": null,
+          "cav_eps": 0.01
+        },
         "ports_locked": true,
         "label_offsets": {
           "title": [
@@ -165,22 +279,32 @@
       "n": 1,
       "relaxation": 1.0,
       "tol": 1e-06,
-      "max_iter": 200
+      "max_iter": 200,
+      "line_search": false
     },
     "simulate": {
-      "strategy": "richardson",
-      "stop_time": 1.0,
+      "strategy": "tr_bdf2",
+      "stop_time": 100.0,
       "dt_start": 0.0001,
       "dt_min": 1e-09,
-      "dt_max": 10.0,
+      "dt_max": 100.0,
       "grow": 1.5,
       "shrink": 0.5,
       "max_retries": 20,
       "relaxation": 1.0,
       "tol": 1e-06,
       "max_iter": 200,
+      "line_search": false,
       "tol_local": 0.001,
       "atol": 1.0
+    }
+  },
+  "media": {
+    "Hydrogen": {
+      "fluid": "Hydrogen",
+      "backend": "BICUBIC&HEOS",
+      "scalar_cache_maxsize": 1000,
+      "disable_warnings": true
     }
   }
 }

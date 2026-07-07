@@ -90,6 +90,7 @@ class CoolPropMedium:
         "eval_T_ph",   "eval_dT_ph_dp",   "eval_dT_ph_dh",
         "eval_s_ph",   "eval_ds_ph_dp",   "eval_ds_ph_dh",
         "eval_k_ph",   "eval_dk_ph_dp",   "eval_dk_ph_dh",
+        "eval_d2rho_ph_dp2", "eval_d2rho_ph_dpdh", "eval_d2rho_ph_dh2",
     )
 
     # Smooth-HEM property variants (`*_ph_hem`) reuse the single-phase CoolProp
@@ -108,6 +109,7 @@ class CoolPropMedium:
         "eval_dT_ph_hem_dp",   "eval_dT_ph_hem_dh",
         "eval_dmu_ph_hem_dp",  "eval_dmu_ph_hem_dh",
         "eval_dk_ph_hem_dp",   "eval_dk_ph_hem_dh",
+        "eval_d2rho_ph_hem_dp2", "eval_d2rho_ph_hem_dpdh", "eval_d2rho_ph_hem_dh2",
     )
 
     def __init__(self, medium, p=101325, T=293.15, disable_warnings=False,
@@ -169,6 +171,20 @@ class CoolPropMedium:
         self.mu_ph_hem  = get_symbolic_property_function(self.eval_mu_ph,  {1: self.eval_dmu_ph_hem_dp,  2: self.eval_dmu_ph_hem_dh},  ["p", "h"], medium, "mu_ph_hem")
         self.k_ph_hem   = get_symbolic_property_function(self.eval_k_ph,   {1: self.eval_dk_ph_hem_dp,   2: self.eval_dk_ph_hem_dh},   ["p", "h"], medium, "k_ph_hem")
 
+        # `drho/dp` as first-class symbolic functions (single-phase + HEM) so a
+        # component can put the true isothermal-ish compressibility into a
+        # residual and still get a consistent Jacobian.  Consumed by the
+        # SegmentedChannel `compressible`-level stabilisation gate.
+        self.drho_ph_dp = get_symbolic_property_function(self.eval_drho_ph_dp, {1: self.eval_d2rho_ph_dp2, 2: self.eval_d2rho_ph_dpdh}, ["p", "h"], medium, "drho_ph_dp")
+        self.drho_ph_hem_dp = get_symbolic_property_function(self.eval_drho_ph_hem_dp, {1: self.eval_d2rho_ph_hem_dp2, 2: self.eval_d2rho_ph_hem_dpdh}, ["p", "h"], medium, "drho_ph_hem_dp")
+        # `drho/dh` as a first-class symbolic function too (single-phase + HEM),
+        # with its own consistent second derivatives.  The primitive `(p, h)`
+        # dynamic levels need BOTH `rho_p` and `rho_h` in the mass / energy cell
+        # balances, and lambdifying the Newton Jacobian differentiates them once
+        # more -- so `drho/dh` must expose `d2rho/dhdp` and `d2rho/dh2`.
+        self.drho_ph_dh = get_symbolic_property_function(self.eval_drho_ph_dh, {1: self.eval_d2rho_ph_dpdh, 2: self.eval_d2rho_ph_dh2}, ["p", "h"], medium, "drho_ph_dh")
+        self.drho_ph_hem_dh = get_symbolic_property_function(self.eval_drho_ph_hem_dh, {1: self.eval_d2rho_ph_hem_dpdh, 2: self.eval_d2rho_ph_hem_dh2}, ["p", "h"], medium, "drho_ph_hem_dh")
+
         self.default_vars = {'p': p, 'T': T, 'h': self.h_pT(p, T)}
         # `self.modules` exposes the SCALAR `eval_*_ph` functions to
         # `sympy.lambdify`.  Each scalar evaluator carries an
@@ -190,12 +206,19 @@ class CoolPropMedium:
             {f"{medium}_T_ph":   self.eval_T_ph},   {f"{medium}_dT_ph_dp":   self.eval_dT_ph_dp},   {f"{medium}_dT_ph_dh":   self.eval_dT_ph_dh},
             {f"{medium}_s_ph":   self.eval_s_ph},   {f"{medium}_ds_ph_dp":   self.eval_ds_ph_dp},   {f"{medium}_ds_ph_dh":   self.eval_ds_ph_dh},
             {f"{medium}_k_ph":   self.eval_k_ph},   {f"{medium}_dk_ph_dp":   self.eval_dk_ph_dp},   {f"{medium}_dk_ph_dh":   self.eval_dk_ph_dh},
+            # Second derivatives of rho (single-phase): the `_dp_*` pair
+            # linearises `drho/dp`, the `_dh_*` pair linearises `drho/dh` -- both
+            # needed for the Jacobian of the primitive `(p, h)` cell balances.
+            {f"{medium}_ddrho_ph_dp_dp": self.eval_d2rho_ph_dp2}, {f"{medium}_ddrho_ph_dp_dh": self.eval_d2rho_ph_dpdh},
+            {f"{medium}_ddrho_ph_dh_dp": self.eval_d2rho_ph_dpdh}, {f"{medium}_ddrho_ph_dh_dh": self.eval_d2rho_ph_dh2},
             # HEM variants: value reuses the single-phase evaluator; partials are
             # the smoothed finite-difference ones registered below.
             {f"{medium}_rho_ph_hem": self.eval_rho_ph}, {f"{medium}_drho_ph_hem_dp": self.eval_drho_ph_hem_dp}, {f"{medium}_drho_ph_hem_dh": self.eval_drho_ph_hem_dh},
             {f"{medium}_T_ph_hem":   self.eval_T_ph},   {f"{medium}_dT_ph_hem_dp":   self.eval_dT_ph_hem_dp},   {f"{medium}_dT_ph_hem_dh":   self.eval_dT_ph_hem_dh},
             {f"{medium}_mu_ph_hem":  self.eval_mu_ph},  {f"{medium}_dmu_ph_hem_dp":  self.eval_dmu_ph_hem_dp},  {f"{medium}_dmu_ph_hem_dh":  self.eval_dmu_ph_hem_dh},
             {f"{medium}_k_ph_hem":   self.eval_k_ph},   {f"{medium}_dk_ph_hem_dp":   self.eval_dk_ph_hem_dp},   {f"{medium}_dk_ph_hem_dh":   self.eval_dk_ph_hem_dh},
+            {f"{medium}_ddrho_ph_hem_dp_dp": self.eval_d2rho_ph_hem_dp2}, {f"{medium}_ddrho_ph_hem_dp_dh": self.eval_d2rho_ph_hem_dpdh},
+            {f"{medium}_ddrho_ph_hem_dh_dp": self.eval_d2rho_ph_hem_dpdh}, {f"{medium}_ddrho_ph_hem_dh_dh": self.eval_d2rho_ph_hem_dh2},
         ]
         # `self.batch_modules` exposes the batch-aware (`numpy-array`-friendly)
         # variants for users who manually build models that benefit from
@@ -209,12 +232,16 @@ class CoolPropMedium:
             {f"{medium}_T_ph":   self.eval_T_ph_batch},   {f"{medium}_dT_ph_dp":   self.eval_dT_ph_dp_batch},   {f"{medium}_dT_ph_dh":   self.eval_dT_ph_dh_batch},
             {f"{medium}_s_ph":   self.eval_s_ph_batch},   {f"{medium}_ds_ph_dp":   self.eval_ds_ph_dp_batch},   {f"{medium}_ds_ph_dh":   self.eval_ds_ph_dh_batch},
             {f"{medium}_k_ph":   self.eval_k_ph_batch},   {f"{medium}_dk_ph_dp":   self.eval_dk_ph_dp_batch},   {f"{medium}_dk_ph_dh":   self.eval_dk_ph_dh_batch},
+            {f"{medium}_ddrho_ph_dp_dp": self.eval_d2rho_ph_dp2_batch}, {f"{medium}_ddrho_ph_dp_dh": self.eval_d2rho_ph_dpdh_batch},
+            {f"{medium}_ddrho_ph_dh_dp": self.eval_d2rho_ph_dpdh_batch}, {f"{medium}_ddrho_ph_dh_dh": self.eval_d2rho_ph_dh2_batch},
             # HEM variants (batch): value reuses the single-phase batch evaluator,
             # partials are the smoothed central differences driven through it.
             {f"{medium}_rho_ph_hem": self.eval_rho_ph_batch}, {f"{medium}_drho_ph_hem_dp": self.eval_drho_ph_hem_dp_batch}, {f"{medium}_drho_ph_hem_dh": self.eval_drho_ph_hem_dh_batch},
             {f"{medium}_T_ph_hem":   self.eval_T_ph_batch},   {f"{medium}_dT_ph_hem_dp":   self.eval_dT_ph_hem_dp_batch},   {f"{medium}_dT_ph_hem_dh":   self.eval_dT_ph_hem_dh_batch},
             {f"{medium}_mu_ph_hem":  self.eval_mu_ph_batch},  {f"{medium}_dmu_ph_hem_dp":  self.eval_dmu_ph_hem_dp_batch},  {f"{medium}_dmu_ph_hem_dh":  self.eval_dmu_ph_hem_dh_batch},
             {f"{medium}_k_ph_hem":   self.eval_k_ph_batch},   {f"{medium}_dk_ph_hem_dp":   self.eval_dk_ph_hem_dp_batch},   {f"{medium}_dk_ph_hem_dh":   self.eval_dk_ph_hem_dh_batch},
+            {f"{medium}_ddrho_ph_hem_dp_dp": self.eval_d2rho_ph_hem_dp2_batch}, {f"{medium}_ddrho_ph_hem_dp_dh": self.eval_d2rho_ph_hem_dpdh_batch},
+            {f"{medium}_ddrho_ph_hem_dh_dp": self.eval_d2rho_ph_hem_dpdh_batch}, {f"{medium}_ddrho_ph_hem_dh_dh": self.eval_d2rho_ph_hem_dh2_batch},
         ]
 
     @functools.lru_cache(maxsize=1)
@@ -353,6 +380,43 @@ class CoolPropMedium:
         self.set_state_ph(p, h)
         return self.abstarct_state_ph.first_partial_deriv(CP.iDmass, CP.iHmass, CP.iP)
 
+    # Second derivatives of rho(p, h), used *only* to give the compressible
+    # channel's adaptive artificial-compressibility gate a consistent Jacobian
+    # (the gate keys on `drho/dp`, so its linearisation needs `d2rho/dp2` and
+    # `d2rho/dpdh`).  Analytic where CoolProp supports it; central-difference of
+    # the first partial otherwise.
+    def eval_d2rho_ph_dp2(self, p, h):
+        self.set_state_ph(p, h)
+        try:
+            return self.abstarct_state_ph.second_partial_deriv(
+                CP.iDmass, CP.iP, CP.iHmass, CP.iP, CP.iHmass)
+        except Exception:
+            e = self.hem_fd_dp
+            p_hi = p + e
+            p_lo = np.maximum(p - e, e)
+            return (self.eval_drho_ph_dp(p_hi, h)
+                    - self.eval_drho_ph_dp(p_lo, h)) / (p_hi - p_lo)
+
+    def eval_d2rho_ph_dpdh(self, p, h):
+        self.set_state_ph(p, h)
+        try:
+            return self.abstarct_state_ph.second_partial_deriv(
+                CP.iDmass, CP.iP, CP.iHmass, CP.iHmass, CP.iP)
+        except Exception:
+            e = self.hem_fd_dh
+            return (self.eval_drho_ph_dp(p, h + e)
+                    - self.eval_drho_ph_dp(p, h - e)) / (2.0 * e)
+
+    def eval_d2rho_ph_dh2(self, p, h):
+        self.set_state_ph(p, h)
+        try:
+            return self.abstarct_state_ph.second_partial_deriv(
+                CP.iDmass, CP.iHmass, CP.iP, CP.iHmass, CP.iP)
+        except Exception:
+            e = self.hem_fd_dh
+            return (self.eval_drho_ph_dh(p, h + e)
+                    - self.eval_drho_ph_dh(p, h - e)) / (2.0 * e)
+
     # --- viscosity mu(p, h) -----------------------------------------------------------
 
     def eval_mu_ph(self, p, h):
@@ -484,6 +548,19 @@ class CoolPropMedium:
     def eval_dk_ph_hem_dh(self, p, h):
         return self._fd_dh(self.eval_k_ph, p, h)
 
+    # Second derivatives of the smooth-HEM `drho/dp` (central difference of the
+    # already-smoothed first partial).  Only the compressible channel's
+    # stabilisation gate consumes these; the FD-of-FD noise is harmless there
+    # because the gate is a smooth, bounded conditioning term.
+    def eval_d2rho_ph_hem_dp2(self, p, h):
+        return self._fd_dp(self.eval_drho_ph_hem_dp, p, h)
+
+    def eval_d2rho_ph_hem_dpdh(self, p, h):
+        return self._fd_dh(self.eval_drho_ph_hem_dp, p, h)
+
+    def eval_d2rho_ph_hem_dh2(self, p, h):
+        return self._fd_dh(self.eval_drho_ph_hem_dh, p, h)
+
     # Batch (array-aware) counterparts: the value reuses `eval_*_ph_batch`
     # (already vectorised), and the partial is the same central difference but
     # driven through the batch value evaluator so `(p, h)` arrays work.
@@ -510,6 +587,25 @@ class CoolPropMedium:
 
     def eval_dk_ph_hem_dh_batch(self, p, h):
         return self._fd_dh(self.eval_k_ph_batch, p, h)
+
+    # Batch second derivatives of rho(p, h) for the stabilisation gate.
+    def eval_d2rho_ph_dp2_batch(self, p, h):
+        return self._fd_dp(self.eval_drho_ph_dp_batch, p, h)
+
+    def eval_d2rho_ph_dpdh_batch(self, p, h):
+        return self._fd_dh(self.eval_drho_ph_dp_batch, p, h)
+
+    def eval_d2rho_ph_dh2_batch(self, p, h):
+        return self._fd_dh(self.eval_drho_ph_dh_batch, p, h)
+
+    def eval_d2rho_ph_hem_dp2_batch(self, p, h):
+        return self._fd_dp(self.eval_drho_ph_hem_dp_batch, p, h)
+
+    def eval_d2rho_ph_hem_dpdh_batch(self, p, h):
+        return self._fd_dh(self.eval_drho_ph_hem_dp_batch, p, h)
+
+    def eval_d2rho_ph_hem_dh2_batch(self, p, h):
+        return self._fd_dh(self.eval_drho_ph_hem_dh_batch, p, h)
 
     # --- batch (array-aware) variants -------------------------------------------------
     #
@@ -618,6 +714,47 @@ class CoolPropMedium:
     def eval_dk_ph_dh_batch(self, p, h):
         return self._batch_eval_ph(p, h, self.eval_dk_ph_dh,
                                    lambda s: s.first_partial_deriv(CP.iconductivity, CP.iHmass, CP.iP))
+
+    # --- saturation-line sampling (consumed by `TabulatedMedium`) ----------------------
+
+    def sample_saturation(self, p_array):
+        """Saturation-line quantities at each pressure of `p_array` (Q=0/Q=1
+        flashes).  Returns a dict of arrays: ``h_l, h_v, T_sat, rho_l, rho_v,
+        mu_l, mu_v, k_l, k_v, s_l, s_v``.
+
+        This is the sampling protocol hook consumed by `TabulatedMedium` when
+        its window intersects the two-phase dome.  Pressures at or above the
+        critical pressure yield NaN (there is no saturation line there);
+        transport properties that CoolProp cannot evaluate on the saturation
+        boundary also yield NaN (the table builder interpolates over them).
+        """
+        p_array = np.asarray(p_array, dtype=float)
+        try:
+            st = CP.AbstractState(self.backend, self.medium)
+            st.p_critical()
+        except Exception:
+            # Tabular backends can lack PQ flashes / critical-state queries.
+            st = CP.AbstractState("HEOS", self.medium)
+        p_crit = st.p_critical()
+        keys = ("h_l", "h_v", "T_sat", "rho_l", "rho_v",
+                "mu_l", "mu_v", "k_l", "k_v", "s_l", "s_v")
+        out = {k: np.full(p_array.shape, np.nan) for k in keys}
+        for i, p in enumerate(p_array.ravel()):
+            if not (0.0 < p < p_crit):
+                continue
+            for q, tag in ((0.0, "l"), (1.0, "v")):
+                st.update(CP.PQ_INPUTS, float(p), q)
+                out[f"h_{tag}"].flat[i] = st.hmass()
+                out[f"rho_{tag}"].flat[i] = st.rhomass()
+                out[f"s_{tag}"].flat[i] = st.smass()
+                if tag == "l":
+                    out["T_sat"].flat[i] = st.T()
+                try:
+                    out[f"mu_{tag}"].flat[i] = st.viscosity()
+                    out[f"k_{tag}"].flat[i] = st.conductivity()
+                except Exception:
+                    pass  # left NaN; interpolated by the table builder
+        return out
 
     # --- introspection helpers --------------------------------------------------------
 
@@ -953,6 +1090,13 @@ class FeosMedium:
         self.mu_ph_hem  = get_symbolic_property_function(self.eval_mu_ph,  {1: self.eval_dmu_ph_hem_dp,  2: self.eval_dmu_ph_hem_dh},  ["p", "h"], medium, "mu_ph_hem")
         self.k_ph_hem   = get_symbolic_property_function(self.eval_k_ph,   {1: self.eval_dk_ph_hem_dp,   2: self.eval_dk_ph_hem_dh},   ["p", "h"], medium, "k_ph_hem")
 
+        # `drho/dp` symbolic functions for the compressible-level stabilisation
+        # gate (parity with CoolPropMedium).
+        self.drho_ph_dp = get_symbolic_property_function(self.eval_drho_ph_dp, {1: self.eval_d2rho_ph_dp2, 2: self.eval_d2rho_ph_dpdh}, ["p", "h"], medium, "drho_ph_dp")
+        self.drho_ph_hem_dp = get_symbolic_property_function(self.eval_drho_ph_hem_dp, {1: self.eval_d2rho_ph_hem_dp2, 2: self.eval_d2rho_ph_hem_dpdh}, ["p", "h"], medium, "drho_ph_hem_dp")
+        self.drho_ph_dh = get_symbolic_property_function(self.eval_drho_ph_dh, {1: self.eval_d2rho_ph_dpdh, 2: self.eval_d2rho_ph_dh2}, ["p", "h"], medium, "drho_ph_dh")
+        self.drho_ph_hem_dh = get_symbolic_property_function(self.eval_drho_ph_hem_dh, {1: self.eval_d2rho_ph_hem_dpdh, 2: self.eval_d2rho_ph_hem_dh2}, ["p", "h"], medium, "drho_ph_hem_dh")
+
         self.default_vars = {'p': p, 'T': T, 'h': self.h_pT(p, T)}
         self.modules = [
             {f"{medium}_h_pT":   self.eval_h_pT},   {f"{medium}_dh_pT_dp":  self.eval_dh_pT_dp},  {f"{medium}_dh_pT_dT":  self.eval_dh_pT_dT},
@@ -961,10 +1105,14 @@ class FeosMedium:
             {f"{medium}_T_ph":   self.eval_T_ph},   {f"{medium}_dT_ph_dp":   self.eval_dT_ph_dp},   {f"{medium}_dT_ph_dh":   self.eval_dT_ph_dh},
             {f"{medium}_s_ph":   self.eval_s_ph},   {f"{medium}_ds_ph_dp":   self.eval_ds_ph_dp},   {f"{medium}_ds_ph_dh":   self.eval_ds_ph_dh},
             {f"{medium}_k_ph":   self.eval_k_ph},   {f"{medium}_dk_ph_dp":   self.eval_dk_ph_dp},   {f"{medium}_dk_ph_dh":   self.eval_dk_ph_dh},
+            {f"{medium}_ddrho_ph_dp_dp": self.eval_d2rho_ph_dp2}, {f"{medium}_ddrho_ph_dp_dh": self.eval_d2rho_ph_dpdh},
+            {f"{medium}_ddrho_ph_dh_dp": self.eval_d2rho_ph_dpdh}, {f"{medium}_ddrho_ph_dh_dh": self.eval_d2rho_ph_dh2},
             {f"{medium}_rho_ph_hem": self.eval_rho_ph}, {f"{medium}_drho_ph_hem_dp": self.eval_drho_ph_hem_dp}, {f"{medium}_drho_ph_hem_dh": self.eval_drho_ph_hem_dh},
             {f"{medium}_T_ph_hem":   self.eval_T_ph},   {f"{medium}_dT_ph_hem_dp":   self.eval_dT_ph_hem_dp},   {f"{medium}_dT_ph_hem_dh":   self.eval_dT_ph_hem_dh},
             {f"{medium}_mu_ph_hem":  self.eval_mu_ph},  {f"{medium}_dmu_ph_hem_dp":  self.eval_dmu_ph_hem_dp},  {f"{medium}_dmu_ph_hem_dh":  self.eval_dmu_ph_hem_dh},
             {f"{medium}_k_ph_hem":   self.eval_k_ph},   {f"{medium}_dk_ph_hem_dp":   self.eval_dk_ph_hem_dp},   {f"{medium}_dk_ph_hem_dh":   self.eval_dk_ph_hem_dh},
+            {f"{medium}_ddrho_ph_hem_dp_dp": self.eval_d2rho_ph_hem_dp2}, {f"{medium}_ddrho_ph_hem_dp_dh": self.eval_d2rho_ph_hem_dpdh},
+            {f"{medium}_ddrho_ph_hem_dh_dp": self.eval_d2rho_ph_hem_dpdh}, {f"{medium}_ddrho_ph_hem_dh_dh": self.eval_d2rho_ph_hem_dh2},
         ]
         # `batch_modules`: same keys as `modules`, values are numpy-array-aware
         # closures (each just loops the scalar evaluator) so callers can opt into
@@ -1243,6 +1391,17 @@ class FeosMedium:
             return self._d_dh(self.eval_rho_ph, p, h)
         return -d.rho * d.alpha / d.cp
 
+    # Second derivatives of rho(p, h) (finite difference of the analytic first
+    # partial), for the compressible channel's stabilisation gate Jacobian.
+    def eval_d2rho_ph_dp2(self, p, h):
+        return self._d_dp(self.eval_drho_ph_dp, p, h)
+
+    def eval_d2rho_ph_dpdh(self, p, h):
+        return self._d_dh(self.eval_drho_ph_dp, p, h)
+
+    def eval_d2rho_ph_dh2(self, p, h):
+        return self._d_dh(self.eval_drho_ph_dh, p, h)
+
     def eval_dT_ph_dp(self, p, h):
         d = self._deriv_inputs_ph(p, h)
         if d is None:
@@ -1312,6 +1471,15 @@ class FeosMedium:
 
     def eval_dk_ph_hem_dh(self, p, h):
         return self._fd_dh(self.eval_k_ph, p, h)
+
+    def eval_d2rho_ph_hem_dp2(self, p, h):
+        return self._fd_dp(self.eval_drho_ph_hem_dp, p, h)
+
+    def eval_d2rho_ph_hem_dpdh(self, p, h):
+        return self._fd_dh(self.eval_drho_ph_hem_dp, p, h)
+
+    def eval_d2rho_ph_hem_dh2(self, p, h):
+        return self._fd_dh(self.eval_drho_ph_hem_dh, p, h)
 
     # --- batch (array-aware) variants -------------------------------------------------
 

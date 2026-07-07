@@ -25,6 +25,51 @@ from ...paramspec import ParamSpec, merged_param_specs
 from ..control.control_components import RealSignal
 from .ports import FluidPort_phm, PermeationPort_pN, ThermalPort_TQ
 
+import math as _math
+
+
+class _SymLib:
+    """sympy math namespace for the axial-dispersion closure (symbolic residual)."""
+    Abs = staticmethod(sp.Abs)
+    sqrt = staticmethod(sp.sqrt)
+    log = staticmethod(sp.log)
+    Max = staticmethod(sp.Max)
+    Min = staticmethod(sp.Min)
+
+
+class _NumLib:
+    """Plain-float math namespace mirroring `_SymLib` for the run-time check."""
+    Abs = staticmethod(abs)
+    sqrt = staticmethod(_math.sqrt)
+    log = staticmethod(_math.log)
+    Max = staticmethod(max)
+    Min = staticmethod(min)
+
+
+def _reference_cp(medium, p=101325.0, T=293.15):
+    """Reference isobaric heat capacity cp = (dh/dT)_p [J/(kg*K)] at a standard
+    state, used as a *constant* in the Nusselt correlation's Prandtl number and
+    the axial-diffusion term.  A fixed cp is adequate for these (it keeps the
+    residual free of the medium's T_ph 2nd derivatives) and is robust: the
+    analytic partial is tried first, with a central finite difference of
+    ``h(p, T)`` as a fallback so the value is never missing."""
+    try:
+        cp = float(medium.eval_dh_pT_dT(p, T))
+        if np.isfinite(cp) and cp > 0.0:
+            return cp
+    except Exception:
+        pass
+    try:
+        dT = 0.5
+        cp = (float(medium.eval_h_pT(p, T + dT))
+              - float(medium.eval_h_pT(p, T - dT))) / (2.0 * dT)
+        if np.isfinite(cp) and cp > 0.0:
+            return cp
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Shared parameter metadata reused across several flow components (single
 # source of truth consumed by both `declare_components` and the catalog).
@@ -127,6 +172,75 @@ class AmbientInlet(Model):
         eq4 = self['T_ambient'].symbol - self['T_ambient_set'].symbol
 
         return [eq1, eq_w, eq2, eq3, eq4]
+
+
+class TemperatureInlet(Model):
+    """Mass-flow inlet whose enthalpy tracks a commanded *temperature* signal.
+
+    Imposes the mass flow `m_flow` (continuity) and sets the boundary enthalpy
+    from a temperature driven through a `RealSignal` INPUT port ``T_set`` -- wire
+    it to a `control.CsvTable` (or any signal block) to replay a measured /
+    prescribed inlet-temperature history::
+
+        CsvTable(water_inlet) --y--> T_set [TemperatureInlet] --outlet--> pipe
+
+    The enthalpy closure is ``h_out = medium.h_pT(p_out, T_set)`` evaluated at
+    the *local* boundary pressure, which the downstream network determines (so
+    terminate the line with a `PressureOutlet` to fix the pressure level).  It
+    is the live-temperature dual of `AmbientInlet`: that one bakes a fixed
+    enthalpy and pins the pressure isentropically; this one imposes mass flow +
+    a time-varying enthalpy and lets pressure float.  The kinetic-energy
+    correction is dropped (negligible for liquids / low-Mach flows).
+
+    Ports:
+        outlet (p, h, m_dot)  - drives the downstream component
+        T_set  (signal in)    - commanded inlet temperature [K]
+    """
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        m_flow: Annotated[float, ParamSpec("Imposed mass flow rate delivered "
+                         "to the outlet.", unit="kg/s")] = 0.1,
+        p_init: Annotated[float, ParamSpec("Initial boundary-pressure guess "
+                         "(the level is set downstream).", unit="Pa")]
+                = 101325.0,
+        T_init: Annotated[float, ParamSpec("Initial temperature: seeds the "
+                         "enthalpy guess and the `T_set` signal.", unit="K")]
+                = 293.15,
+    ):
+        self.medium = medium
+        self.m_flow = m_flow
+        self.p_init = p_init
+        self.T_init = T_init
+        self._h_init = float(medium.eval_h_pT(p_init, T_init))
+        super().__init__()
+
+    def declare_components(self):
+        spec = merged_param_specs(type(self))
+        self.add_component('m_flow', Parameter(self.m_flow, **spec['m_flow'].param_kwargs()))
+        # Commanded inlet temperature: an algebraic Variable closed by the
+        # `T_set` signal input (require_connection -> an unwired port is flagged).
+        self.add_component('T_set', Variable(self.T_init, "K"))
+        self.add_component('p_out', Variable(self.p_init, "Pa"))
+        self.add_component('h_out', Variable(self._h_init, "J/kg"))
+        self.add_component('m_dot_out', Variable(0.0, "kg/s"))
+        self.add_port('T_set', RealSignal.as_input(
+            self, self['T_set'], name='T_set'))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+
+    def declare_equations(self):
+        # Continuity (mass flow imposed); "flow into me" => m_dot_out = -m_flow.
+        eq_cont = self['m_flow'].symbol + self['m_dot_out'].symbol
+        # Enthalpy from the commanded temperature at the local boundary pressure.
+        eq_h = self['h_out'].symbol - self.medium.h_pT(
+            self['p_out'].symbol, self['T_set'].symbol)
+        return [eq_cont, eq_h]
 
 
 class AmbientOutlet(Model):
@@ -343,6 +457,9 @@ class TwoPortSegment(Model):
         self._rho_std = float(medium.eval_rho_ph(101325.0, h_std))
         self._mu_std = float(medium.eval_mu_ph(101325.0, h_std))
         self._k_std = float(medium.eval_k_ph(101325.0, h_std))
+        # Reference isobaric heat capacity used as a constant in the Nusselt
+        # correlation's Prandtl number (see `_reference_cp`).
+        self._cp_std = _reference_cp(medium)
         super().__init__()
 
     def declare_components(self):
@@ -685,6 +802,14 @@ class StraightPipe(Model):
         # unchanged.  Because it is a Parameter (not baked into `A`/`P`), the
         # multiplicity can be retuned without re-instantiating the model.
         self.count = count
+        # Std-state reference properties for the Nusselt-correlation Prandtl
+        # number (a constant cp; see `_reference_cp`).  `get_q_inflow` is a
+        # method of this pipe (passed down to each `TwoPortSegment` as their
+        # `q_inflow_func`), so the reference values live here.
+        h_std = float(self.medium.eval_h_pT(101325.0, 293.15))
+        self._mu_std = float(self.medium.eval_mu_ph(101325.0, h_std))
+        self._k_std = float(self.medium.eval_k_ph(101325.0, h_std))
+        self._cp_std = _reference_cp(self.medium)
         super().__init__()
 
     def get_churchill_f_factor(self, Re, epsilon, D):
@@ -695,27 +820,32 @@ class StraightPipe(Model):
         return (term1 + term2) ** (1.0 / 12.0) * 8
 
     def calculate_nu(self, Re, Pr, fr):
-        U = Re / 1000
+        # Laminar fully-developed Nu = 3.66 below Re~2300; Gnielinski turbulent
+        # correlation above Re~3100; linear blend across the transition band.
+        nu_turb = (fr / 8) * (Re - 1000) * Pr / (
+            1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
         if Re <= 2300:
-            return (fr / 8) * (Re - 1000) * Pr / (1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
-        if 2300 < Re <= 3100:
-            return 3.52 * U ** 4 - 45.148 * U ** 3 + 212.13 * U ** 2 - 427.45 * U + 316.08
-        return 3.66
+            return 3.66
+        if Re >= 3100:
+            return nu_turb
+        phi = (Re - 2300.0) / 800.0
+        return (1.0 - phi) * 3.66 + phi * nu_turb
 
     def calculate_nu_smooth(self, Re, Pr, fr):
-        # `calculate_nu` smoothed via narrow transition windows so the symbolic system is
-        # differentiable across the laminar/transitional/turbulent boundaries.
-        U = Re / 1000
-        nu_1 = (fr / 8) * (Re - 1000) * Pr / (1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
-        nu_2 = 3.52 * U ** 4 - 45.148 * U ** 3 + 212.13 * U ** 2 - 427.45 * U + 316.08
-        nu_3 = 3.66
-        TRANSITION_WIDTH = 100
-        TRANSITION_CENTER_1 = 2250
-        TRANSITION_CENTER_2 = 3050
-        w1 = sp.Max(0.0, sp.Min(1.0, 1.0 - (Re - TRANSITION_CENTER_1) / TRANSITION_WIDTH))
-        w3 = sp.Max(0.0, sp.Min(1.0, (Re - TRANSITION_CENTER_2) / TRANSITION_WIDTH))
-        w2 = 1.0 - w1 - w3
-        return w1 * nu_1 + w2 * nu_2 + w3 * nu_3
+        # Smooth (differentiable) Nusselt number: laminar fully-developed
+        # Nu = 3.66 below Re~2300, blended into the Gnielinski turbulent
+        # correlation above Re~3100.
+        #
+        # NOTE: earlier revisions had the two regimes INVERTED -- the Gnielinski
+        # turbulent formula was applied in the laminar branch and the laminar
+        # constant 3.66 was returned for turbulent Re.  That under-predicted the
+        # turbulent Nusselt number by ~30x (e.g. Nu=3.66 instead of ~106 at
+        # Re=1.4e4), leaving heated pipes far too weakly coupled to their walls.
+        nu_lam = 3.66
+        nu_turb = (fr / 8) * (Re - 1000) * Pr / (
+            1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
+        phi = sp.Max(0.0, sp.Min(1.0, (Re - 2300.0) / 800.0))
+        return (1.0 - phi) * nu_lam + phi * nu_turb
 
     def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
         # `Dh` (hydraulic diameter; == D for a circular pipe) and `area` (the
@@ -728,7 +858,12 @@ class StraightPipe(Model):
         # different diameter or length.  (`area` already accounts for the
         # per-segment length, so there is no `n_segments` over-counting.)
         Re = w * Dh * rho / mu
-        Pr = mu * rho / k
+        # Prandtl number Pr = mu*cp/k (cp at the std reference state; see
+        # `_reference_cp`).  Earlier this read `mu*rho/k`, which is
+        # dimensionally not the Prandtl number and badly under-predicted Nu
+        # for liquids (cp >> rho-scaled value).
+        cp = self._cp_std if self._cp_std else self._k_std / self._mu_std
+        Pr = mu * cp / k
         nu = self.calculate_nu_smooth(Re, Pr, fr)
         alpha = nu * k / Dh
         return alpha * area * (T_wall - T)
@@ -958,37 +1093,73 @@ class SegmentedChannel(Model):
     `TwoPortSegment`.
 
     Dynamic levels (``dynamic=``):
-      * ``"static"`` (default) -- quasi-steady mass / momentum / energy, exactly
-        the `TwoPortSegment` physics.
-      * ``"advective"`` -- transient **energy** on a **cell-centred** scalar.
-        The hydraulic side (``p_j``/``M_j``/``w_j``) stays face-oriented and
-        quasi-steady exactly as ``"static"`` (no acoustics), but the
-        thermodynamic state moves to cell centres: each cell ``i`` carries an
-        independent enthalpy ``hc_i`` (with cell pressure ``pc_i`` = face mean
-        and EoS-derived ``Tc_i``/``rhoc_i``/``kc_i``) and a conserved internal
-        energy ``U_i`` (companion ``der_U_i``).  The balance is
-        ``dU_i/dt = (advective enthalpy flux in - out) + q_wall + (axial
-        diffusion in - out)``.  Face enthalpies are *reconstructed* from the cell
-        values with the upwind-biased ``advection_scheme`` stencil
-        (``'U<n_up>D<n_down>'``, default ``'U2D1'``; sign-aware, reduced order at
-        the ends), so the energy flux ``M_j*h_j`` is a true upwind reconstruction
-        rather than a slaved face DOF.  Axial diffusion = Fourier conduction +
-        a pluggable ``dispersion_func`` (default conduction only; opt into
-        Taylor--Aris), assembled as per-face ``F_diff_j`` fluxes that telescope
-        to a compact Laplacian on the cell temperatures (no checkerboard null
-        mode); the channel ends carry no axial diffusion.  At steady state
-        (``der_U -> 0``, no leak) the equation set reduces to ``"static"``.
-      * ``"compressible"`` -- ``"advective"`` + mass storage + momentum inertia
-        (full acoustic wave operator).  Scaffolded; not yet implemented.
+
+    Pick the level by *what you want to simulate* -- each adds one storage
+    mechanism (and cost) on top of the previous:
+
+      * ``"static"`` (default) -- steady operating points.  Quasi-steady mass /
+        momentum / energy, exactly the `TwoPortSegment` physics (the only level
+        that is not cell-centred; it uses the face-collocated per-cell
+        template).  All media.
+      * ``"advective"`` -- temperature / composition fronts.  Transient
+        **energy** only: ``hc_i`` differential, mass and momentum quasi-steady,
+        ``pc_i`` algebraic (set by the staggered momentum).  The level for
+        (near-)incompressible transients (validated on the ULg water
+        benchmark).
+      * ``"compressible"`` -- pack/unpack, pressurisation, mass storage (gas,
+        liquid AND the HEM two-phase dome), no pressure waves.  Transient
+        **mass + energy** via the **low-Mach pressure split** (Paolucci 1982;
+        Majda & Sethian 1985; the single-pressure-state structure of
+        ThermoPower's ``Flow1D``, Casella 2006): ONE pipe-level thermodynamic
+        pressure state ``p_pipe`` (anchored to the mean cell pressure) carries
+        the pressure dynamics, while each cell keeps the exact quasi-steady
+        spatial profile ``pc_i`` from the momentum chain (friction + gravity),
+        so the EoS sees the correct local pressure (saturation-temperature
+        glide along a boiling channel included).  The per-cell mass balance
+        ``V*(rho_p*dp_pipe/dt + rho_h*dhc_i/dt) = M_i - M_{i+1}`` lets the
+        flow field go non-uniform as fluid is stored/released.  Acoustics are
+        filtered by construction, which is exactly what keeps this level
+        well-conditioned at any Mach number.
+      * ``"acoustic"`` -- pressure-wave phenomena: water hammer, surge, fast
+        valve events, for all phases.  Per-cell ``pc_i`` differential states
+        plus transient momentum ``rho*L*dw_j/dt`` on EVERY face (end faces
+        included, so waves reflect correctly off the port boundary
+        conditions).  The mass/energy rows carry constant reference scaling
+        and the momentum rows are written in pressure units, which keeps the
+        per-cell pressure Jacobian well-conditioned even for a subcooled
+        liquid (see `_declare_primitive`).  Optional wall physics:
+        ``wall_elasticity`` (Korteweg hoop compliance -- the classic
+        elastic-line wave-speed correction, required for quantitative water
+        hammer), ``cavitation`` (discrete vapor cavities / column separation
+        via a smoothed complementarity clamp at ``p_vap``),
+        ``unsteady_friction`` (Brunone) and ``viscoelastic_wall``
+        (Kelvin-Voigt, polymer pipes).  Resolving the waves needs
+        ``dt <~ L/(N*c)``; the implicit integrator remains stable at larger
+        ``dt`` (waves are then damped, not amplified).
+
+    All three dynamic levels share one **primitive** ``(p, h)`` cell-centred
+    finite-volume formulation (see `_declare_primitive`): cells carry
+    ``(pc_i, hc_i)`` with EoS-derived ``Tc_i``/``rhoc_i``/``kc_i``; momentum is
+    a **staggered face** balance (face ``j`` relates the adjacent cell
+    pressures -- half a cell to the port pressures at the ends -- to the face
+    velocity ``w_j``); face enthalpies are *reconstructed* with the
+    upwind-biased ``advection_scheme`` stencil (default ``'U2D1'``); axial
+    diffusion (Fourier + ``dispersion_func``) telescopes to a compact
+    cell-temperature Laplacian.  ``rho_p = drho/dp|_h`` and
+    ``rho_h = drho/dh|_p`` come from the medium as symbolic functions with
+    consistent second derivatives, so the Newton Jacobian of the storage terms
+    is exact in every phase.
     """
 
     _MULTIPHASE_MODES = ("single", "HEM")
-    _DYNAMIC_LEVELS = ("static", "advective", "compressible")
+    _DYNAMIC_LEVELS = ("static", "advective", "compressible", "acoustic")
     #: Instance flags that change the emitted equation structure, so the
     #: per-class template cache keeps heated / leaky / multiphase / sized
     #: variants distinct (see `Model.collect_equations`).
     _cache_key_flags = ("multiphase", "heat_port", "leaky", "dynamic", "N",
-                        "advection_scheme")
+                        "advection_scheme", "wall_elasticity",
+                        "unsteady_friction", "viscoelastic_wall",
+                        "cavitation")
 
     def __init__(
         self,
@@ -1009,8 +1180,12 @@ class SegmentedChannel(Model):
         q_inflow_func: Annotated[Callable, ParamSpec(
             "Callable returning the radial heat input rate symbolically.")] = None,
         dispersion_func: Annotated[Callable, ParamSpec(
-            "Callable f(w, Dh, alpha) returning the effective axial diffusivity "
-            "[m^2/s] for the advective level (default: conduction only).")] = None,
+            "Callable f(w, Dh, alpha, nu) returning the effective axial "
+            "diffusivity [m^2/s] for the advective level, from the local face "
+            "velocity `w`, hydraulic diameter `Dh`, molecular thermal "
+            "diffusivity `alpha=k/(rho*cp)` and kinematic viscosity `nu=mu/rho`. "
+            "Default: `get_general_dispersion`, a regime-blended (laminar "
+            "Taylor-Aris / turbulent Taylor) model valid for any medium.")] = None,
         advection_scheme: Annotated[str, ParamSpec(
             "Face-enthalpy reconstruction for the advective level "
             "('U<n_up>D<n_down>'); default 'U2D1'.", structural=True)] = "U2D1",
@@ -1019,9 +1194,83 @@ class SegmentedChannel(Model):
         leaky: Annotated[bool, _SPEC_LEAKY] = False,
         dynamic: Annotated[str, ParamSpec("Dynamic modelling level: 'static' "
                           "(quasi-steady, default), 'advective', "
-                          "'compressible'.",
-                          choices=("static", "advective", "compressible"),
+                          "'compressible', 'acoustic'.",
+                          choices=("static", "advective", "compressible",
+                                   "acoustic"),
                           structural=True)] = "static",
+        p_init: Annotated[float, ParamSpec(
+            "Initial fluid pressure [Pa]. Seeds the cell and face pressures.",
+            unit="Pa")] = 101325.0,
+        wall_elasticity: Annotated[bool, ParamSpec(
+            "Korteweg hoop compliance of the pipe wall (mass-storage levels "
+            "only): a pressure rise stretches the wall and enlarges the "
+            "cross-section, adding rho*D*c1/(e*E) to the effective "
+            "compressibility.  Lowers the pressure-wave speed to the classic "
+            "elastic-line value 1/a^2 = rho_p + rho*D*c1/(e*E) -- required "
+            "for quantitative water hammer in real pipes.",
+            structural=True)] = False,
+        wall_E: Annotated[float, ParamSpec(
+            "Young's modulus of the structural wall (wall_elasticity).",
+            unit="Pa", relevant_when={"wall_elasticity": True})] = 200e9,
+        wall_e: Annotated[float, ParamSpec(
+            "Structural wall thickness (wall_elasticity).", unit="m",
+            relevant_when={"wall_elasticity": True})] = 0.002,
+        wall_c1: Annotated[float, ParamSpec(
+            "Pipe-anchoring constraint factor c1 in the Korteweg formula: "
+            "1 (expansion joints, default), 1-nu/2 (anchored upstream only), "
+            "1-nu^2 (anchored throughout).",
+            relevant_when={"wall_elasticity": True})] = 1.0,
+        unsteady_friction: Annotated[bool, ParamSpec(
+            "TESTING: instantaneous-acceleration (Brunone) unsteady wall "
+            "friction on the acoustic level; adds "
+            "k_uf*rho*L*(dw/dt + a*sign(w)*dw/dx) to the face pressure drop. "
+            "Improves the damping of water-hammer oscillation tails.",
+            structural=True)] = False,
+        k_uf: Annotated[float, ParamSpec(
+            "Brunone unsteady-friction coefficient (unsteady_friction).",
+            relevant_when={"unsteady_friction": True})] = 0.033,
+        viscoelastic_wall: Annotated[bool, ParamSpec(
+            "TESTING: Kelvin-Voigt viscoelastic wall creep (mass-storage "
+            "levels): one retarded-strain state per cell, "
+            "tau_ve*deps/dt = J_ve*(pc - p_init) - eps, feeding 2*rho*deps/dt "
+            "into the mass storage.  For polymer (PE/PVC) pipes; see Covas et "
+            "al. (2004).", structural=True)] = False,
+        J_ve: Annotated[float, ParamSpec(
+            "Kelvin-Voigt creep compliance of the wall hoop strain per Pa of "
+            "gauge pressure (viscoelastic_wall).", unit="1/Pa",
+            relevant_when={"viscoelastic_wall": True})] = 0.0,
+        tau_ve: Annotated[float, ParamSpec(
+            "Kelvin-Voigt retardation time (viscoelastic_wall).", unit="s",
+            relevant_when={"viscoelastic_wall": True})] = 1.0,
+        cavitation: Annotated[bool, ParamSpec(
+            "Vapor-cavity (column-separation) handling, acoustic level only: "
+            "each cell carries a discrete vapor-cavity volume V_cav_i >= 0 "
+            "closed by the smoothed complementarity (pc_i - p_vap) >= 0, the "
+            "implicit-FV analogue of the classic DVCM/DGCM (Wylie & Streeter; "
+            "Bergant & Simpson 1999).  When a rarefaction wave pulls a cell "
+            "down to the vapor pressure, the cell pressure clamps there and "
+            "the cavity absorbs the flow imbalance; on collapse the "
+            "water-hammer shock is re-emitted.  The surrounding liquid stays "
+            "single-phase, so the two-phase-dome property cliff never enters "
+            "the Jacobian.", structural=True)] = False,
+        p_vap: Annotated[float, ParamSpec(
+            "Cavity opening pressure [Pa] (cavitation=True): the fluid's "
+            "saturation pressure at the operating temperature.  `Pipe` fills "
+            "this in automatically from `T_wall_init`; a bare "
+            "SegmentedChannel needs it explicitly.", unit="Pa",
+            relevant_when={"cavitation": True})] = None,
+        cav_eps: Annotated[float, ParamSpec(
+            "Dimensionless smoothing of the cavity complementarity switch: "
+            "the exact condition (p - p_vap)*V_cav = 0 is regularised to the "
+            "smooth hyperbola a*b = cav_eps^2/2 in scaled variables.  Smaller "
+            "= sharper clamp, larger = easier Newton convergence through "
+            "cavity opening / collapse (1e-3 is already too sharp for plain "
+            "Newton on a hard water-hammer cavity).",
+            relevant_when={"cavitation": True})] = 1e-2,
+        fsi: Annotated[bool, ParamSpec(
+            "RESERVED: full fluid-structure interaction (axial pipe motion, "
+            "junction coupling).  Not implemented -- raises.",
+            structural=True)] = False,
         count: Annotated[float, _SPEC_COUNT] = 1.0,
     ):
         self.medium = medium
@@ -1032,17 +1281,89 @@ class SegmentedChannel(Model):
         if dynamic not in self._DYNAMIC_LEVELS:
             raise ValueError(
                 f"dynamic must be one of {self._DYNAMIC_LEVELS}, got {dynamic!r}")
-        if dynamic == "compressible":
-            raise NotImplementedError(
-                "SegmentedChannel dynamic='compressible' (mass + momentum "
-                "storage / acoustics) is scaffolded but not yet implemented; "
-                "use 'static' or 'advective'.")
         if int(N) != N or N < 1:
             raise ValueError(f"N must be an integer >= 1, got {N!r}")
         self.multiphase = multiphase
         self.heat_port = bool(heat_port)
         self.leaky = bool(leaky)
         self.dynamic = dynamic
+        # The three dynamic levels share one primitive `(p, h)` cell-centred
+        # finite-volume formulation (see `_declare_primitive`); each level adds
+        # one storage mechanism on top of the previous:
+        #   * `advective`   -- transient cell energy only (`hc_i` states); mass
+        #     and momentum quasi-steady, `pc_i` algebraic.
+        #   * `compressible`-- + mass storage carried by ONE pipe-level
+        #     thermodynamic-pressure state `p_pipe` (low-Mach pressure split:
+        #     the cells see `pc_i = p_pipe + quasi-steady momentum profile`, so
+        #     density/storage respond to pressure without any per-cell acoustic
+        #     mode -- the singular low-Mach coupling is designed out).
+        #   * `acoustic`    -- per-cell `pc_i` differential states + face
+        #     velocity `w_j` momentum inertia on EVERY face: the full 1-D
+        #     compressible staggered scheme that resolves pressure waves.
+        # `static` is the sole non-cell-centred level (face-collocated template).
+        self._cell_centered = dynamic in ("advective", "compressible",
+                                          "acoustic")
+        self._pressure_split = dynamic == "compressible"
+        self._mass_storage = dynamic in ("compressible", "acoustic")
+        self._momentum_inertia = dynamic == "acoustic"
+        self.p_init = float(p_init)
+        if fsi:
+            raise NotImplementedError(
+                "SegmentedChannel(fsi=True): full fluid-structure interaction "
+                "(axial pipe motion, junction coupling) is not implemented. "
+                "Korteweg hoop compliance is available via wall_elasticity=True;"
+                " for full FSI see Tijsseling (1996), 'Fluid-structure "
+                "interaction in liquid-filled pipe systems: a review'.")
+        self.fsi = False
+        self.wall_elasticity = bool(wall_elasticity)
+        self.wall_E = float(wall_E)
+        self.wall_e = float(wall_e)
+        self.wall_c1 = float(wall_c1)
+        if self.wall_elasticity and (self.wall_E <= 0 or self.wall_e <= 0):
+            raise ValueError(
+                f"SegmentedChannel(wall_elasticity=True): wall_E and wall_e "
+                f"must be > 0, got wall_E={wall_E!r}, wall_e={wall_e!r}")
+        self.unsteady_friction = bool(unsteady_friction)
+        self.k_uf = float(k_uf)
+        self.viscoelastic_wall = bool(viscoelastic_wall)
+        self.J_ve = float(J_ve)
+        self.tau_ve = float(tau_ve)
+        if self.viscoelastic_wall and self.tau_ve <= 0:
+            raise ValueError("SegmentedChannel(viscoelastic_wall=True): "
+                             f"tau_ve must be > 0, got {tau_ve!r}")
+        self.cavitation = bool(cavitation)
+        self.cav_eps = float(cav_eps)
+        self.p_vap = None if p_vap is None else float(p_vap)
+        if self.cavitation:
+            if dynamic != "acoustic":
+                raise ValueError(
+                    f"SegmentedChannel(cavitation=True) requires "
+                    f"dynamic='acoustic' (the only level with per-cell "
+                    f"pressure states that a cavity can clamp), got "
+                    f"dynamic={dynamic!r}")
+            if self.p_vap is None:
+                raise ValueError(
+                    "SegmentedChannel(cavitation=True): p_vap is required -- "
+                    "pass the saturation pressure at the operating "
+                    "temperature, e.g. CoolProp.PropsSI('P', 'T', T_op, 'Q', "
+                    "0, fluid).  (The Pipe assembly computes it automatically "
+                    "from T_wall_init.)")
+            if self.p_vap <= 0:
+                raise ValueError(
+                    f"SegmentedChannel(cavitation=True): p_vap must be > 0, "
+                    f"got {p_vap!r}")
+            if self.cav_eps <= 0:
+                raise ValueError(
+                    f"SegmentedChannel(cavitation=True): cav_eps must be > 0, "
+                    f"got {cav_eps!r}")
+            if self.p_vap >= float(p_init):
+                warnings.warn(
+                    f"SegmentedChannel(cavitation=True): p_vap="
+                    f"{self.p_vap:.4g} Pa >= p_init={float(p_init):.4g} Pa -- "
+                    f"the channel starts cavitated, which the closed-cavity "
+                    f"initial state (V_cav=0) contradicts.  Expect "
+                    f"initialisation trouble; raise p_init or check p_vap.",
+                    stacklevel=2)
         self.N = int(N)
         # `n_segments` alias so the channel is a drop-in for `StraightPipe`
         # consumers that read `.n_segments` and per-cell port lists.
@@ -1060,14 +1381,28 @@ class SegmentedChannel(Model):
         self.q_inflow_func = q_inflow_func or (
             self.get_q_inflow if self.heat_port else self.get_q_inflow_adiabatic)
         # Axial diffusion closure, used only by the `advective`/`compressible`
-        # levels.  Defaults to molecular conduction only (no dispersion
-        # enhancement): the Taylor--Aris term grows like w^2/alpha and on a
-        # coarse grid (cell-Peclet >> 2) it makes the central-difference energy
-        # balance very stiff.  Opt in with
-        # `dispersion_func=<channel>.get_taylor_aris_dispersion` once N is large
-        # enough to keep Pe_cell <~ 2 (see `_warn_cell_peclet`).
+        # levels.  Defaults to `get_general_dispersion`: a regime-blended
+        # (laminar Taylor--Aris / turbulent Taylor) effective diffusivity built
+        # entirely from local properties, so it is valid for any medium
+        # (including the HEM multiphase mixture) across laminar, transitional
+        # and turbulent flow.  The physical dispersion it adds is what keeps the
+        # central axial-diffusion stencil non-oscillatory at sharp fronts; on a
+        # coarse grid (cell-Peclet >> 2) it can still oscillate, so the channel
+        # emits a build-time and run-time cell-Peclet warning (see
+        # `_warn_cell_peclet` / `runtime_diagnostics`).  Pass
+        # `dispersion_func=<channel>.get_conduction_only` to disable it.
+        #
+        # The `static` (quasi-steady) level has NO axial-diffusion term at all
+        # (`_cell_residuals` is a pure face-to-face energy balance), so it never
+        # uses a dispersion closure -- leave it `None` there rather than
+        # silently binding `get_general_dispersion` to a slot that is dead for
+        # static, which would misleadingly suggest static disperses.
         self._dispersion_is_custom = dispersion_func is not None
-        self.dispersion_func = dispersion_func or self.get_conduction_only
+        if self._cell_centered:
+            self.dispersion_func = dispersion_func or self.get_general_dispersion
+        else:
+            self.dispersion_func = None
+        self._peclet_warned = False
         self.advection_scheme = advection_scheme
         self._n_up, self._n_down = self._parse_advection_scheme(advection_scheme)
         h_std = float(medium.eval_h_pT(101325.0, 293.15))
@@ -1075,14 +1410,12 @@ class SegmentedChannel(Model):
         self._rho_std = float(medium.eval_rho_ph(101325.0, h_std))
         self._mu_std = float(medium.eval_mu_ph(101325.0, h_std))
         self._k_std = float(medium.eval_k_ph(101325.0, h_std))
-        # Std-state isobaric heat capacity, used as a (constant) reference for the
-        # advective level's axial diffusion (a 2nd-order diffusive correction, so
-        # a fixed cp is adequate and keeps the residual free of T_ph derivatives,
-        # whose 2nd derivatives the medium does not provide).
-        try:
-            self._cp_std = float(medium.eval_dh_pT_dT(101325.0, 293.15))
-        except Exception:
-            self._cp_std = None
+        # Std-state isobaric heat capacity, used as a (constant) reference both
+        # for the Nusselt-correlation Prandtl number and for the advective
+        # level's axial diffusion (a 2nd-order diffusive correction, so a fixed
+        # cp is adequate and keeps the residual free of T_ph derivatives, whose
+        # 2nd derivatives the medium does not provide).  See `_reference_cp`.
+        self._cp_std = _reference_cp(medium)
         super().__init__()
 
     # --- constitutive correlations (same as StraightPipe) ------------------
@@ -1094,21 +1427,24 @@ class SegmentedChannel(Model):
         return (term1 + term2) ** (1.0 / 12.0) * 8
 
     def calculate_nu_smooth(self, Re, Pr, fr):
-        U = Re / 1000
-        nu_1 = (fr / 8) * (Re - 1000) * Pr / (1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
-        nu_2 = 3.52 * U ** 4 - 45.148 * U ** 3 + 212.13 * U ** 2 - 427.45 * U + 316.08
-        nu_3 = 3.66
-        TRANSITION_WIDTH = 100
-        TRANSITION_CENTER_1 = 2250
-        TRANSITION_CENTER_2 = 3050
-        w1 = sp.Max(0.0, sp.Min(1.0, 1.0 - (Re - TRANSITION_CENTER_1) / TRANSITION_WIDTH))
-        w3 = sp.Max(0.0, sp.Min(1.0, (Re - TRANSITION_CENTER_2) / TRANSITION_WIDTH))
-        w2 = 1.0 - w1 - w3
-        return w1 * nu_1 + w2 * nu_2 + w3 * nu_3
+        # Smooth (differentiable) Nusselt number: laminar fully-developed
+        # Nu = 3.66 below Re~2300, blended into the Gnielinski turbulent
+        # correlation above Re~3100.  (Earlier revisions had the laminar /
+        # turbulent regimes inverted; see `StraightPipe.calculate_nu_smooth`.)
+        nu_lam = 3.66
+        nu_turb = (fr / 8) * (Re - 1000) * Pr / (
+            1 + 12.7 * (fr / 8) ** 0.5 * (Pr ** (2 / 3) - 1))
+        phi = sp.Max(0.0, sp.Min(1.0, (Re - 2300.0) / 800.0))
+        return (1.0 - phi) * nu_lam + phi * nu_turb
 
     def get_q_inflow(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
         Re = w * Dh * rho / mu
-        Pr = mu * rho / k
+        # Prandtl number Pr = mu*cp/k (cp at the std reference state; see
+        # `_reference_cp`).  Earlier this read `mu*rho/k`, which is
+        # dimensionally not the Prandtl number and badly under-predicted Nu
+        # for liquids (cp >> rho-scaled value).
+        cp = self._cp_std if self._cp_std else self._k_std / self._mu_std
+        Pr = mu * cp / k
         nu = self.calculate_nu_smooth(Re, Pr, fr)
         alpha = nu * k / Dh
         return alpha * area * (T_wall - T)
@@ -1116,21 +1452,68 @@ class SegmentedChannel(Model):
     def get_q_inflow_adiabatic(self, w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
         return 0.0
 
-    def get_conduction_only(self, w, Dh, alpha):
+    # Regime blend for the general axial-dispersion model.  Taylor--Aris (the
+    # laminar w^2/alpha shear term) is only valid below transition; the turbulent
+    # Taylor scaling D ~ Dh*u* takes over above it.  `phi` ramps 0->1 across
+    # [_RE_LAM, _RE_TURB] so the two branches join smoothly (and, crucially, the
+    # laminar term is switched off before it blows up at high Re).
+    _RE_LAM = 2300.0
+    _RE_TURB = 4000.0
+    #: Taylor (1954) turbulent axial-dispersion constant, D = 10.1*R*u* =
+    #: 5.05*Dh*u* with the friction velocity u* = |w|*sqrt(f/8).
+    _C_TAYLOR_TURB = 5.05
+
+    def get_conduction_only(self, w, Dh, alpha, nu=None):
         """Axial diffusivity = molecular thermal diffusivity only (no shear
-        dispersion).  The robust default for the advective level."""
+        dispersion).  Pass this to disable the general model."""
         return alpha
 
-    def get_taylor_aris_dispersion(self, w, Dh, alpha):
-        """Effective axial (Taylor--Aris) diffusivity ``[m^2/s]``.
-
-        ``D_eff = alpha + (w*Dh)^2 / (192*alpha)`` -- molecular thermal
-        diffusivity ``alpha = k/(rho*cp)`` plus the laminar Taylor--Aris shear
-        enhancement.  Overridable like `f_factor_func`; pass a callable
-        ``(w, Dh, alpha) -> D_eff`` returning ``alpha`` (or ``0``) to disable the
-        shear term.
+    def get_taylor_aris_dispersion(self, w, Dh, alpha, nu=None):
+        """Laminar Taylor--Aris effective axial diffusivity ``[m^2/s]``:
+        ``D_eff = alpha + (w*Dh)^2 / (192*alpha)`` (valid for laminar flow only;
+        diverges as ``w`` grows -- use `get_general_dispersion` across regimes).
         """
         return alpha + (w * Dh) ** 2 / (192 * alpha)
+
+    def get_general_dispersion(self, w, Dh, alpha, nu):
+        """General effective axial diffusivity ``[m^2/s]``, valid across laminar,
+        transitional and turbulent flow and for any medium (the closure is built
+        purely from the *local* molecular diffusivity ``alpha=k/(rho*cp)`` and
+        kinematic viscosity ``nu=mu/rho``, so it works unchanged for the HEM
+        multiphase mixture).
+
+        ``D_eff = (1-phi)*[alpha + (w*Dh)^2/(192*alpha)]  (laminar Taylor-Aris)``
+        ``      + phi*[alpha + C*Dh*|w|*sqrt(f/8)]        (turbulent Taylor)``
+
+        with ``phi`` a smooth ramp over ``Re in [_RE_LAM, _RE_TURB]``, ``f`` the
+        Darcy friction factor (`f_factor_func`) and ``C = _C_TAYLOR_TURB``.  Both
+        branches include molecular conduction (``alpha``), so the Fourier term is
+        never dropped.
+        """
+        return self._general_dispersion(w, Dh, alpha, nu, _SymLib)
+
+    def _general_dispersion(self, w, Dh, alpha, nu, lib):
+        """Shared laminar/turbulent-blend implementation, evaluated with either
+        the sympy namespace (`_SymLib`, symbolic residual) or the numeric
+        namespace (`_NumLib`, run-time Peclet check)."""
+        Re = lib.Abs(w) * Dh / nu + 1.0            # +1 floor: keep Re, f finite
+        f = self._darcy_f(Re, self.epsilon, Dh, lib)
+        D_lam = alpha + (w * Dh) ** 2 / (192.0 * alpha)
+        u_star = lib.Abs(w) * lib.sqrt(f / 8.0)
+        D_turb = alpha + self._C_TAYLOR_TURB * Dh * u_star
+        phi = lib.Max(0.0, lib.Min(
+            1.0, (Re - self._RE_LAM) / (self._RE_TURB - self._RE_LAM)))
+        return (1.0 - phi) * D_lam + phi * D_turb
+
+    @staticmethod
+    def _darcy_f(Re, epsilon, D, lib):
+        """Churchill Darcy friction factor, evaluated with `lib` (sympy or
+        numeric); mirrors `get_churchill_f_factor` so the run-time Peclet check
+        matches the symbolic residual."""
+        term1 = (8.0 / Re) ** 12
+        A = (-2.457 * lib.log((7.0 / Re) ** 0.9 + 0.27 * epsilon / D)) ** 16
+        B = (37530.0 / Re) ** 16
+        return (term1 + 1.0 / (A + B) ** 1.5) ** (1.0 / 12.0) * 8
 
     # --- advective-level face reconstruction (cell -> face) ----------------
     @staticmethod
@@ -1199,19 +1582,29 @@ class SegmentedChannel(Model):
         theta = (1 + M_j / sp.sqrt(M_j ** 2 + 1e-12)) / 2  # ~1 forward, ~0 reverse
         return theta * h_fwd + (1 - theta) * h_bwd
 
-    def _warn_cell_peclet(self, w_ref=1.0):
-        """Best-effort cell-Peclet check for the central diffusion stencil.
+    def _dispersion_numeric(self, w, Dh, alpha, nu):
+        """Evaluate the effective axial diffusivity on plain floats (for the
+        Peclet checks).  Uses the fast numeric branch for the built-in general
+        model and otherwise coerces the (possibly symbolic) custom hook."""
+        if self.dispersion_func == self.get_general_dispersion:
+            return self._general_dispersion(w, Dh, alpha, nu, _NumLib)
+        try:
+            return float(self.dispersion_func(w, Dh, alpha, nu))
+        except (TypeError, ValueError):
+            return float(alpha)
 
-        Central reconstruction of the advective flux is non-oscillatory only
-        while ``Pe_cell = |w|*dx/D_eff <= 2``.  Evaluate it numerically at a
-        reference velocity using the std-state properties as a build-time nudge;
-        the true ``Pe`` is velocity-dependent at run time.
-        """
+    def _warn_cell_peclet(self, w_ref=1.0):
+        """Best-effort *build-time* cell-Peclet check for the central diffusion
+        stencil.  The reconstruction is non-oscillatory only while
+        ``Pe_cell = |w|*dx/D_eff <= 2``; evaluate it at a reference velocity on
+        the std-state properties (the true, velocity-dependent ``Pe`` is checked
+        again at run time by `runtime_diagnostics`)."""
         try:
             cp = self._cp_std
             alpha = self._k_std / (self._rho_std * cp)
-            Dh = 4.0 * (np.pi * self.D ** 2 / 4) / (np.pi * self.D)
-            D_eff = float(self.dispersion_func(w_ref, Dh, alpha))
+            nu = self._mu_std / self._rho_std
+            Dh = self.D                       # circular bore: Dh = 4A/P = D
+            D_eff = self._dispersion_numeric(w_ref, Dh, alpha, nu)
             dx = self.L / self.N
             pe = abs(w_ref) * dx / D_eff
         except Exception:  # property eval or hook may not support floats
@@ -1223,6 +1616,61 @@ class SegmentedChannel(Model):
                 f"Central axial diffusion may oscillate; increase N "
                 f"(currently {self.N}).",
                 stacklevel=2)
+
+    def _max_cell_peclet_runtime(self):
+        """Largest interior-face cell-Peclet ``|w|*dx/D_eff`` from the *current*
+        solved state (actual velocities / properties), or ``None`` if it cannot
+        be evaluated."""
+        cp = self._cp_std
+        Dh = self.D
+        dx = self.L / self.N
+        worst = None
+        for j in range(1, self.N):
+            try:
+                w = float(self[f'w_{j}'].value)
+                rho = 0.5 * (float(self[f'rhoc_{j - 1}'].value)
+                             + float(self[f'rhoc_{j}'].value))
+                k = 0.5 * (float(self[f'kc_{j - 1}'].value)
+                           + float(self[f'kc_{j}'].value))
+                mu = float(self[f'mu_{j}'].value)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if rho <= 0.0 or k <= 0.0:
+                continue
+            alpha = k / (rho * cp)
+            nu = mu / rho if mu > 0.0 else self._mu_std / rho
+            D_eff = self._dispersion_numeric(w, Dh, alpha, nu)
+            if D_eff <= 0.0:
+                continue
+            pe = abs(w) * dx / D_eff
+            worst = pe if worst is None else max(worst, pe)
+        return worst
+
+    def runtime_diagnostics(self):
+        """Run-time cell-Peclet check against the *actual* solved velocities,
+        invoked automatically once per committed step by `Model.run`.
+
+        Emits a single warning if the true ``Pe_cell`` exceeds 2 at the chosen
+        segmentation (so the user learns the grid is too coarse for the flow
+        they are actually running, which the build-time estimate at a guessed
+        reference velocity can miss).  Returns ``True`` once it no longer needs
+        to be called (warned, not applicable, or check budget exhausted)."""
+        if not self._cell_centered or self._peclet_warned:
+            return True
+        self._peclet_checks = getattr(self, "_peclet_checks", 0) + 1
+        pe = self._max_cell_peclet_runtime()
+        if pe is not None and pe > 2.0:
+            dx = self.L / self.N
+            warnings.warn(
+                f"SegmentedChannel(dynamic={self.dynamic!r}): run-time cell "
+                f"Peclet ~ {pe:.1f} > 2 (dx={dx:.3g} m, N={self.N}). The axial "
+                f"advection/diffusion may show unphysical oscillations at sharp "
+                f"fronts; increase N (finer grid) to bring Pe_cell <~ 2.",
+                stacklevel=2)
+            self._peclet_warned = True
+            return True
+        # Give up quietly after a bounded number of checks if never triggered.
+        return self._peclet_checks >= 200
 
     def _property_funcs(self):
         m = self.medium
@@ -1267,12 +1715,58 @@ class SegmentedChannel(Model):
         for j in range(N + 1):
             self.add_component(f'z_{j}', Parameter(self.z_in + j * dz, "m"))
 
-        # N+1 shared faces, each carrying its own (single) closure set.
+        # Nominal scales for the derivative companions (Modelica-style
+        # `nominal`): a `der_x` starts at 0, so the default variable scale
+        # max(|init|, 1) = 1 would make the Newton step-norm metric demand
+        # absurd absolute accuracy on fast derivatives.  Worse, the mass
+        # storage rows determine the pressure derivatives only through the
+        # tiny compressive coefficient V*rho_p, so ~1e-11 property-
+        # interpolation noise in the residual maps to O(1e-7) Pa/s wiggle on
+        # `der_p` -- physically harmless (a ~1e-18 kg/s spurious mass rate)
+        # but enough to keep an unscaled step norm above tolerance forever.
+        # The scales below are natural magnitudes: pressure/velocity change
+        # per acoustic cell-transit time (acoustic level) or per second
+        # (pipe-level pressure of the compressible level).
+        if self._cell_centered:
+            rho_ref_s, _rp_s, c_ref_s = self._ref_state_floats()
+            L_cell = self.L / N
+            self._der_pc_scale = max(rho_ref_s * c_ref_s ** 2 / L_cell, 1.0)
+            self._der_w_scale = max(c_ref_s / L_cell, 1.0)
+            self._der_P_scale = max(self.p_init, 1e5)
+            self._der_hc_scale = max(abs(self._h_std), 1e5)
+            if self.cavitation:
+                # Cavity complementarity scales: `a = (pc - p_vap)/S_p_cav`,
+                # `b = V_cav/S_V_cav` are both O(1) at the operating point /
+                # for a cell-sized cavity, so the Fischer-Burmeister row is
+                # dimensionless and well-conditioned in every regime.
+                self._S_p_cav = max(abs(self.p_init - self.p_vap),
+                                    0.05 * self.p_init, 1e3)
+                # `count` may be a live Parameter (Pipe multiplicity); the
+                # scales are constant floats, so take its numeric value.
+                cnt = float(getattr(self.count, "value", self.count))
+                self._S_V_cav = cnt * A_value * L_segment_value
+                # Cavity growth-rate scale = pipe area times the Joukowsky
+                # velocity swing that matches the pressure scale.
+                dw_jouk = self._S_p_cav / (rho_ref_s * c_ref_s)
+                self._der_Vcav_scale = cnt * A_value * max(dw_jouk, 0.1)
+                # Width of the smooth EoS-pressure floor (`_p_eos_cav`).
+                self._cav_w = 0.05 * self._S_p_cav
+
+        # N+1 shared faces, each carrying its own (single) closure set.  On the
+        # acoustic level EVERY face velocity is a momentum state (transient
+        # d(rho*w)/dt inertia -- including the end faces, so pressure waves
+        # reflect correctly off the port boundary conditions); on the other
+        # levels `w_j` is algebraic (quasi-steady momentum).
         for j in range(N + 1):
-            self.add_component(f'p_{j}', Variable(101325, "Pa"))
+            self.add_component(f'p_{j}', Variable(self.p_init, "Pa"))
             self.add_component(f'h_{j}', Variable(self._h_std, "J/kg"))
             self.add_component(f'M_{j}', Variable(0.0, "kg/s"))
-            self.add_component(f'w_{j}', Variable(0.1, "m/s"))
+            if self._momentum_inertia:
+                dv_w = DifferentialVariable(0.1, "m/s")
+                dv_w.der_variable.scale = self._der_w_scale
+                self.add_component(f'w_{j}', dv_w)
+            else:
+                self.add_component(f'w_{j}', Variable(0.1, "m/s"))
             self.add_component(f'T_{j}', Variable(293.15, "K"))
             self.add_component(f'rho_{j}', Variable(self._rho_std, "kg/m^3"))
             self.add_component(f'mu_{j}', Variable(self._mu_std, "Pa*s"))
@@ -1285,28 +1779,80 @@ class SegmentedChannel(Model):
             if self.leaky:
                 self.add_component(f'm_dot_leak_{i}', Variable(0.0, "kg/s"))
 
-        # Transient-energy states (advective level): one conservative internal
-        # energy `U_i` per cell (auto-attaches `der_U_i`) plus one axial-diffusion
-        # flux `F_diff_j` per face.  See the `dynamic` notes in the class docstring.
-        if self.dynamic == "advective":
-            count_num = getattr(self.count, 'value', self.count)
-            V_cell = count_num * A_value * L_segment_value
-            U_cell_init = V_cell * (self._rho_std * self._h_std - 101325.0)
-            # Cell-centred thermodynamic state: enthalpy `hc_i` is the genuine
-            # transported + diffused DOF (no longer slaved to the face average),
-            # with cell pressure `pc_i` (face mean) and the EoS-derived
-            # `Tc_i`/`rhoc_i`/`kc_i`.  `U_i` is the conserved internal energy.
+        # Primitive cell-centred thermodynamic state (advective / compressible /
+        # acoustic): each cell carries the primary pair `(pc_i, hc_i)` and the
+        # EoS-derived `Tc_i`/`rhoc_i`/`kc_i`, plus one axial-diffusion flux
+        # `F_diff_j` per face.  `hc_i` is always a differential state (transient
+        # energy).  `pc_i` is:
+        #   * algebraic on `advective` (pinned by the quasi-steady momentum);
+        #   * algebraic on `compressible` too -- the mass storage there is
+        #     carried by ONE pipe-level thermodynamic pressure state `p_pipe`
+        #     (low-Mach pressure split; see `_declare_primitive`), while the
+        #     cells keep the exact quasi-steady spatial profile;
+        #   * a per-cell differential state on `acoustic` (resolves waves).
+        if self._cell_centered:
             for i in range(N):
-                self.add_component(f'U_{i}', DifferentialVariable(U_cell_init, "J"))
-                self.add_component(f'hc_{i}', Variable(self._h_std, "J/kg"))
-                self.add_component(f'pc_{i}', Variable(101325.0, "Pa"))
+                dv_hc = DifferentialVariable(self._h_std, "J/kg")
+                # `der_hc` reaches O(h/residence-time) magnitudes during
+                # transients; the default scale of 1 makes the Newton step
+                # norm demand 1e-8 J/kg/s ABSOLUTE accuracy on it, which
+                # property-interpolation noise can hold hostage at small dt
+                # (observed as non-convergent +/- 1e-7 flip-flop on water).
+                dv_hc.der_variable.scale = self._der_hc_scale
+                self.add_component(f'hc_{i}', dv_hc)
+                if self._momentum_inertia:
+                    dv_pc = DifferentialVariable(self.p_init, "Pa")
+                    dv_pc.der_variable.scale = self._der_pc_scale
+                    self.add_component(f'pc_{i}', dv_pc)
+                else:
+                    self.add_component(f'pc_{i}', Variable(self.p_init, "Pa"))
                 self.add_component(f'Tc_{i}', Variable(293.15, "K"))
                 self.add_component(f'rhoc_{i}', Variable(self._rho_std, "kg/m^3"))
                 self.add_component(f'kc_{i}', Variable(self._k_std, "W/m/K"))
+                if self.viscoelastic_wall and self._mass_storage:
+                    self.add_component(f'eps_ve_{i}', DifferentialVariable(
+                        0.0, "1"))
+                if self.cavitation:
+                    # Discrete vapor-cavity volume (starts closed).  Explicit
+                    # scales: the state starts at 0, so the default
+                    # max(|init|, 1) would treat a 1 m^3 cavity as "typical".
+                    dv_vc = DifferentialVariable(0.0, "m^3",
+                                                 scale=self._S_V_cav)
+                    dv_vc.der_variable.scale = self._der_Vcav_scale
+                    self.add_component(f'V_cav_{i}', dv_vc)
             for j in range(N + 1):
                 self.add_component(f'F_diff_{j}', Variable(0.0, "W"))
-            if self._dispersion_is_custom:
-                self._warn_cell_peclet()
+            # Compressible level: the single pipe-level thermodynamic-pressure
+            # state (anchored to the mean cell pressure; drives all storage).
+            if self._pressure_split:
+                dv_P = DifferentialVariable(self.p_init, "Pa")
+                dv_P.der_variable.scale = self._der_P_scale
+                self.add_component('p_pipe', dv_P)
+            # Wall-physics knobs (live Parameters so the equation templates
+            # stay instance-invariant across different wall properties).
+            if self.wall_elasticity:
+                spec_w = merged_param_specs(type(self))
+                self.add_component('wall_E', Parameter(
+                    self.wall_E, **spec_w['wall_E'].param_kwargs()))
+                self.add_component('wall_e', Parameter(
+                    self.wall_e, **spec_w['wall_e'].param_kwargs()))
+                self.add_component('wall_c1', Parameter(
+                    self.wall_c1, **spec_w['wall_c1'].param_kwargs()))
+            if self.unsteady_friction:
+                self.add_component('k_uf', Parameter(
+                    self.k_uf,
+                    **merged_param_specs(type(self))['k_uf'].param_kwargs()))
+            if self.viscoelastic_wall and self._mass_storage:
+                spec_v = merged_param_specs(type(self))
+                self.add_component('J_ve', Parameter(
+                    self.J_ve, **spec_v['J_ve'].param_kwargs()))
+                self.add_component('tau_ve', Parameter(
+                    self.tau_ve, **spec_v['tau_ve'].param_kwargs()))
+            if self.cavitation:
+                self.add_component('p_vap', Parameter(
+                    self.p_vap,
+                    **merged_param_specs(type(self))['p_vap'].param_kwargs()))
+            self._warn_cell_peclet()
 
         # Boundary "into me" mass flows = the inlet/outlet port channels.
         self.add_component('m_dot_in', Variable(0.0, "kg/s"))
@@ -1335,6 +1881,504 @@ class SegmentedChannel(Model):
                               'm_dot_leak': self[f'm_dot_leak_{i}']},
                     flow_orientation='in', require_connection=True))
 
+    def _p_eos_cav(self, p):
+        """EoS-side smooth pressure floor at ``p_vap`` (cavitation only).
+
+        The DVCM complementarity keeps the *solution* at ``pc >= p_vap``, but
+        Newton ITERATES (and the last few Pa of the smoothed clamp) can still
+        graze below the saturation line, where the single-phase property
+        partials of a real-fluid backend are undefined (HEOS returns NaN,
+        the tabular backends have invalid cells) -- one bad iterate then
+        poisons the Jacobian.  Property calls therefore see
+
+            p_eos = p_vap + (x + sqrt(x^2 + w^2))/2,   x = p - p_vap
+
+        (a smooth max, ``w = _cav_w``): identical to ``p`` a few kPa above
+        the clamp, floored at ``p_vap + w/2`` below it, exact symbolic
+        derivatives everywhere.  The balance equations keep the true ``p``;
+        only the EoS lookups are floored, and when the cavity is open the
+        cell sits at ``p ~ p_vap`` anyway, so the floor changes nothing
+        physical.  Identity when `cavitation` is off."""
+        if not self.cavitation:
+            return p
+        pv = self['p_vap'].symbol
+        x = p - pv
+        return pv + (x + sp.sqrt(x ** 2 + self._cav_w ** 2)) / 2
+
+    def _wall_compliance_term(self, rhoci, Dh):
+        """Korteweg hoop-compliance contribution to the effective cell
+        compressibility ``d(rho*A)/dp / A = rho_p + rho*D*c1/(e*E)``: the wall
+        stretches under pressure, enlarging the cross-section (quasi-static --
+        the hoop breathing frequency is far above water-hammer frequencies).
+        Returns 0 when `wall_elasticity` is off."""
+        if not self.wall_elasticity:
+            return 0
+        E = self['wall_E'].symbol
+        e = self['wall_e'].symbol
+        c1 = self['wall_c1'].symbol
+        return rhoci * Dh * c1 / (e * E)
+
+    def _ref_state_floats(self):
+        """Reference floats at ``(p_init, h_std)`` for constant residual row
+        scaling: ``(rho_ref, rho_p_ref, c_ref)``.  ``rho_p_ref`` includes the
+        Korteweg wall compliance when enabled, and ``c_ref`` is the isentropic
+        sound speed ``1/sqrt(rho_p + rho_h/rho)`` corrected for the wall (the
+        classic elastic-line wave speed)."""
+        p0, h0 = self.p_init, self._h_std
+        try:
+            rho_ref = float(self.medium.eval_rho_ph(p0, h0))
+            rho_p = float(self.medium.eval_drho_ph_dp(p0, h0))
+            rho_h = float(self.medium.eval_drho_ph_dh(p0, h0))
+        except Exception:
+            rho_ref, rho_p, rho_h = self._rho_std, 1e-6, 0.0
+        rho_p_eff = rho_p
+        if self.wall_elasticity:
+            rho_p_eff = rho_p + rho_ref * self.D * self.wall_c1 / (
+                self.wall_e * self.wall_E)
+        if not (rho_p_eff > 0.0):
+            rho_p_eff = 1e-7
+        denom = rho_p_eff + rho_h / rho_ref
+        c_ref = _math.sqrt(1.0 / denom) if denom > 0 else 1000.0
+        return rho_ref, rho_p_eff, c_ref
+
+    def _corr_template(self, func, key, args):
+        """Evaluate a per-cell/-face correlation hook (``func``) through a cached
+        placeholder template so its (expensive) symbolic body is canonicalised
+        by sympy only ONCE per call site, not once per cell/face.
+
+        The primitive (cell-centred) levels call ``f_factor_func`` /
+        ``dispersion_func`` / ``q_inflow_func`` inside per-cell and per-face
+        loops.  Those hooks are pure symbolic functions of their positional args
+        (Churchill friction with ``(...)**12/**16/**1.5``, the Taylor blend with
+        ``Max/Min``, the Gnielinski Nusselt) whose *structure* depends only on
+        the arg count, not the arg values -- so rebuilding them N times re-fires
+        sympy's Pow/assumption/Max-Min canonicalisation machinery N times, which
+        is the dominant cost of `collect_equations` for the transient levels
+        (the static level already sidesteps this via its cell template).
+
+        The first call on a given ``key`` builds ``func(*dummies)`` once and
+        caches ``(dummies, expr)``; every call then returns ``expr`` with the
+        real args substituted for the dummies under ``sp.evaluate(False)`` -- a
+        structural leaf swap that skips re-canonicalisation, exactly mirroring
+        the static `declare_equations` template/`xreplace` path.  The dummies are
+        fully covered by the substitution map, so none leak into the residuals.
+        """
+        cache = self.__dict__.setdefault('_corr_tmpl_cache', {})
+        entry = cache.get(key)
+        if entry is None or len(entry[0]) != len(args):
+            dummies = tuple(sp.Dummy() for _ in args)
+            expr = sp.sympify(func(*dummies))
+            entry = (dummies, expr)
+            cache[key] = entry
+        dummies, expr = entry
+        with sp.evaluate(False):
+            return expr.xreplace(dict(zip(dummies, args)))
+
+    def _primitive_cell_real_syms(self, i):
+        """Leaf symbols for primitive cell ``i`` (dynamic levels)."""
+        d = {
+            'pci': self[f'pc_{i}'].symbol,
+            'hci': self[f'hc_{i}'].symbol,
+            'Tci': self[f'Tc_{i}'].symbol,
+            'rhoci': self[f'rhoc_{i}'].symbol,
+            'kci': self[f'kc_{i}'].symbol,
+            'der_hci': self[f'der_hc_{i}'].symbol,
+            'q_inflow': self[f'q_inflow_{i}'].symbol,
+            'T_wall': self[f'T_wall_{i}'].symbol,
+            'M_in': self[f'M_{i}'].symbol,
+            'M_out': self[f'M_{i + 1}'].symbol,
+            'h_in': self[f'h_{i}'].symbol,
+            'h_out': self[f'h_{i + 1}'].symbol,
+            'w_in': self[f'w_{i}'].symbol,
+            'w_out': self[f'w_{i + 1}'].symbol,
+            'F_in': self[f'F_diff_{i}'].symbol,
+            'F_out': self[f'F_diff_{i + 1}'].symbol,
+        }
+        d['m_dot_leak'] = (self[f'm_dot_leak_{i}'].symbol if self.leaky else None)
+        if self._momentum_inertia:
+            d['der_pc'] = self[f'der_pc_{i}'].symbol
+            if self.cavitation:
+                d['V_cav'] = self[f'V_cav_{i}'].symbol
+                d['der_V_cav'] = self[f'der_V_cav_{i}'].symbol
+        if self.viscoelastic_wall and self._mass_storage:
+            d['eps_ve'] = self[f'eps_ve_{i}'].symbol
+            d['der_eps_ve'] = self[f'der_eps_ve_{i}'].symbol
+        return d
+
+    def _primitive_cell_placeholder_syms(self):
+        """Placeholder leaves for one primitive cell, keyed like `_primitive_cell_real_syms`."""
+        keys = (
+            'pci', 'hci', 'Tci', 'rhoci', 'kci', 'der_hci', 'q_inflow', 'T_wall',
+            'M_in', 'M_out', 'h_in', 'h_out', 'w_in', 'w_out', 'F_in', 'F_out',
+        )
+        d = {k: sp.Symbol(f'__prim_{k}__', real=True) for k in keys}
+        d['m_dot_leak'] = (sp.Symbol('__prim_m_dot_leak__', real=True)
+                           if self.leaky else None)
+        if self._momentum_inertia:
+            d['der_pc'] = sp.Symbol('__prim_der_pc__', real=True)
+            if self.cavitation:
+                d['V_cav'] = sp.Symbol('__prim_V_cav__', real=True)
+                d['der_V_cav'] = sp.Symbol('__prim_der_V_cav__', real=True)
+        if self.viscoelastic_wall and self._mass_storage:
+            d['eps_ve'] = sp.Symbol('__prim_eps_ve__', real=True)
+            d['der_eps_ve'] = sp.Symbol('__prim_der_eps_ve__', real=True)
+        return d
+
+    def _primitive_diff_real_syms(self, j):
+        """Leaf symbols for interior diffusion face ``j`` (1 <= j < N)."""
+        return {
+            'Fd': self[f'F_diff_{j}'].symbol,
+            'Tc_L': self[f'Tc_{j - 1}'].symbol,
+            'Tc_R': self[f'Tc_{j}'].symbol,
+            'rhoc_L': self[f'rhoc_{j - 1}'].symbol,
+            'rhoc_R': self[f'rhoc_{j}'].symbol,
+            'kc_L': self[f'kc_{j - 1}'].symbol,
+            'kc_R': self[f'kc_{j}'].symbol,
+            'w': self[f'w_{j}'].symbol,
+            'mu': self[f'mu_{j}'].symbol,
+        }
+
+    def _primitive_diff_placeholder_syms(self):
+        keys = ('Fd', 'Tc_L', 'Tc_R', 'rhoc_L', 'rhoc_R', 'kc_L', 'kc_R', 'w', 'mu')
+        return {k: sp.Symbol(f'__prim_diff_{k}__', real=True) for k in keys}
+
+    def _primitive_diff_residual(self, *, Fd, Tc_L, Tc_R, rhoc_L, rhoc_R, kc_L, kc_R,
+                                 w, mu, count, A, L_seg, Dh, cp):
+        """Axial diffusion flux at one interior face."""
+        rho_f = (rhoc_L + rhoc_R) / 2
+        k_f = (kc_L + kc_R) / 2
+        alpha_f = k_f / (rho_f * cp)
+        nu_f = mu / rho_f
+        D_eff = self._corr_template(
+            self.dispersion_func, 'disp', (w, Dh, alpha_f, nu_f))
+        kappa_eff = rho_f * cp * D_eff
+        return Fd + count * A * kappa_eff * (Tc_R - Tc_L) / L_seg
+
+    def _primitive_mom_interior_real_syms(self, j, z):
+        """Leaf symbols for interior face momentum ``j`` (1 <= j < N)."""
+        d = {
+            'w': self[f'w_{j}'].symbol,
+            'rho': self[f'rho_{j}'].symbol,
+            'mu': self[f'mu_{j}'].symbol,
+            'pL': self[f'pc_{j - 1}'].symbol,
+            'pR': self[f'pc_{j}'].symbol,
+            'zL': (z[j - 1] + z[j]) / 2,
+            'zR': (z[j] + z[j + 1]) / 2,
+        }
+        if self._momentum_inertia:
+            d['der_w'] = self[f'der_w_{j}'].symbol
+            if self.unsteady_friction:
+                d['w_prev'] = self[f'w_{j - 1}'].symbol
+                d['w_next'] = self[f'w_{j + 1}'].symbol
+        return d
+
+    def _primitive_mom_interior_placeholder_syms(self):
+        keys = ['w', 'rho', 'mu', 'pL', 'pR', 'zL', 'zR']
+        d = {k: sp.Symbol(f'__prim_mom_{k}__', real=True) for k in keys}
+        if self._momentum_inertia:
+            d['der_w'] = sp.Symbol('__prim_mom_der_w__', real=True)
+            if self.unsteady_friction:
+                d['w_prev'] = sp.Symbol('__prim_mom_w_prev__', real=True)
+                d['w_next'] = sp.Symbol('__prim_mom_w_next__', real=True)
+        return d
+
+    def _primitive_mom_residual(self, *, w, rho, mu, pL, pR, zL, zR, L_mom, Dh,
+                                der_w=None, w_prev=None, w_next=None, c_ref=None):
+        """Staggered face momentum balance (pressure units)."""
+        Re = rho * abs(w) * Dh / mu + 1
+        f = self._corr_template(self.f_factor_func, 'f', (Re, self.epsilon, Dh))
+        dp_fric = f * (L_mom / Dh) * (rho * abs(w) * w / 2)
+        dp_grav = G_const * (zR - zL) * rho
+        if self._momentum_inertia:
+            dp_uf = 0
+            if self.unsteady_friction:
+                k_uf = self['k_uf'].symbol
+                dwdx = (w_next - w_prev) / (2 * L_mom)
+                sgn_w = w / sp.sqrt(w ** 2 + 1e-6)
+                dp_uf = k_uf * rho * L_mom * (der_w + c_ref * sgn_w * dwdx)
+            return rho * L_mom * der_w - (pL - pR - dp_fric - dp_grav - dp_uf)
+        return pL - pR - dp_fric - dp_grav
+
+    def _primitive_cell_residuals(self, *, pci, hci, Tci, rhoci, kci, der_hci,
+                                  q_inflow, T_wall, M_in, M_out, h_in, h_out,
+                                  w_in, w_out, F_in, F_out,
+                                  m_dot_leak=None, der_pc=None, V_cav=None,
+                                  der_V_cav=None, eps_ve=None, der_eps_ve=None,
+                                  V_cell, area_conv, Dh, count, cp,
+                                  T_ph, rho_ph, mu_ph, k_ph, drho_dp, drho_dh,
+                                  S_mass, S_energy, c_ref, N):
+        """Primitive cell-centred residuals as a pure function of leaf symbols."""
+        eqs = []
+        pei = self._p_eos_cav(pci)
+        eqs.append(rhoci - rho_ph(pei, hci))
+        eqs.append(Tci - T_ph(pei, hci))
+        eqs.append(kci - k_ph(pei, hci))
+
+        m_dot_in = M_in
+        m_dot_out = -M_out
+        cont = m_dot_in + m_dot_out
+        if self.leaky:
+            cont = cont + m_dot_leak
+
+        rho_p = drho_dp(pei, hci)
+        rho_h = drho_dh(pei, hci)
+        rho_p_eff = rho_p + self._wall_compliance_term(rhoci, Dh)
+
+        muci = mu_ph(pei, hci)
+        w_avg = (w_in + w_out) / 2
+        Re_cell = rhoci * abs(w_avg) * Dh / muci + 1
+        f_cell = self._corr_template(
+            self.f_factor_func, 'f', (Re_cell, self.epsilon, Dh))
+        q = self._corr_template(
+            self.q_inflow_func, 'q',
+            (w_avg, pci, hci, rhoci, Tci, muci, kci,
+             f_cell, T_wall, Dh, area_conv))
+        flux = (m_dot_in * (h_in + w_in ** 2 / 2)
+                + m_dot_out * (h_out + w_out ** 2 / 2)
+                + q + F_in - F_out)
+        if self.leaky:
+            flux = flux + m_dot_leak * hci
+
+        ve_storage = 0
+        if self.viscoelastic_wall and self._mass_storage:
+            J = self['J_ve'].symbol
+            tau = self['tau_ve'].symbol
+            eqs.append(tau * der_eps_ve + eps_ve - J * (pci - self.p_init))
+            ve_storage = 2 * rhoci * der_eps_ve
+
+        if self._momentum_inertia:
+            cav_storage = 0
+            if self.cavitation:
+                cav_storage = rhoci * der_V_cav
+            mass_row = (V_cell * (rho_p_eff * der_pc + rho_h * der_hci
+                                  + ve_storage) - cav_storage - cont)
+            eqs.append(S_mass * mass_row)
+            dU_dt = V_cell * ((rho_p * hci - 1) * der_pc
+                              + (rho_h * hci + rhoci) * der_hci)
+            if self.cavitation:
+                dU_dt = dU_dt - rhoci * hci * der_V_cav
+            eqs.append(S_energy * (dU_dt - flux))
+            if self.cavitation:
+                a_cav = (pci - self['p_vap'].symbol) / self._S_p_cav
+                b_cav = V_cav / self._S_V_cav
+                r_cav = sp.sqrt(a_cav ** 2 + b_cav ** 2 + self.cav_eps ** 2)
+                phi = a_cav + b_cav - r_cav
+                dphi_dt = ((1 - a_cav / r_cav) * der_pc / self._S_p_cav
+                           + (1 - b_cav / r_cav) * der_V_cav / self._S_V_cav)
+                tau_cav = (self.L / N) / c_ref
+                eqs.append(phi + tau_cav * dphi_dt)
+        elif self._pressure_split:
+            der_P = self['der_p_pipe'].symbol
+            eqs.append(V_cell * (rho_p_eff * der_P + rho_h * der_hci
+                                 + ve_storage) - cont)
+            dU_dt = V_cell * ((rho_p * hci - 1) * der_P
+                              + (rho_h * hci + rhoci) * der_hci)
+            eqs.append(dU_dt - flux)
+        else:
+            eqs.append(cont)
+            dU_dt = V_cell * (rho_h * hci + rhoci) * der_hci
+            eqs.append(dU_dt - flux)
+        eqs.append(q_inflow - q)
+        if not self.heat_port:
+            eqs.append(T_wall - Tci)
+        return eqs
+
+    def _declare_primitive(self, eqs, N, count, A, P, L_seg, Dh,
+                           T_ph, rho_ph, mu_ph, k_ph):
+        """Unified primitive-``(p, h)`` residuals for the three dynamic levels.
+
+        Each cell carries the primary pair ``(pc_i, hc_i)`` (plus EoS closures
+        for ``Tc_i``/``rhoc_i``/``kc_i``); interior face pressures are the mean of
+        the two adjacent cell pressures; face enthalpies are the upwind
+        reconstruction; axial diffusion is the compact cell-temperature Laplacian;
+        and momentum is a **staggered face** balance relating each face velocity
+        ``w_j`` to the adjacent cell-pressure drop (half a cell to the port
+        pressures at the ends).  Using the cell-to-cell pressure gradient
+        directly keeps the pressure-velocity coupling free of the odd-even
+        (checkerboard) mode.  Each level adds one storage mechanism:
+
+        * ``advective`` -- transient energy only.  Quasi-steady mass
+          (``M_i - M_{i+1} = 0`` per cell) and momentum; ``pc_i`` algebraic.
+
+        * ``compressible`` -- + mass storage via the **low-Mach pressure split**
+          (Paolucci 1982; Majda & Sethian 1985; the single-pressure-state
+          structure of ThermoPower's ``Flow1D``, Casella 2006): ONE pipe-level
+          thermodynamic pressure state ``p_pipe`` (anchored to the mean cell
+          pressure) carries the pressure *dynamics*, while the cells keep the
+          exact quasi-steady spatial *profile* ``pc_i`` from the staggered
+          momentum (friction + gravity), so the EoS sees the correct local
+          pressure.  The mass balance per cell is
+          ``V*(rho_p*dp_pipe/dt + rho_h*dhc_i/dt) = M_i - M_{i+1}`` (+leak),
+          which lets the flow field go non-uniform as the fluid stores/releases
+          mass -- WITHOUT a per-cell acoustic pressure mode.  This designs out
+          the singular low-Mach coupling (a per-cell pressure backed by the
+          tiny compressive storage ``V*rho_p``): the only pressure DOF is
+          pinned algebraically by the momentum profile, so the level is
+          well-conditioned for gas, subcooled liquid AND the HEM dome alike.
+          The neglected ``d(delta_p_i)/dt`` storage is O(dp_friction/p) --
+          second-order small.  Acoustics are filtered by construction.
+
+        * ``acoustic`` -- per-cell ``pc_i`` differential states AND transient
+          momentum ``rho*L*dw_j/dt`` on EVERY face (end faces included, so
+          waves reflect correctly off the port boundary conditions): the full
+          1-D compressible staggered semi-implicit structure (RELAP5 family;
+          Casulli-type), resolving pressure-wave propagation (water hammer).
+          The mass/energy rows are scaled by constant reference factors
+          ``1/(V*rho_p_ref)`` / ``1/V`` and the momentum row is written in
+          pressure units, so the Jacobian stays numerically well-conditioned
+          in every regime (the raw conservative rows leave ``dpc/dt`` with a
+          ~1e-10 coefficient, which is what previously made the per-cell
+          scheme rank-deficient in float64).
+
+        Optional wall physics (all levels with mass storage):
+        `wall_elasticity` (Korteweg hoop compliance -- adds
+        ``rho*D*c1/(e*E)`` to the effective compressibility, lowering the wave
+        speed to the elastic-line value), `viscoelastic_wall` (Kelvin-Voigt
+        retarded strain state per cell, for polymer pipes) and, on the
+        acoustic momentum, `unsteady_friction` (Brunone instantaneous-
+        acceleration model).
+
+        Optional column separation (`cavitation`, acoustic only): per-cell
+        discrete vapor-cavity volume ``V_cav_i`` displacing liquid storage
+        ``rho*dV_cav/dt`` in the mass balance, closed by the smoothed
+        Fischer-Burmeister complementarity ``(pc_i - p_vap) >= 0 _|_
+        V_cav_i >= 0`` -- the implicit-FV analogue of the classic DVCM/DGCM
+        (Wylie & Streeter; Bergant & Simpson 1999).  The clamp keeps the
+        liquid EoS out of the two-phase dome, so the acoustic Jacobian stays
+        well-conditioned straight through cavitation and cavity collapse.
+        """
+        hc = [self[f'hc_{i}'].symbol for i in range(N)]
+        pc = [self[f'pc_{i}'].symbol for i in range(N)]
+        z = [self[f'z_{j}'].symbol for j in range(N + 1)]
+        V_cell = count * A * L_seg
+        cp = self._cp_std
+        area_conv = count * P * L_seg
+        # Symbolic density partials for the primitive chain rule (HEM-smoothed
+        # variants inside the dome).  Both `rho_p` and `rho_h` expose consistent
+        # second derivatives, so the Newton Jacobian of the cell balances is
+        # exact.
+        if self.multiphase == "HEM":
+            drho_dp = self.medium.drho_ph_hem_dp
+            drho_dh = self.medium.drho_ph_hem_dh
+        else:
+            drho_dp = self.medium.drho_ph_dp
+            drho_dh = self.medium.drho_ph_dh
+
+        # Constant reference floats for residual row scaling (acoustic) and the
+        # Brunone convective term.  Constant scalars multiply whole residual
+        # rows, so they change nothing about the solution manifold -- they only
+        # equilibrate the Jacobian.
+        rho_ref, rho_p_ref, c_ref = self._ref_state_floats()
+        V_val = (_math.pi * self.D ** 2 / 4.0) * (self.L / N)
+        S_mass = 1.0 / (V_val * rho_p_ref)
+        S_energy = 1.0 / (V_val * rho_ref)
+
+        def cell_z(i):
+            return (z[i] + z[i + 1]) / 2
+
+        # Face enthalpy reconstruction (interior + outlet); `h_0` stays the free
+        # inlet port input.
+        for j in range(1, N + 1):
+            eqs.append(self[f'h_{j}'].symbol - self._face_h_recon(j, hc))
+
+        # Interior face pressure = mean of the two adjacent cell pressures.
+        # (`p_0` / `p_N` are the inlet / outlet port pressures.)
+        for j in range(1, N):
+            eqs.append(self[f'p_{j}'].symbol - (pc[j - 1] + pc[j]) / 2)
+
+        # Axial diffusion fluxes: compact cell-temperature Laplacian (ends
+        # insulated).
+        for j in range(N + 1):
+            if j == 0 or j == N:
+                eqs.append(self[f'F_diff_{j}'].symbol)
+        if N > 1:
+            diff_ref = self._primitive_diff_placeholder_syms()
+            diff_tpl = [self._primitive_diff_residual(
+                count=count, A=A, L_seg=L_seg, Dh=Dh, cp=cp, **diff_ref)]
+            with sp.evaluate(False):
+                for j in range(1, N):
+                    real = self._primitive_diff_real_syms(j)
+                    mapping = {ph: real[k] for k, ph in diff_ref.items()}
+                    eqs.extend(eq.xreplace(mapping) for eq in diff_tpl)
+        elif N == 1:
+            pass  # only insulated end faces (already zeroed above)
+
+        # Per-cell EoS closures + energy (+ optional mass) balances.
+        cell_kw = dict(
+            V_cell=V_cell, area_conv=area_conv, Dh=Dh, count=count, cp=cp,
+            T_ph=T_ph, rho_ph=rho_ph, mu_ph=mu_ph, k_ph=k_ph,
+            drho_dp=drho_dp, drho_dh=drho_dh,
+            S_mass=S_mass, S_energy=S_energy, c_ref=c_ref, N=N)
+        if N == 1:
+            real = self._primitive_cell_real_syms(0)
+            eqs.extend(self._primitive_cell_residuals(**real, **cell_kw))
+        else:
+            ref = self._primitive_cell_placeholder_syms()
+            cell_tpl = self._primitive_cell_residuals(**ref, **cell_kw)
+            with sp.evaluate(False):
+                for i in range(N):
+                    real = self._primitive_cell_real_syms(i)
+                    mapping = {ph: real[k] for k, ph in ref.items()
+                               if real.get(k) is not None}
+                    eqs.extend(eq.xreplace(mapping) for eq in cell_tpl)
+
+        # Compressible level: anchor the pipe-level thermodynamic pressure to
+        # the mean cell pressure.  `p_pipe` is thereby pinned ALGEBRAICALLY by
+        # the momentum profile (a Dirichlet-like anchor through the ports), so
+        # its time derivative is a well-conditioned numerical derivative -- the
+        # pressure level is never left floating on the tiny compressive
+        # storage.  (Anchoring to the outlet port pressure directly is
+        # structurally fragile: with a fixed-pressure outlet the anchor row
+        # collapses against the boundary equation during trivial reduction.)
+        if self._pressure_split:
+            eqs.append(self['p_pipe'].symbol - sum(pc) / N)
+
+        # Staggered face momentum: drive w_j from the adjacent cell-pressure
+        # drop (half a cell to the port pressures at the ends).  Quasi-steady
+        # duct friction on `advective`/`compressible`; on `acoustic` EVERY face
+        # carries the transient inertia `rho*L*dw/dt = -dp/dx - friction +
+        # gravity` (the classic water-hammer momentum equation, in PRESSURE
+        # units so the pressure coupling keeps O(1) Jacobian rows).
+        half_L = L_seg / 2
+        # End faces (only two; build directly).
+        for j in (0, N):
+            if j == 0:
+                pL, pR = self['p_0'].symbol, pc[0]
+                zL, zR = z[0], cell_z(0)
+                L_mom = half_L
+            else:
+                pL, pR = pc[N - 1], self[f'p_{N}'].symbol
+                zL, zR = cell_z(N - 1), z[N]
+                L_mom = half_L
+            w_j = self[f'w_{j}'].symbol
+            rho_f = self[f'rho_{j}'].symbol
+            mu_f = self[f'mu_{j}'].symbol
+            mom_kw = dict(w=w_j, rho=rho_f, mu=mu_f, pL=pL, pR=pR,
+                          zL=zL, zR=zR, L_mom=L_mom, Dh=Dh, c_ref=c_ref)
+            if self._momentum_inertia:
+                mom_kw['der_w'] = self[f'der_w_{j}'].symbol
+                if self.unsteady_friction:
+                    if j == 0:
+                        mom_kw['w_prev'] = w_j
+                        mom_kw['w_next'] = self['w_1'].symbol
+                    else:
+                        mom_kw['w_prev'] = self[f'w_{N - 1}'].symbol
+                        mom_kw['w_next'] = w_j
+            eqs.append(self._primitive_mom_residual(**mom_kw))
+        # Interior faces: one template, rename leaves per face.
+        if N > 1:
+            mom_ref = self._primitive_mom_interior_placeholder_syms()
+            mom_tpl = [self._primitive_mom_residual(
+                L_mom=L_seg, Dh=Dh, c_ref=c_ref, **mom_ref)]
+            with sp.evaluate(False):
+                for j in range(1, N):
+                    real = self._primitive_mom_interior_real_syms(j, z)
+                    mapping = {ph: real[k] for k, ph in mom_ref.items()
+                               if real.get(k) is not None}
+                    eqs.extend(eq.xreplace(mapping) for eq in mom_tpl)
+
+        return eqs
+
     def declare_equations(self):
         N = self.N
         count = self['count'].symbol
@@ -1345,7 +2389,7 @@ class SegmentedChannel(Model):
         T_ph, rho_ph, mu_ph, k_ph = self._property_funcs()
         eqs = []
 
-        # --- per-face closures (ONE set per shared face) -------------------
+        # --- per-face closures (ONE sept per shared face) -------------------
         for j in range(N + 1):
             p = self[f'p_{j}'].symbol
             h = self[f'h_{j}'].symbol
@@ -1355,54 +2399,33 @@ class SegmentedChannel(Model):
             rho = self[f'rho_{j}'].symbol
             mu = self[f'mu_{j}'].symbol
             k = self[f'k_{j}'].symbol
+            # Face EoS lookups get the same (cavitation-only) smooth pressure
+            # floor as the cells (`_p_eos_cav`; identity otherwise).
+            pe = self._p_eos_cav(p)
             eqs.append(M - count * rho * A * w)
-            eqs.append(T - T_ph(p, h))
-            eqs.append(rho - rho_ph(p, h))
-            eqs.append(mu - mu_ph(p, h))
-            eqs.append(k - k_ph(p, h))
+            eqs.append(T - T_ph(pe, h))
+            eqs.append(rho - rho_ph(pe, h))
+            eqs.append(mu - mu_ph(pe, h))
+            eqs.append(k - k_ph(pe, h))
 
         # Boundary into-me flows (inlet/outlet port channels).
         eqs.append(self['m_dot_in'].symbol - self['M_0'].symbol)
         eqs.append(self['m_dot_out'].symbol + self[f'M_{N}'].symbol)
 
-        # --- advective level: face reconstruction + axial diffusion ---------
-        # The transported scalar lives at cell centres (`hc_i`); every interior
-        # and outlet face enthalpy `h_j` is *reconstructed* from the cell values
-        # with the upwind-biased U<n_up>D<n_down> stencil (sign-aware, reduced to
-        # lower order near the ends).  The inlet face `h_0` stays a free port
-        # input.  This is the piece a face-collocated layout cannot express: it
-        # is what lets the energy flux M_j*h_j be a genuine upwind reconstruction
-        # rather than a slaved face DOF.
-        if self.dynamic == "advective":
-            hc = [self[f'hc_{i}'].symbol for i in range(N)]
-            for j in range(1, N + 1):
-                eqs.append(self[f'h_{j}'].symbol - self._face_h_recon(j, hc))
+        # --- dynamic levels: one primitive (p, h) cell-centred scheme -------
+        # The advective / compressible / acoustic levels all share the primitive
+        # formulation (staggered momentum, upwind face-enthalpy reconstruction,
+        # axial diffusion) and differ in the storage mechanism: none / one
+        # pipe-level pressure state (low-Mach split) / per-cell pressure +
+        # all-face momentum inertia.  Per-cell and per-face residuals are
+        # structurally identical across cells/faces (only leaf symbols differ),
+        # so they are built once on placeholders and renamed per instance --
+        # mirroring the static-level template path.
+        if self._cell_centered:
+            return self._declare_primitive(
+                eqs, N, count, A, P, L_seg, Dh, T_ph, rho_ph, mu_ph, k_ph)
 
-            # Axial diffusion: a COMPACT 3-point Laplacian on the *cell* temps.
-            # F_diff_j is the +x conductive + dispersive energy flux through face
-            # j: F_j = -count*A*kappa_eff*(Tc_j - Tc_{j-1})/L_seg, with
-            # kappa_eff = rho*cp*D_eff (rho*cp*alpha == k, so Fourier conduction
-            # is included).  The net into cell i, F_diff_i - F_diff_{i+1},
-            # telescopes to count*A*kappa*(Tc_{i-1} - 2 Tc_i + Tc_{i+1})/L_seg --
-            # diagonally dominant and free of the checkerboard null mode that
-            # broke the old face-collocated stencil.  Ends are insulated.
-            cp = self._cp_std
-            for j in range(N + 1):
-                Fd = self[f'F_diff_{j}'].symbol
-                if j == 0 or j == N:
-                    eqs.append(Fd)
-                    continue
-                Tc_L = self[f'Tc_{j - 1}'].symbol
-                Tc_R = self[f'Tc_{j}'].symbol
-                rho_f = (self[f'rhoc_{j - 1}'].symbol + self[f'rhoc_{j}'].symbol) / 2
-                k_f = (self[f'kc_{j - 1}'].symbol + self[f'kc_{j}'].symbol) / 2
-                w_j = self[f'w_{j}'].symbol
-                alpha_f = k_f / (rho_f * cp)
-                D_eff = self.dispersion_func(w_j, Dh, alpha_f)
-                kappa_eff = rho_f * cp * D_eff
-                eqs.append(Fd + count * A * kappa_eff * (Tc_R - Tc_L) / L_seg)
-
-        # --- per-cell balances --------------------------------------------
+        # --- per-cell balances (static level only) ------------------------
         # The N cells are structurally identical -- same correlations, only the
         # per-cell leaf symbols differ.  Building each from scratch re-fires
         # sympy's assumption + Max/Min canonicalisation machinery N times, which
@@ -1445,7 +2468,11 @@ class SegmentedChannel(Model):
     )
 
     def _cell_real_syms(self, i):
-        """The actual leaf symbols for cell ``i`` keyed by residual field."""
+        """The actual leaf symbols for cell ``i`` keyed by residual field.
+
+        Static level uses this for the face-nodal template; dynamic
+        (cell-centred) levels use `_primitive_cell_real_syms` instead.
+        """
         d = {}
         for k_in, k_out, stem in self._CELL_FACE_FIELDS:
             d[k_in] = self[f'{stem}_{i}'].symbol
@@ -1455,19 +2482,6 @@ class SegmentedChannel(Model):
         d['T_wall'] = self[f'T_wall_{i}'].symbol
         d['q_inflow'] = self[f'q_inflow_{i}'].symbol
         d['m_dot_leak'] = self[f'm_dot_leak_{i}'].symbol if self.leaky else None
-        if self.dynamic == "advective":
-            d['U'] = self[f'U_{i}'].symbol
-            d['der_U'] = self[f'der_U_{i}'].symbol
-            d['F_diff_in'] = self[f'F_diff_{i}'].symbol
-            d['F_diff_out'] = self[f'F_diff_{i + 1}'].symbol
-            d['hc'] = self[f'hc_{i}'].symbol
-            d['pc'] = self[f'pc_{i}'].symbol
-            d['Tc'] = self[f'Tc_{i}'].symbol
-            d['rhoc'] = self[f'rhoc_{i}'].symbol
-            d['kc'] = self[f'kc_{i}'].symbol
-        else:
-            d['U'] = d['der_U'] = d['F_diff_in'] = d['F_diff_out'] = None
-            d['hc'] = d['pc'] = d['Tc'] = d['rhoc'] = d['kc'] = None
         return d
 
     def _cell_placeholder_syms(self):
@@ -1478,24 +2492,17 @@ class SegmentedChannel(Model):
         """
         keys = [k for pair in self._CELL_FACE_FIELDS for k in pair[:2]]
         keys += ['z_in', 'z_out', 'T_wall', 'q_inflow']
-        if self.dynamic == "advective":
-            keys += ['U', 'der_U', 'F_diff_in', 'F_diff_out',
-                     'hc', 'pc', 'Tc', 'rhoc', 'kc']
         d = {k: sp.Symbol(f'__cell_{k}__', real=True) for k in keys}
         d['m_dot_leak'] = (sp.Symbol('__cell_m_dot_leak__', real=True)
                            if self.leaky else None)
-        if self.dynamic != "advective":
-            d['U'] = d['der_U'] = d['F_diff_in'] = d['F_diff_out'] = None
-            d['hc'] = d['pc'] = d['Tc'] = d['rhoc'] = d['kc'] = None
         return d
 
     def _cell_residuals(self, cell, *, p_in, p_out, h_in, h_out, w_in, w_out,
                         rho_in, rho_out, mu_in, mu_out, k_in, k_out, T_in, T_out,
                         M_in, M_out, z_in, z_out, T_wall, q_inflow, m_dot_leak,
-                        A, P, L_seg, count, Dh,
-                        U=None, der_U=None, F_diff_in=None, F_diff_out=None,
-                        hc=None, pc=None, Tc=None, rhoc=None, kc=None):
-        """Residuals for a single cell as a pure function of its symbols.
+                        A, P, L_seg, count, Dh):
+        """Static-level residuals for a single cell as a pure function of its
+        symbols.
 
         Shared by the direct (N == 1) path and the template build; expressed in
         terms of the passed symbols so the same code serves real and
@@ -1539,38 +2546,15 @@ class SegmentedChannel(Model):
             m_dot_avg=m_dot_avg, f_avg=f_avg, Dh_avg=Dh_avg, L=L_seg,
             z_in=z_in, z_out=z_out))
 
-        # energy
+        # energy (quasi-steady, static level)
         area_conv = count * P_avg * L_seg
         q = self.q_inflow_func(
             w_avg, p_avg, h_avg, rho_avg, T_avg, mu_avg, k_avg,
             f_avg, T_wall, Dh_avg, area_conv)
-        if self.dynamic == "advective":
-            # Conservative transient cell-energy balance on a CELL-CENTRED state.
-            # `hc` is the genuine (independent) cell enthalpy; `pc` is the face
-            # mean and `Tc`/`rhoc`/`kc` follow from the EoS.  `U` is the conserved
-            # internal energy; `der_U` is the net flux: advective enthalpy
-            # (+ kinetic) carried by the *reconstructed* face enthalpies
-            # `h_in`/`h_out`, wall heat, axial diffusion (cell-temp Laplacian),
-            # and any permeation-leak enthalpy.  At steady state (der_U -> 0, no
-            # leak) this reduces to the static balance.
-            T_ph, rho_ph, _mu_ph, k_ph = self._property_funcs()
-            V_cell = count * A * L_seg
-            eqs.append(pc - p_avg)
-            eqs.append(Tc - T_ph(pc, hc))
-            eqs.append(rhoc - rho_ph(pc, hc))
-            eqs.append(kc - k_ph(pc, hc))
-            eqs.append(U - V_cell * (rhoc * hc - pc))
-            flux = (m_dot_in * (h_in + w_in ** 2 / 2)
-                    + m_dot_out * (h_out + w_out ** 2 / 2)
-                    + q + F_diff_in - F_diff_out)
-            if self.leaky:
-                flux = flux + m_dot_leak * hc
-            eqs.append(der_U - flux)
-        else:
-            sign_w = w_avg / sp.sqrt(w_avg ** 2 + w_eps ** 2)
-            m_dot_reg = sp.sqrt(m_dot_avg ** 2 + m_eps ** 2)
-            q_specific = sign_w * q / m_dot_reg
-            eqs.append(h_in + w_in ** 2 / 2 + q_specific - (h_out + w_out ** 2 / 2))
+        sign_w = w_avg / sp.sqrt(w_avg ** 2 + w_eps ** 2)
+        m_dot_reg = sp.sqrt(m_dot_avg ** 2 + m_eps ** 2)
+        q_specific = sign_w * q / m_dot_reg
+        eqs.append(h_in + w_in ** 2 / 2 + q_specific - (h_out + w_out ** 2 / 2))
         eqs.append(q_inflow - q)
 
         if not self.heat_port:
@@ -1657,6 +2641,7 @@ class Valve(SegmentedChannel):
         dp_eps: Annotated[float, ParamSpec("Pressure-drop regulariser keeping "
                          "the sign*sqrt(|dp|) flow law smooth through dp = 0.",
                          unit="Pa")] = 1.0,
+        multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
     ):
         # Store the constructor scalars under their own names so the reflective
         # serializer can recover them (it maps each __init__ arg to a like-named
@@ -1667,10 +2652,12 @@ class Valve(SegmentedChannel):
         # A single finite-volume cell; the channel computes A = pi*D^2/4 and
         # P = pi*D from the connecting diameter.  Friction / heat are inert (the
         # momentum hook is replaced by the valve flow law), so a nominal L and
-        # zero roughness are passed.
+        # zero roughness are passed.  `multiphase="HEM"` makes the face/cell
+        # property closures dome-safe -- needed when the valve discharges a
+        # flashing (cavitating) liquid whose outlet state is two-phase.
         super().__init__(medium, D=D, L=1.0, epsilon=0.0, z_in=z_in,
                          z_out=z_out, N=1, f_factor_func=self._no_friction,
-                         q_inflow_func=self._no_heat)
+                         q_inflow_func=self._no_heat, multiphase=multiphase)
 
     @staticmethod
     def _no_friction(Re, epsilon, Dh):
@@ -1701,20 +2688,51 @@ class Valve(SegmentedChannel):
 
 
 class IncompressibleValve(Valve):
-    """Liquid / low-Mach valve sized by metric Kv with a linear opening trim.
+    """Liquid / low-Mach valve sized by metric Kv.
 
-        m_dot = (theta * Kv / 36000) * sign(dp) * sqrt(rho * |dp|)   [kg/s, Pa]
+        m_dot = (theta^n * Kv / 36000) * sign(dp) * sqrt(rho * |dp_eff|)
 
-    where ``Kv`` is the metric flow coefficient (m^3/h of water at 1 bar) and
-    ``theta`` the 0..1 opening.  Calibration: Kv=1, water (rho=1000), dp=1 bar
-    gives 0.2778 kg/s = 1 m^3/h.  Valid while compressibility is negligible
-    (``Delta p << p_1``); use `CompressibleValve` for gases at large pressure
-    ratio.  The discontinuous ``sign(dp)*sqrt(|dp|)`` is regularised as
-    ``dp / (dp^2 + dp_eps^2)^(1/4)`` so the Jacobian stays smooth through
-    ``dp = 0`` (flow reversal).
+    where ``Kv`` is the metric flow coefficient (m^3/h of water at 1 bar),
+    ``theta`` the 0..1 opening and ``n = trim_exp`` the inherent trim
+    characteristic (1 = linear, the default; ~2-3 approximates a ball /
+    quick-closing segment valve, whose flow coefficient collapses in the
+    last part of the stroke -- important when replaying a measured valve
+    position for a water-hammer event).  Calibration: Kv=1, water
+    (rho=1000), dp=1 bar gives 0.2778 kg/s = 1 m^3/h.  Valid while
+    compressibility is negligible (``Delta p << p_1``); use
+    `CompressibleValve` for gases at large pressure ratio.
+
+    Optional LIQUID CHOKING / valve cavitation (ISA 75.01 / IEC 60534-2-1),
+    enabled by passing ``p_vap``: when the vena-contracta pressure reaches
+    the vapor pressure the flow saturates at
+
+        dp_eff = min(dp, dp_choked),   dp_choked = FL^2 * (p_up - FF*p_vap)
+
+    with ``FL`` the liquid pressure-recovery factor (~0.9 full-bore ball) and
+    ``FF`` the liquid critical-pressure-ratio factor
+    (``0.96 - 0.28*sqrt(p_vap/p_crit)``): the downstream pressure then no
+    longer influences the flow, which is the correct physics for a valve
+    discharging near/below the vapor pressure (flashing).  The upstream
+    density is used in the choked law (the downstream face may be a
+    two-phase mixture -- combine with ``multiphase="HEM"`` so the outlet
+    property closures are dome-safe).  The choke clamp and the upstream
+    selection use smooth min/max (`p_eps`), and the discontinuous
+    ``sign(dp)*sqrt(|dp|)`` is regularised as
+    ``dp / (dp^2 + dp_eps^2)^(1/4)``, so the Jacobian stays smooth through
+    ``dp = 0`` and the onset of choking.
     """
 
     UI_ICON = "valve.svg"
+    #: `choked` (p_vap given or not) and the baked trim exponent change the
+    #: emitted equation structure -> keep template-cache variants distinct.
+    _cache_key_flags = SegmentedChannel._cache_key_flags + (
+        "choked", "trim_exp")
+    #: `choked` is COMPUTED (True iff `p_vap` was given), not a constructor
+    #: arg, so its catalog-literal description lives here.
+    PARAMS = {"choked": ParamSpec(
+        "Computed flag: True when `p_vap` is given, i.e. the ISA "
+        "liquid-choking (valve cavitation / flashing) clamp is active in "
+        "the momentum equation.")}
 
     def __init__(
         self,
@@ -1723,20 +2741,97 @@ class IncompressibleValve(Valve):
                      "water at 1 bar pressure drop).", unit="m^3/h",
                      default=1.0)],
         D, opening=1.0, z_in=0.0, z_out=0.0, dp_eps=1.0,
+        trim_exp: Annotated[float, ParamSpec(
+            "Inherent trim characteristic exponent n in Kv_eff = Kv*theta^n: "
+            "1 = linear (default), ~2-3 approximates a ball valve.",
+            structural=True)] = 1.0,
+        p_vap: Annotated[float, ParamSpec(
+            "Fluid vapor pressure at the operating temperature [Pa]; enables "
+            "the ISA liquid-choking (valve cavitation / flashing) clamp.  "
+            "None (default) = no choking.", unit="Pa")] = None,
+        FL: Annotated[float, ParamSpec(
+            "Liquid pressure-recovery factor (ISA 75.01): ~0.9 full-bore "
+            "ball, ~0.85-0.9 globe.", relevant_when={"choked": True})] = 0.9,
+        FF: Annotated[float, ParamSpec(
+            "Liquid critical-pressure-ratio factor "
+            "(0.96 - 0.28*sqrt(p_vap/p_crit)).",
+            relevant_when={"choked": True})] = 0.96,
+        p_eps: Annotated[float, ParamSpec(
+            "Smoothing scale [Pa] of the choke clamp and upstream-pressure "
+            "selection.", unit="Pa",
+            relevant_when={"choked": True})] = 1.0,
+        multiphase: str = "single",
     ):
         self.Kv = Kv
+        self.trim_exp = float(trim_exp)
+        if self.trim_exp <= 0:
+            raise ValueError(
+                f"IncompressibleValve: trim_exp must be > 0, got {trim_exp!r}")
+        self.choked = p_vap is not None
+        self.FL = float(FL)
+        self.FF = float(FF)
+        self.p_eps = float(p_eps)
+        # The SegmentedChannel base has its own `p_vap` constructor argument
+        # (pipe cavitation, default None) and assigns the attribute inside
+        # super().__init__ -- BEFORE declare_components() runs.  Keep the
+        # valve's value in a private slot that declare_components reads, and
+        # restore the public attribute afterwards for the serializer.
+        self._p_vap_valve = None if p_vap is None else float(p_vap)
         super().__init__(medium, D, opening=opening, z_in=z_in, z_out=z_out,
-                         dp_eps=dp_eps)
+                         dp_eps=dp_eps, multiphase=multiphase)
+        self.p_vap = self._p_vap_valve
 
     def declare_components(self):
         super().declare_components()
+        spec = merged_param_specs(type(self))
         self.add_component('Kv', Parameter(self.Kv,
-                                           **merged_param_specs(type(self))['Kv'].param_kwargs()))
+                                           **spec['Kv'].param_kwargs()))
+        if self.choked:
+            self.add_component('p_vap', Parameter(
+                self._p_vap_valve, **spec['p_vap'].param_kwargs()))
+            self.add_component('FL', Parameter(
+                self.FL, **spec['FL'].param_kwargs()))
+            self.add_component('FF', Parameter(
+                self.FF, **spec['FF'].param_kwargs()))
+            self.add_component('p_eps', Parameter(
+                self.p_eps, **spec['p_eps'].param_kwargs()))
 
     def _valve_flow(self, dp, rho_avg, theta):
         C = self['Kv'].symbol / 36000.0
         dp_eps = self['dp_eps'].symbol
-        return C * theta * sp.sqrt(rho_avg) * dp / (dp ** 2 + dp_eps ** 2) ** 0.25
+        th = theta if self.trim_exp == 1.0 else theta ** self.trim_exp
+        if not self.choked:
+            return (C * th * sp.sqrt(rho_avg)
+                    * dp / (dp ** 2 + dp_eps ** 2) ** 0.25)
+
+        FL = self['FL'].symbol
+        FF = self['FF'].symbol
+        pv = self['p_vap'].symbol
+        p_eps = self['p_eps'].symbol
+        p_in = self['p_0'].symbol
+        p_out = self['p_1'].symbol
+        rho_in = self['rho_0'].symbol
+        rho_out = self['rho_1'].symbol
+
+        def smax(a, b):
+            return 0.5 * (a + b + sp.sqrt((a - b) ** 2 + p_eps ** 2))
+
+        def smin(a, b):
+            return 0.5 * (a + b - sp.sqrt((a - b) ** 2 + p_eps ** 2))
+
+        # Upstream pressure / (liquid) density picked smoothly by flow
+        # direction -- the downstream face may be a flashing two-phase
+        # mixture whose density must NOT enter the sizing law.
+        s = dp / sp.sqrt(dp ** 2 + dp_eps ** 2)             # smooth sign(dp)
+        frac = 0.5 * (1 + s)                                # ~1 fwd, ~0 rev
+        p_up = smax(p_in, p_out)
+        rho_up = frac * rho_in + (1 - frac) * rho_out
+        # ISA liquid-choking clamp (floored at p_eps so the sqrt stays real
+        # even if an iterate drags p_up below FF*p_vap).
+        dp_choke = FL ** 2 * smax(p_up - FF * pv, p_eps)
+        dp_used = smin(smax(dp, -dp_choke), dp_choke)
+        return (C * th * sp.sqrt(rho_up)
+                * dp_used / (dp_used ** 2 + dp_eps ** 2) ** 0.25)
 
 
 class CompressibleValve(Valve):

@@ -4,7 +4,7 @@ The top-level package exposes the modelling *framework* and tooling:
 
     from hydrogen import (
         Model, Parameter, Variable, DifferentialVariable, Input,  # framework
-        CoolPropMedium, FeosMedium,                              # media
+        CoolPropMedium, FeosMedium, TabulatedMedium,             # media
         Interpolation1D, Interpolation2D,                        # interpolation utilities
         IntegrationTest, SimpleODE, InnerODE_1, InnerODE_2,      # ODE test sub-models
         plot_results,                                            # plotting
@@ -28,6 +28,7 @@ respective submodules; import directly from there if you need them.
 """
 
 from .medium import CoolPropMedium, FeosMedium, get_symbolic_property_function
+from .tabulated import TabulatedMedium
 from .model import (
     DifferentialVariable,
     EquationCacheValidationError,
@@ -70,6 +71,7 @@ __all__ = [
     # medium
     "CoolPropMedium",
     "FeosMedium",
+    "TabulatedMedium",
     "get_symbolic_property_function",
     # port machinery (generic)
     "Port",

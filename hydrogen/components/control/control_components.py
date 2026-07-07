@@ -29,9 +29,11 @@ Crank-Nicolson even when feeding a differential block.  See the domain
 
 from __future__ import annotations
 
+import csv as _csv
 import math
 from typing import Annotated
 
+import numpy as np
 import sympy as sp
 
 from ...model import DifferentialVariable, Input, Model, Parameter, Variable
@@ -321,6 +323,85 @@ class SmoothRamp(_TimeSource):
         return (self.offset + 0.5 * self.height
                 + 0.5 * slope * w
                 * (self._logcosh((t - a) / w) - self._logcosh((t - b) / w)))
+
+
+class CsvTable(_TimeSource):
+    """Replay one column of a CSV file as a time-interpolated signal ``y(t)``.
+
+    A data-driven source (the analogue of Modelica's ``CombiTimeTable``): reads
+    `filename` once at construction, uses `time_column` as the time base and
+    `value_column` as the data, and emits ``y(t)`` by linear interpolation,
+    held flat outside the recorded span.  An optional affine transform
+    ``value_scale * raw + value_offset`` rescales the column (e.g. degC -> K
+    with ``value_offset=273.15``), and `time_scale` converts the time column
+    into seconds.
+
+    Columns may be named (matched against the header row) or given as integer
+    indices.  Because the underlying `Input` carries the value at both ends of
+    each step, a downstream differential block stays second-order accurate.
+
+    Typical use -- drive a `flow.TemperatureInlet` from measured data::
+
+        tin = CsvTable("PipeDataULg151202.csv", value_column="water_inlet",
+                       value_offset=273.15, unit="K")
+        self.connect(tin.ports["y"], inlet.ports["T_set"])
+    """
+
+    UI_ICON = "constant.svg"
+
+    def __init__(
+        self,
+        filename: Annotated[str, ParamSpec("Path to the CSV file to read.")],
+        value_column: Annotated[str, ParamSpec("Column (header name or integer "
+                               "index) replayed as the output signal.")],
+        time_column: Annotated[str, ParamSpec("Column (header name or integer "
+                              "index) holding the time base.")] = "time",
+        value_scale: Annotated[float, ParamSpec("Output = value_scale * raw + "
+                              "value_offset.")] = 1.0,
+        value_offset: Annotated[float, ParamSpec("Output = value_scale * raw + "
+                               "value_offset (e.g. 273.15 for degC -> K).")]
+        = 0.0,
+        time_scale: Annotated[float, ParamSpec("Multiplier converting the time "
+                             "column into seconds.")] = 1.0,
+        unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
+    ):
+        self.filename = filename
+        self.value_column = value_column
+        self.time_column = time_column
+        self.value_scale = value_scale
+        self.value_offset = value_offset
+        self.time_scale = time_scale
+        self.unit = unit
+        self._t, self._v = self._load()
+        super().__init__()
+
+    def _load(self):
+        with open(self.filename, newline="") as fh:
+            rows = list(_csv.DictReader(fh))
+        if not rows:
+            raise ValueError(f"CsvTable: {self.filename!r} has no data rows")
+        header = list(rows[0].keys())
+
+        def resolve(spec):
+            if spec in header:
+                return spec
+            try:
+                return header[int(spec)]
+            except (ValueError, IndexError, TypeError):
+                raise KeyError(
+                    f"CsvTable: column {spec!r} not found in header {header}")
+
+        tc = resolve(self.time_column)
+        vc = resolve(self.value_column)
+        t = np.array([float(r[tc]) for r in rows]) * self.time_scale
+        v = np.array([float(r[vc]) for r in rows]) * self.value_scale \
+            + self.value_offset
+        order = np.argsort(t, kind="stable")
+        return t[order], v[order]
+
+    def signal(self, t):
+        # np.interp holds the end values flat outside the span (no extrapolation).
+        return float(np.interp(float(t), self._t, self._v))
 
 
 # ---------------------------------------------------------------------------

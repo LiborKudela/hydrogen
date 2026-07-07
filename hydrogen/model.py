@@ -1148,6 +1148,34 @@ class Model:
                     dyn.add(s)
         return dyn
 
+    def _differential_state_symbols(self):
+        """Set of symbols backing `DifferentialVariable` STATES.
+
+        The linear eliminators must never pivot on (i.e. substitute away) a
+        differential state: the time steppers advance these states through
+        their `prev` slots (`_get_diff_state_indices`; TR-BDF2's BDF2 stage
+        folds `c2*x_n + c1*x_gamma` into the state's prev value), and the
+        Crank-Nicolson closure equation references `x_prev`.  If the state's
+        symbol is substituted out, the prev-slot writes land on a slot no
+        surviving equation reads, silently freezing the state's dynamics
+        (observed as broken mass conservation when a global pressure state
+        was inlined as `mean(pc)` by the linear-block pass).
+
+        Derivative companions (`der_x`) are deliberately NOT included: the
+        steppers tolerate an inlined derivative definition (see
+        `_get_diff_state_indices`)."""
+        states = set()
+
+        def _walk(node):
+            if isinstance(node, DifferentialVariable) and node.symbol is not None:
+                states.add(node.symbol)
+            if isinstance(node, Model):
+                for child in node.components.values():
+                    _walk(child)
+
+        _walk(self)
+        return states
+
     @staticmethod
     def _close_substitutions(substitutions):
         """Resolve chains in `substitutions` so each value only references symbols
@@ -1160,19 +1188,39 @@ class Model:
         cache = {}
         visiting = set()
 
-        def resolve(k):
-            if k in cache:
-                return cache[k]
-            if k in visiting:
-                raise ValueError(f"Cycle in trivial-equation substitutions involving {k}")
-            visiting.add(k)
-            v = substitutions[k]
-            deps = v.free_symbols & keys
-            if deps:
-                v = v.xreplace({d: resolve(d) for d in deps})
-            visiting.discard(k)
-            cache[k] = v
-            return v
+        # Iterative post-order DFS: a long substitution chain (e.g. the
+        # ~N-deep face-pressure chain of a finely-segmented pipe) used to
+        # blow Python's recursion limit around N ~ 1000 cells.
+        def resolve(root):
+            stack = [(root, False)]
+            while stack:
+                k, expanded = stack.pop()
+                if k in cache:
+                    continue
+                v = substitutions[k]
+                deps = v.free_symbols & keys
+                if expanded:
+                    visiting.discard(k)
+                    cache[k] = v.xreplace({d: cache[d] for d in deps}) \
+                        if deps else v
+                    continue
+                todo = [d for d in deps if d not in cache]
+                if not todo:
+                    cache[k] = v.xreplace({d: cache[d] for d in deps}) \
+                        if deps else v
+                    continue
+                if k in visiting:
+                    raise ValueError(
+                        f"Cycle in trivial-equation substitutions involving {k}")
+                visiting.add(k)
+                stack.append((k, True))
+                for d in todo:
+                    if d in visiting:
+                        raise ValueError(
+                            f"Cycle in trivial-equation substitutions "
+                            f"involving {d}")
+                    stack.append((d, False))
+            return cache[root]
 
         for k in list(substitutions.keys()):
             substitutions[k] = resolve(k)
@@ -1214,6 +1262,7 @@ class Model:
         var_symbols_list = list(var_symbols)
         var_set = set(var_symbols_list)
         raw_var_set = set(self.raw_var_symbols)
+        diff_state_set = self._differential_state_symbols()
         current_to_prev = {var.symbol: var.prev_symbol for var in self.raw_vars_references}
         # Parameter-coefficient mode: classify linearity in the variables while
         # treating Parameters as part of the constant coefficient field.
@@ -1258,10 +1307,13 @@ class Model:
                 continue
 
             # Only true Variables that are still surviving and not already eliminated
-            # this pass are eligible.
+            # this pass are eligible.  Differential states are never eligible:
+            # eliminating one breaks the stepper's prev-slot advancement (see
+            # `_differential_state_symbols`).
             candidates = [
                 s for s in coeffs
                 if s in raw_var_set and s in var_set and s not in removed_vars
+                and s not in diff_state_set
             ]
             if allow_param_coeffs:
                 # Guard 1 (safe division): only eliminate a variable whose own
@@ -1390,6 +1442,7 @@ class Model:
         """
         raw_var_set = set(self.raw_var_symbols)
         var_set = set(var_symbols)
+        diff_state_set = self._differential_state_symbols()
         current_to_prev = {var.symbol: var.prev_symbol for var in self.raw_vars_references}
 
         # `signatures[(coeff, rest)] = (var, idx)` -- first equation registered
@@ -1459,9 +1512,41 @@ class Model:
                 existing = signatures.get(sig)
                 if existing is None:
                     continue
-                keeper_var, _ = existing
-                if keeper_var is var or keeper_var in removed_vars:
+                keeper_var, keeper_idx = existing
+                if keeper_var is var:
+                    # Exact structural duplicate: same coeff, rest AND leaf, so
+                    # `coeff*var + rest` is the identical equation.  Drop the
+                    # redundant copy outright (no rename needed).  This is the
+                    # capacitive-node-merge case -- two heat-capacity surface
+                    # nodes wired together (e.g. adjacent dynamic wall layers)
+                    # collapse their two now-identical state closures into one.
+                    if idx != keeper_idx:
+                        drop_indices.add(idx)
+                        matched = True
+                        break
                     continue
+                if keeper_var in removed_vars:
+                    continue
+                # Differential states must survive renames: the steppers
+                # advance them through their prev slots (see
+                # `_differential_state_symbols`).  If the dup leaf is a diff
+                # state, either flip the rename direction (algebraic keeper
+                # absorbed by the state) or -- when both are diff states --
+                # leave the pair alone.
+                if var in diff_state_set:
+                    if keeper_var in diff_state_set:
+                        continue
+                    duplicate_subs[keeper_var] = var
+                    removed_vars.add(keeper_var)
+                    var_prev = current_to_prev.get(var)
+                    keeper_prev = current_to_prev.get(keeper_var)
+                    if var_prev is not None and keeper_prev is not None:
+                        duplicate_subs[keeper_prev] = var_prev
+                        removed_vars.add(keeper_prev)
+                    signatures[sig] = (var, idx)
+                    drop_indices.add(keeper_idx)
+                    matched = True
+                    break
                 duplicate_subs[var] = keeper_var
                 removed_vars.add(var)
                 var_prev = current_to_prev.get(var)
@@ -1488,7 +1573,7 @@ class Model:
                 if sig not in signatures:
                     signatures[sig] = (var, idx)
 
-        if not duplicate_subs:
+        if not duplicate_subs and not drop_indices:
             print("No duplicate equations found")
             return equations, var_symbols, {}
 
@@ -1973,6 +2058,7 @@ class Model:
         """
         raw_var_set = set(self.raw_var_symbols)
         var_set = set(var_symbols)
+        diff_state_set = self._differential_state_symbols()
         current_to_prev = {v.symbol: v.prev_symbol for v in self.raw_vars_references}
         param_set = set(self.raw_param_symbols) if allow_param_coeffs else None
         dynamic_param_set = self._dynamic_param_symbols() if allow_param_coeffs else set()
@@ -2032,8 +2118,15 @@ class Model:
             if len(live) < 2:
                 continue
 
+            # Differential states must survive as pivot targets: substituting
+            # one away breaks the stepper's prev-slot advancement (see
+            # `_differential_state_symbols`).
+            pivot_pool = {s: c for s, c in live.items() if s not in diff_state_set}
+            if not pivot_pool:
+                continue
+
             pivot = min(
-                live.keys(),
+                pivot_pool.keys(),
                 key=lambda s: (var_usage.get(s, 0), s.name),
             )
             cp = live[pivot]
@@ -2110,7 +2203,8 @@ class Model:
     def instantiate(self, cse=True, aditional_modules=None, max_remove_trival_passes=1,
                     lambda_cache_dir=None, max_remove_duplicate_passes=5,
                     enable_blt=True, max_remove_linear_block_passes=3,
-                    enable_var_scaling=False, eliminate_param_linear=None):
+                    enable_var_scaling=True, eliminate_param_linear=None,
+                    numba=False):
         # Step B's `declare_equations()` template cache is scoped to this single
         # `instantiate()` call to avoid cross-call contamination (e.g. Air's
         # `Air_rho_ph` Function nodes leaking into a subsequent Hydrogen
@@ -2135,6 +2229,7 @@ class Model:
                     max_remove_linear_block_passes=max_remove_linear_block_passes,
                     enable_var_scaling=enable_var_scaling,
                     eliminate_param_linear=eliminate_param_linear,
+                    numba=numba,
                 )
         finally:
             _eq_cache_var.reset(_eq_cache_token)
@@ -2144,7 +2239,8 @@ class Model:
                           max_remove_trival_passes=1, lambda_cache_dir=None,
                           max_remove_duplicate_passes=5, enable_blt=True,
                           max_remove_linear_block_passes=3,
-                          enable_var_scaling=False, eliminate_param_linear=None):
+                          enable_var_scaling=True, eliminate_param_linear=None,
+                          numba=False):
         if aditional_modules is None:
             aditional_modules = []
         # Parameter-coefficient linear elimination (treat Parameters as constant
@@ -2264,6 +2360,40 @@ class Model:
                 uf_sign[s] = sign_self
                 return root, sign_self
 
+            # Symbols backing a `DifferentialVariable` state MUST survive
+            # connection elimination.  The time integrator locates states by
+            # walking the component tree for `DifferentialVariable` instances
+            # (`_get_diff_state_indices` / `_get_diff_var_index_pairs`); if a
+            # state's symbol is absorbed into a plain (algebraic) representative
+            # -- e.g. a fluid cell's `T_wall_i` alias swallowing a wall layer's
+            # differential `T_a` purely because its name sorts first -- the
+            # state silently drops out of the integrated set and the TR-BDF2
+            # stage handling no longer advances it, corrupting its dynamics.
+            # Rank state symbols ahead of algebraic ones so they are kept.
+            diff_state_symbols = set()
+
+            # state-symbol -> (der-symbol, der-prev-symbol) for capacitive-node
+            # merging (see the connection_subs loop below).
+            diff_state_der = {}
+
+            def _collect_diff_states(node):
+                if isinstance(node, DifferentialVariable) and node.symbol is not None:
+                    diff_state_symbols.add(node.symbol)
+                    dv = node.der_variable
+                    if dv is not None and dv.symbol is not None:
+                        diff_state_der[node.symbol] = (dv.symbol, dv.prev_symbol)
+                if isinstance(node, Model):
+                    for child in node.components.values():
+                        _collect_diff_states(child)
+
+            _collect_diff_states(self)
+
+            def _rep_key(s):
+                # Smaller key wins as representative; differential-state symbols
+                # rank first (0) so they absorb algebraic partners, never the
+                # other way round.  Name breaks ties deterministically.
+                return (0 if s in diff_state_symbols else 1, s.name)
+
             def union(a, b, sign):
                 """Add the constraint `a == sign * b`."""
                 ra, sa = find(a)
@@ -2280,9 +2410,10 @@ class Model:
                 # Want:  sa * ra == sign * sb * rb
                 #   ->   ra == (sign * sb / sa) * rb   (sa, sb in {+1, -1})
                 rel_ab = sign * sb * sa  # +/-1
-                # Deterministic: smaller symbol-name wins as representative.
-                if rb.name < ra.name:
-                    # Flip so the smaller-named root absorbs the other.
+                # Deterministic: lower-ranked symbol wins as representative
+                # (differential states first, then by name).
+                if _rep_key(rb) < _rep_key(ra):
+                    # Flip so the preferred root absorbs the other.
                     uf_parent[ra] = rb
                     uf_sign[ra] = rel_ab
                 else:
@@ -2332,6 +2463,24 @@ class Model:
                 pr = current_to_prev.get(rep)
                 if ps is not None and pr is not None:
                     connection_subs[ps] = pr if sign_to_rep == +1 else -pr
+
+                # Capacitive-node merge: when the eliminated symbol `s` and its
+                # representative `rep` are BOTH differential states (two heat-
+                # capacity surface nodes wired together, e.g. adjacent dynamic
+                # wall layers sharing an interface), forcing `s == sign*rep`
+                # also forces `der_s == sign*der_rep`.  Aliasing the derivative
+                # companions makes both nodes' `C*der = ...` ODEs constrain the
+                # SAME derivative, so the capacities add into one combined node
+                # ((C_s + C_rep)*der = RHS_s + RHS_rep) -- the correct index
+                # reduction.  Without this the eliminated node's derivative is
+                # orphaned and the Jacobian is structurally singular.
+                if s in diff_state_der and rep in diff_state_der:
+                    der_s, der_s_prev = diff_state_der[s]
+                    der_rep, der_rep_prev = diff_state_der[rep]
+                    connection_subs[der_s] = der_rep if sign_to_rep == +1 else -der_rep
+                    if der_s_prev is not None and der_rep_prev is not None:
+                        connection_subs[der_s_prev] = (
+                            der_rep_prev if sign_to_rep == +1 else -der_rep_prev)
 
             if connection_subs:
                 self.improved_equations = [
@@ -2553,24 +2702,80 @@ class Model:
         # that vanished to a constant (`0`) after the trivial / connection
         # reducer are dropped here -- they're tautologies that contribute
         # nothing to either the residual or the Jacobian.
+        #
+        # For a segmented model the N interior cells emit N structurally
+        # IDENTICAL equations that all collapse to one template.  The naive way
+        # to discover that -- build the placeholder-substituted `template`
+        # expression (a full sympy `xreplace`, which rebuilds the whole tree)
+        # for EVERY equation and group by expression equality -- costs one
+        # sympy tree rebuild + one sympy hash per equation, i.e. O(N * expr)
+        # sympy work that dominates this phase at large N even though there are
+        # only a handful of distinct templates.
+        #
+        # Instead we compute a cheap *structural key* in a single preorder walk
+        # (a flat token stream with each symbol replaced by its first-occurrence
+        # index) and use it purely as a fast cache for the expensive
+        # `xreplace`: the FIRST equation of each key materialises the real
+        # `template`, and subsequent equations with the same key reuse that same
+        # template object (an O(1) dict hit -- its sympy hash is memoised on the
+        # object) instead of rebuilding + re-hashing the tree.
+        #
+        # The grouping itself stays keyed by the template EXPRESSION, exactly as
+        # the legacy path, so behaviour is identical.  This matters because the
+        # structural key is intentionally allowed to be *finer* than template
+        # equality: commutative reorderings (e.g. `a*b + a` vs `c*d + d`) yield
+        # different token streams but the SAME canonical sympy template, and
+        # grouping by the template expression re-merges them.  Keying the final
+        # groups by the token stream instead would wrongly split (and, on
+        # re-key, silently drop) those instances.
+        key_to_template = {}   # structural key -> representative template expr
         template_to_instances = {}
         n_constant_dropped = 0
+        _Symbol = sp.Symbol
         for i, eq in enumerate(improved_equations_list):
+            # Single preorder walk (matches `sp.preorder_traversal` order):
+            # emit a flat token stream capturing the tree structure and collect
+            # the equation's symbols in first-occurrence order.
             sym_order = []
-            sym_to_ph = {}
-            for atom in sp.preorder_traversal(eq):
-                if isinstance(atom, sp.Symbol) and atom not in sym_to_ph:
-                    ph = _placeholder(len(sym_to_ph))
-                    sym_to_ph[atom] = ph
-                    sym_order.append(atom)
+            sym_to_idx = {}
+            tokens = []
+            tok_append = tokens.append
+            stack = [eq]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, _Symbol):
+                    idx = sym_to_idx.get(node)
+                    if idx is None:
+                        idx = len(sym_order)
+                        sym_to_idx[node] = idx
+                        sym_order.append(node)
+                    tok_append(idx)          # placeholder slot for this symbol
+                    continue
+                if node.is_Number:
+                    tok_append(node)         # exact numeric literal (kept as-is)
+                    continue
+                args = node.args
+                tok_append((type(node), len(args)))
+                # Push children reversed so they pop in natural preorder order.
+                for a in reversed(args):
+                    stack.append(a)
             if not sym_order:
-                # Constant equation -- assert it actually evaluates to 0; if
-                # not, the reducer would have produced an infeasibility row
-                # which we keep so the Newton solver still surfaces it.
+                # Constant equation -- drop a tautological `0` row; keep a
+                # non-zero constant as an infeasibility row the solver surfaces.
                 if eq == 0:
                     n_constant_dropped += 1
                     continue
-            template = eq.xreplace(sym_to_ph) if sym_order else eq
+            key = tuple(tokens)
+            template = key_to_template.get(key)
+            if template is None:
+                # First equation of this structural key: build the placeholder
+                # template exactly as the legacy path did (same first-occurrence
+                # placeholder order) -- byte-identical templates, hence
+                # unchanged lambda-cache keys.
+                template = (eq.xreplace({s: _placeholder(k)
+                                         for k, s in enumerate(sym_order)})
+                            if sym_order else eq)
+                key_to_template[key] = template
             template_to_instances.setdefault(template, []).append((i, sym_order))
 
         n_eq = len(improved_equations_list)
@@ -2623,17 +2828,33 @@ class Model:
             # a different cache key from the Matrix form, so on-disk cache
             # entries from prior versions are naturally ignored (left
             # in-place; harmless).
-            exprs_list = [template] + [sp.diff(template, ph) for ph in placeholders]
             args_mat = sp.Matrix(placeholders)
             label = f"template_{tid:02d}"
             cached_func = None
             key = None
             if self._lambda_cache_dir is not None:
-                key = lambda_cache_key(args_mat, exprs_list, self._lambda_modules_sig, cse)
+                # Key on the TEMPLATE (residual) alone.  The Jacobian rows are a
+                # deterministic function of it -- `sp.diff` wrt the fixed
+                # placeholders -- so differentiating the whole block and
+                # serialising it (the old key input) just to LOOK UP the cache
+                # was pure overhead that ran on every instantiate, hit or miss.
+                # For heavy templates (e.g. the `compressible` momentum/energy
+                # rows) that `sp.diff` + pickle dominated the "lambdify" phase
+                # even when every template was a cache hit.  Keying on the
+                # template defers `sp.diff` to the miss path below.
+                key = lambda_cache_key(args_mat, template,
+                                       self._lambda_modules_sig, cse)
                 namespace = self._build_lambdify_namespace(all_modules)
                 cached_func = load_lambdified_source(self._lambda_cache_dir, key, namespace)
                 if cached_func is not None:
                     print(f"  [lambda-cache HIT  for {label}: {key[:8]}]")
+            # The differentiated block is only needed to LAMBDIFY (cache miss)
+            # or to scan for numba twins; skip the expensive `sp.diff` on a
+            # plain cache hit.
+            exprs_list = None
+            if cached_func is None or numba:
+                exprs_list = [template] + [sp.diff(template, ph)
+                                           for ph in placeholders]
             prep_per_template.append({
                 "label": label, "tid": tid, "n_ph": n_ph,
                 "instances": instances, "template": template,
@@ -2943,6 +3164,22 @@ class Model:
                         continue
                     g[name] = _vectorise_callable(raw)
 
+        # ---- Optional numba JIT of the vectorised templates -----------------
+        # Re-lambdify each vectorised template with a numba-friendly printer
+        # (nested minimum/maximum/where instead of reduce/select) and the
+        # medium callbacks' `@njit` twins (attached by `TabulatedMedium` as
+        # `_hydrogen_numba`), then compile the whole template in nopython
+        # mode.  Templates whose medium calls have no njit twin, or that fail
+        # numba typing, silently keep the numpy path.
+        if numba:
+            _t0_numba = time.time()
+            if n_vec:
+                self._numba_jit_templates(
+                    prep_per_template, aditional_modules, cse)
+            else:
+                print("  [numba: no vectorised templates to jit]")
+            _timings.append(("numba JIT", time.time() - _t0_numba, []))
+
         def _eval_per_template(*args):
             """Hybrid per-template residual + Jacobian evaluator.
 
@@ -2970,7 +3207,7 @@ class Model:
                     inputs = vals_arr[idx_mat]
                     out_list = f(*inputs)
                     rows = np.empty((n_outputs, n_inst_t))
-                    if isinstance(out_list, list):
+                    if isinstance(out_list, (list, tuple)):
                         # `out_list` items can be either arrays of shape
                         # `(n_inst_t,)` or scalars (entries that CSE-folded
                         # to a constant).  Broadcast either case via a
@@ -3231,6 +3468,89 @@ class Model:
             save_lambdified_source(cache_dir, key, func, self._lambda_modules_sig)
             print(f"  [lambda-cache MISS for {label}: {key[:8]} (saved)]")
         return func
+
+    def _numba_jit_templates(self, prep_per_template, aditional_modules, cse):
+        """Compile the vectorised equation templates in numba nopython mode.
+
+        For each vectorised template, re-lambdify with `NumbaFriendlyPrinter`
+        (nested ``minimum``/``maximum``/``where`` instead of ``reduce`` /
+        ``select``) against the medium callbacks' ``@njit`` twins, wrap in
+        ``numba.njit`` and compile eagerly on dummy arrays.  Successful
+        templates replace their numpy lambda in `self._template_lambdas`;
+        anything else (no njit twin available, numba typing failure) keeps
+        the numpy path.  Purely a runtime optimisation -- values are
+        identical (the printer rewrites are exact and the twins mirror the
+        numpy table evaluation).
+        """
+        try:
+            import numba as _nb
+        except ImportError:
+            print("  [numba requested but not installed; keeping numpy path]")
+            return
+        from .numerics import NumbaFriendlyPrinter, lambdify_compat
+
+        t0 = time.time()
+        # Mirror the printer settings sympy's lambdify uses internally;
+        # `allow_unknown_functions` makes the medium callbacks (`Water_rho_ph`
+        # etc.) print as plain calls resolved from the injected modules.
+        printer = NumbaFriendlyPrinter({
+            "fully_qualified_modules": False, "inline": True,
+            "allow_unknown_functions": True,
+        })
+        medium_fns = {}
+        for m in aditional_modules:
+            if isinstance(m, dict):
+                medium_fns.update({k: v for k, v in m.items() if callable(v)})
+
+        n_ok = 0
+        skipped = []
+        for tid, use_vec in enumerate(self._vec_template_use):
+            if not use_vec:
+                continue
+            prep = prep_per_template[tid]
+            # Scan the WHOLE lambdified block (residual + Jacobian rows):
+            # differentiating a property call introduces new function names
+            # (`Water_T_ph` -> `Water_dT_ph_dp`) that only appear in the
+            # derivative rows.
+            needed = {type(f).__name__
+                      for expr in prep["block"]
+                      for f in expr.atoms(sp.Function)}
+            needed_medium = needed & set(medium_fns)
+            twins = {}
+            missing = None
+            for name in needed_medium:
+                twin = getattr(medium_fns[name], "_hydrogen_numba", None)
+                if twin is None:
+                    missing = name
+                    break
+                twins[name] = twin
+            if missing is not None:
+                skipped.append((prep["label"], f"no njit twin: {missing}"))
+                continue
+            try:
+                fn = lambdify_compat(
+                    prep["args_mat"], tuple(prep["block"]),
+                    modules=[twins, "numpy"], cse=cse, docstring_limit=-1,
+                    printer=printer,
+                )
+                jit = _nb.njit(cache=False, nogil=True)(fn)
+                dummy = [np.full(2, 1.05) for _ in range(prep["n_ph"])]
+                with np.errstate(all="ignore"):
+                    jit(*dummy)                       # eager compile
+            except Exception as exc:                  # typing/lowering error
+                skipped.append(
+                    (prep["label"], f"{type(exc).__name__}: {exc}"))
+                continue
+            self._template_lambdas[tid] = jit
+            n_ok += 1
+        n_vec = sum(self._vec_template_use)
+        print(f"  [numba: {n_ok}/{n_vec} vectorised templates jitted in "
+              f"{time.time() - t0:.1f} s"
+              + (f"; {len(skipped)} kept numpy path" if skipped else "")
+              + "]")
+        for label, why in skipped:
+            print(f"    - {label}: {str(why)[:160]}")
+        self._numba_template_stats = {"jitted": n_ok, "skipped": skipped}
 
     @staticmethod
     def _build_lambdify_namespace(modules):
@@ -3759,7 +4079,7 @@ class Model:
 
     @line_profiler.profile
     def initialise(self, n=1, relaxation=1.0, tol=1e-6, max_iter=100,
-                   line_search=False):
+                   line_search=False, steady=False, steady_dt=1e6):
         """Set the system to a Newton-consistent state at t = 0.
 
         For weakly-coupled or smoothly-conditioned problems the default
@@ -3770,6 +4090,21 @@ class Model:
         damp the first few iterations and avoid overshooting into infeasible
         thermodynamic states, or pass `line_search=True` to let a backtracking
         line search pick the step length automatically (see `custom_solve`).
+
+        With the default `steady=False` the solve runs at `dt = 0`, which
+        PINS every `DifferentialVariable` at its seeded value (the closure
+        degenerates to `x = x_prev`) and lets the derivative companions
+        absorb whatever imbalance the seeding carries.  That is the right
+        semantics when the initial state is genuinely transient (e.g. a
+        vessel that starts charging at t = 0: `der_x` comes out as the true
+        initial rate).  But when the run is meant to START FROM STEADY STATE,
+        a seeding inconsistency leaves large spurious derivative values that
+        poison adaptive-stepper error estimates on the first steps.  Pass
+        `steady=True` to append a relaxation to the true steady state: one
+        L-stable implicit-Euler step of size `steady_dt` (default 1e6 s) with
+        the clock held at t = 0 (Inputs keep their t=0 values), after which
+        every surviving derivative is ~0 and the states sit on the steady
+        solution.
         """
         self.set_t_values([0.0, 0.0, 0.0])
         init_values = np.array([var.value for var in self.active_vars_references])
@@ -3780,6 +4115,16 @@ class Model:
         self.custom_solve(tol=tol, max_iter=max_iter, relaxation=relaxation,
                           line_search=line_search)
         self.next_step()
+        if steady:
+            self.set_scheme_coeffs(1.0, 0.0, 1.0, 0.0)   # implicit Euler
+            self.set_dt(steady_dt)
+            self.set_t(0.0)
+            self.set_t_prev(0.0)
+            self.custom_solve(tol=tol, max_iter=max_iter, relaxation=relaxation,
+                              line_search=line_search)
+            self.set_scheme_coeffs(*_CN_COEFFS)
+            self.set_t_values([0.0, 0.0, 0.0])
+            self.next_step()
 
     def update_delta(self):
         # BLT path: per-block forward substitution.  For feed-forward
@@ -4012,6 +4357,23 @@ class Model:
                 # record the failure so `raise_on_no_convergence` callers
                 # (every adaptive strategy) reject the step and retry at a
                 # smaller dt instead of crashing the whole run.
+                self._last_solve_error_norm = np.inf
+                self._last_solve_iters = i
+                if raise_on_no_convergence:
+                    raise NewtonConvergenceFailure(np.inf, i, max_iter, tol) from exc
+                return guess
+            except RuntimeError as exc:
+                # SuperLU (`splu`) raises `RuntimeError("Factor is exactly
+                # singular")` when the Jacobian is degenerate -- most often
+                # because a Newton overshoot produced NaN/Inf entries (a
+                # smoothly-extrapolating surrogate medium won't raise a
+                # domain error the way CoolProp does, so the non-finite value
+                # only surfaces here at the factorization).  A numerically
+                # singular pivot is unrecoverable at this dt, so fall through
+                # to the same non-convergence path: let the adaptive stepper
+                # shrink dt and retry instead of aborting the whole run.
+                if "singular" not in str(exc).lower():
+                    raise
                 self._last_solve_error_norm = np.inf
                 self._last_solve_iters = i
                 if raise_on_no_convergence:
@@ -4499,6 +4861,10 @@ class Model:
         n_rej = 0
         reason = "stop_time"
         err = None
+        # Components that expose a `runtime_diagnostics()` hook (e.g. the
+        # advective SegmentedChannel's cell-Peclet check) are polled after each
+        # committed step and dropped once they report they are done.
+        diag_components = self._collect_runtime_diagnostics()
         t_wall0 = time.perf_counter()
         while True:
             t = self.get_t_value()
@@ -4527,6 +4893,9 @@ class Model:
 
             n_steps += 1
             n_rej += int(info.get("rejections", 0))
+            if diag_components:
+                diag_components = [c for c in diag_components
+                                  if not c.runtime_diagnostics()]
             if on_step is not None:
                 cont = on_step(self, {
                     "step": n_steps, "t": self.get_t_value(),
@@ -4552,6 +4921,18 @@ class Model:
         for c in self.components.values():
             if isinstance(c, Model):
                 c.set_initial_time(t)
+
+    def _collect_runtime_diagnostics(self):
+        """Recursively gather sub-components exposing a ``runtime_diagnostics()``
+        hook (polled by `run` after every committed step)."""
+        found = []
+        for c in self.components.values():
+            if hasattr(c, "runtime_diagnostics") and callable(
+                    getattr(c, "runtime_diagnostics")):
+                found.append(c)
+            if isinstance(c, Model):
+                found.extend(c._collect_runtime_diagnostics())
+        return found
 
     def __repr__(self):
         return f"{self.__class__.__name__} {getattr(self, 'name', '')}"

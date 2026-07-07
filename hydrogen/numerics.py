@@ -9,12 +9,14 @@ import numpy as np
 import scipy.sparse as _sp
 import scipy.sparse.linalg as _spla
 import sympy as sp
+from sympy.printing.numpy import NumPyPrinter as _NumPyPrinter
 
 # Gravitational acceleration used by fluid components for buoyancy terms.
 G_const = 9.81
 
 
-def lambdify_compat(args, expr, modules=None, cse=True, docstring_limit=-1):
+def lambdify_compat(args, expr, modules=None, cse=True, docstring_limit=-1,
+                    printer=None):
     """Wrapper around `sympy.lambdify` that tolerates older sympy versions.
 
     Older sympy releases don't accept `cse` or `docstring_limit` keywords. We probe the
@@ -26,7 +28,53 @@ def lambdify_compat(args, expr, modules=None, cse=True, docstring_limit=-1):
         kwargs["cse"] = cse
     if "docstring_limit" in supported_kwargs:
         kwargs["docstring_limit"] = docstring_limit
+    if printer is not None:
+        kwargs["printer"] = printer
     return sp.lambdify(args, expr, **kwargs)
+
+
+class NumbaFriendlyPrinter(_NumPyPrinter):
+    """NumPy code printer emitting only constructs numba's nopython mode
+    supports.
+
+    The stock `NumPyPrinter` prints `Min`/`Max` as ``reduce(numpy.minimum,
+    [...])`` (numba: no `functools.reduce`) and `Piecewise` as
+    ``numpy.select([...], [...], default=nan)`` (numba: arrays-only, no
+    scalar branches).  Both have exact rewrites as nested binary ufunc /
+    ``numpy.where`` calls, which numba compiles fine and which evaluate to
+    the identical values (`select` also evaluates all branches).
+    """
+
+    def _print_Min(self, expr):
+        if len(expr.args) == 1:
+            return self._print(expr.args[0])
+        out = self._print(expr.args[-1])
+        fn = self._module_format(self._module + ".minimum")
+        for a in reversed(expr.args[:-1]):
+            out = f"{fn}({self._print(a)}, {out})"
+        return out
+
+    def _print_Max(self, expr):
+        if len(expr.args) == 1:
+            return self._print(expr.args[0])
+        out = self._print(expr.args[-1])
+        fn = self._module_format(self._module + ".maximum")
+        for a in reversed(expr.args[:-1]):
+            out = f"{fn}({self._print(a)}, {out})"
+        return out
+
+    def _print_Piecewise(self, expr):
+        pairs = expr.args
+        if pairs[-1].cond == sp.true:
+            out = self._print(pairs[-1].expr)
+            pairs = pairs[:-1]
+        else:
+            out = self._module_format(self._module + ".nan")
+        fn = self._module_format(self._module + ".where")
+        for arg in reversed(pairs):
+            out = (f"{fn}({self._print(arg.cond)}, "
+                   f"{self._print(arg.expr)}, {out})")
+        return out
 
 
 @numba.jit(nopython=True)
@@ -41,18 +89,58 @@ def fast_linear_solve(A, b):
     return np.linalg.solve(A, b)
 
 
+def _equilibrated_splu_solve(A, b):
+    """Solve ``A x = b`` (A a CSC matrix) after two-sided infinity-norm
+    equilibration.
+
+    Thermofluid Jacobians mix wildly different physical scales in one system:
+    pressures ~1e5 Pa, enthalpies ~1e6 J/kg, densities ~1e0..1e3, velocities
+    ~1e-2 m/s and viscosities ~1e-4 Pa*s.  Unscaled, the condition number can
+    reach ~1e14 (dominated by an all-pressures near-null mode), at which point
+    SuperLU reports a *spurious* "Factor is exactly singular" -- a below-
+    threshold pivot -- even though the system is perfectly solvable.  This is
+    especially easy to trip inside the two-phase dome, where the density (and
+    hence the momentum/continuity coupling) swings 100x across a few cells.
+
+    A single pass of row- then column- max-norm scaling
+    ``(Dr A Dc) y = Dr b,  x = Dc y`` brings the condition number down by ~9
+    orders of magnitude (measured ~3.5e14 -> ~1.9e5) at O(nnz) cost, negligible
+    beside the factorisation itself, and never changes the true solution.
+    """
+    b = np.asarray(b, dtype=float).reshape(-1)
+    n = A.shape[0]
+    row_idx = A.indices                       # CSC: row index of each nonzero
+    col_idx = np.repeat(np.arange(n, dtype=np.intp), np.diff(A.indptr))
+    data = A.data
+    absd = np.abs(data)
+    r_max = np.zeros(n)
+    np.maximum.at(r_max, row_idx, absd)
+    r_max[r_max == 0.0] = 1.0
+    dr = 1.0 / r_max
+    data = data * dr[row_idx]
+    absd = np.abs(data)
+    c_max = np.zeros(n)
+    np.maximum.at(c_max, col_idx, absd)
+    c_max[c_max == 0.0] = 1.0
+    dc = 1.0 / c_max
+    data = data * dc[col_idx]
+    A_s = _sp.csc_matrix((data, A.indices, A.indptr), shape=A.shape, copy=False)
+    y = _spla.splu(A_s).solve(dr * b)
+    return dc * y
+
+
 def fast_sparse_solve(values, rows, cols, shape, b):
     """SuperLU sparse linear solve used when a sparse Jacobian is available.
 
     `values`/`rows`/`cols` are the COO triplets emitted by the sparse Jacobian
     evaluator; we build a CSC matrix in place (CSC is what SuperLU expects) and
-    call `splu`.  Reusing `splu` is non-trivial because the symbolic
-    factorisation depends on the value pattern, so we re-factorise per Newton
-    iteration -- still much cheaper than a dense solve once the Jacobian is
-    significantly sparser than ~10%.
+    call `splu` (after equilibration; see `_equilibrated_splu_solve`).  Reusing
+    `splu` is non-trivial because the symbolic factorisation depends on the
+    value pattern, so we re-factorise per Newton iteration -- still much cheaper
+    than a dense solve once the Jacobian is significantly sparser than ~10%.
     """
     A = _sp.csc_matrix((values, (rows, cols)), shape=shape)
-    return _spla.splu(A).solve(np.asarray(b).reshape(-1))
+    return _equilibrated_splu_solve(A, b)
 
 
 def precompute_csc_pattern(rows, cols, shape):
@@ -95,4 +183,4 @@ def fast_sparse_solve_cached(values, perm, indices, indptr, shape, b):
     """
     data = values[perm]
     A = _sp.csc_matrix((data, indices, indptr), shape=shape, copy=False)
-    return _spla.splu(A).solve(np.asarray(b).reshape(-1))
+    return _equilibrated_splu_solve(A, b)
