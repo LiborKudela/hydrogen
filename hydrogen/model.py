@@ -4611,6 +4611,91 @@ class Model:
         est = x_np1 - (x_n + dt * f_np1)
         return est, diff_state_idx
 
+    # --- live run controller (mutable mid-run from the service host) -------- #
+    _RUN_CTRL_NUMERIC = (
+        "dt_min", "dt_max", "grow", "shrink", "max_retries",
+        "relaxation", "tol", "max_iter", "stop_time",
+    )
+    _RUN_CTRL_BOOL = ("line_search",)
+
+    def _init_run_control(self, *, strategy, dt=None, stop_time=None, **kwargs):
+        """Seed the per-run controller read by :meth:`iter_run` each step."""
+        if isinstance(strategy, dict):
+            strat = dict(strategy)
+        else:
+            strat = {"name": str(strategy)}
+        ctrl = {"strategy": strat, "fixed_dt": dt, "stop_time": stop_time}
+        for key in self._RUN_CTRL_NUMERIC:
+            if key in kwargs and kwargs[key] is not None:
+                ctrl[key] = float(kwargs[key])
+        for key in self._RUN_CTRL_BOOL:
+            if key in kwargs:
+                ctrl[key] = bool(kwargs[key])
+        self._run_ctrl = ctrl
+
+    def get_run_control(self) -> dict:
+        """Snapshot of the live run controller (empty when idle)."""
+        ctrl = getattr(self, "_run_ctrl", None)
+        return dict(ctrl) if ctrl else {}
+
+    def clear_run_control(self):
+        self._run_ctrl = None
+
+    def update_run_control(self, **updates) -> dict:
+        """Merge runtime controller knobs (honoured on the next step).
+
+        When ``dt_max`` is lowered or ``dt_min`` raised, ``_dt_hint`` is
+        clamped so the next step respects the new bounds immediately.
+        """
+        ctrl = getattr(self, "_run_ctrl", None)
+        if not ctrl:
+            raise RuntimeError("no active run controller")
+        applied: dict = {}
+        strat = updates.pop("strategy", None)
+        if strat is not None:
+            cur = ctrl.get("strategy") or {}
+            if isinstance(cur, dict):
+                base = dict(cur)
+            else:
+                base = {"name": str(cur)}
+            if isinstance(strat, dict):
+                base.update(strat)
+            else:
+                base = {"name": str(strat)}
+            ctrl["strategy"] = base
+            applied["strategy"] = dict(base)
+        for key in self._RUN_CTRL_NUMERIC:
+            if key not in updates:
+                continue
+            val = updates.pop(key)
+            if val is None:
+                ctrl.pop(key, None)
+            else:
+                ctrl[key] = float(val)
+            applied[key] = ctrl.get(key)
+        for key in self._RUN_CTRL_BOOL:
+            if key not in updates:
+                continue
+            ctrl[key] = bool(updates.pop(key))
+            applied[key] = ctrl[key]
+        if updates:
+            bad = ", ".join(sorted(updates))
+            raise ValueError(f"unknown run-control key(s): {bad}")
+        dt_max = ctrl.get("dt_max")
+        dt_min = ctrl.get("dt_min")
+        hint = getattr(self, "_dt_hint", None)
+        if hint is not None:
+            if dt_max is not None and hint > dt_max:
+                self._dt_hint = float(dt_max)
+            if dt_min is not None and self._dt_hint < dt_min:
+                self._dt_hint = float(dt_min)
+        return applied
+
+    def set_dt_max(self, dt_max: float) -> float:
+        """Raise or lower the adaptive step ceiling for the current run."""
+        self.update_run_control(dt_max=float(dt_max))
+        return float(self._run_ctrl["dt_max"])
+
     def solve_adaptive_step(self, dt_target, strategy="predictor_corrector",
                             dt_min=1e-9, dt_max=None,
                             grow=1.5, shrink=0.5, max_retries=20,
@@ -4723,6 +4808,13 @@ class Model:
                        else dt_start if dt_start is not None
                        else dt_max if dt_max is not None else 1.0)
 
+        self._init_run_control(
+            strategy=strategy, dt=dt, stop_time=stop_time,
+            dt_min=dt_min, dt_max=dt_max, grow=grow, shrink=shrink,
+            max_retries=max_retries, relaxation=relaxation, tol=tol,
+            max_iter=max_iter, line_search=line_search,
+        )
+
         # Build the sorted list of event step boundaries (te +/- event_eps) that
         # fall strictly inside the run window.  `guard` is used both to merge
         # near-coincident boundaries (avoiding zero-length crossing steps) and
@@ -4747,15 +4839,28 @@ class Model:
         bptr = 0
 
         while True:
+            ctrl = self._run_ctrl
+            live_stop = ctrl.get("stop_time", stop_time)
+            live_dt_max = ctrl.get("dt_max", dt_max)
+            live_dt_min = ctrl.get("dt_min", dt_min)
+            live_grow = ctrl.get("grow", grow)
+            live_shrink = ctrl.get("shrink", shrink)
+            live_max_retries = int(ctrl.get("max_retries", max_retries))
+            live_relaxation = ctrl.get("relaxation", relaxation)
+            live_tol = ctrl.get("tol", tol)
+            live_max_iter = int(ctrl.get("max_iter", max_iter))
+            live_line_search = ctrl.get("line_search", line_search)
+            live_strategy = ctrl.get("strategy", strategy)
+
             t = self.get_t_value()
             if is_fixed:
-                dt_try = dt
+                dt_try = ctrl.get("fixed_dt", dt)
             else:
                 dt_try = getattr(self, "_dt_hint", init_target)
-                if dt_max is not None:
-                    dt_try = min(dt_try, dt_max)
-            if stop_time is not None:
-                dt_try = min(dt_try, stop_time - t)
+                if live_dt_max is not None:
+                    dt_try = min(dt_try, live_dt_max)
+            if live_stop is not None:
+                dt_try = min(dt_try, live_stop - t)
             # Clip to the next pending event boundary (advancing past any we
             # have already reached).  `t` is monotonic across yields, so the
             # pointer never has to rewind.
@@ -4764,13 +4869,15 @@ class Model:
             if bptr < len(boundaries):
                 dt_try = min(dt_try, boundaries[bptr] - t)
 
-            adaptive_dt_max = dt_max if dt_max is not None else 4.0 * dt_try
+            adaptive_dt_max = (live_dt_max if live_dt_max is not None
+                               else 4.0 * dt_try)
             t_step0 = time.perf_counter()
             dt_used, info = self.solve_adaptive_step(
-                dt_try, strategy=strategy, dt_min=dt_min,
-                dt_max=adaptive_dt_max, grow=grow, shrink=shrink,
-                max_retries=max_retries, relaxation=relaxation, tol=tol,
-                max_iter=max_iter, line_search=line_search)
+                dt_try, strategy=live_strategy, dt_min=live_dt_min,
+                dt_max=adaptive_dt_max, grow=live_grow, shrink=live_shrink,
+                max_retries=live_max_retries, relaxation=live_relaxation,
+                tol=live_tol, max_iter=live_max_iter,
+                line_search=live_line_search)
             step_wall_time = time.perf_counter() - t_step0
             self.next_step(step_wall_time=step_wall_time,
                            step_error=info.get("metric", np.nan))

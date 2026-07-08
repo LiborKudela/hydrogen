@@ -427,6 +427,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
 
     # --- ports -------------------------------------------------------------- #
     def rebuild_ports(self, specs: list[tuple[str, str]] | None = None):
+        self.refresh_param_labels()
         scene = self.scene()
         for pi in self.port_items:
             for conn in list(pi.connections):

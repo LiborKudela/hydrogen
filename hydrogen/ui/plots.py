@@ -173,6 +173,7 @@ class VariableTable(QtWidgets.QWidget):
 
         bar = QtWidgets.QHBoxLayout()
         bar.setSpacing(3)
+        self._toolbar_buttons: list[tuple[QtWidgets.QToolButton, object]] = []
         for text, tip, slot in (
             ("▲", "Move the selected row up", self._move_up),
             ("▼", "Move the selected row down", self._move_down),
@@ -184,6 +185,7 @@ class VariableTable(QtWidgets.QWidget):
             b.setAutoRaise(True)
             b.clicked.connect(slot)
             bar.addWidget(b)
+            self._toolbar_buttons.append((b, slot))
         bar.addStretch(1)
         hint = QtWidgets.QLabel("drag rows to a plot")
         hint.setStyleSheet("color:#999; font-size:10px;")
@@ -195,6 +197,8 @@ class VariableTable(QtWidgets.QWidget):
         self._table.verticalHeader().setSectionsMovable(True)
         self._table.verticalHeader().sectionMoved.connect(self._on_section_moved)
         self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._table.setVerticalScrollMode(
+            QtWidgets.QAbstractItemView.ScrollPerPixel)
         self._table.setEditTriggers(
             QtWidgets.QAbstractItemView.DoubleClicked
             | QtWidgets.QAbstractItemView.SelectedClicked)
@@ -202,6 +206,19 @@ class VariableTable(QtWidgets.QWidget):
         hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
         lay.addWidget(self._table, 1)
+
+    def toolbar_action_at(self, pos: QtCore.QPoint):
+        """Return the toolbar callback under ``pos`` (this widget's coords)."""
+        for btn, slot in self._toolbar_buttons:
+            if btn.geometry().contains(pos):
+                return slot
+        return None
+
+    def remove_selected_row(self) -> bool:
+        """Remove the currently selected row; return True if one was removed."""
+        before = len(self._rows)
+        self._remove_selected()
+        return len(self._rows) < before
 
     # --- content contract -------------------------------------------------- #
     def title(self) -> str:
@@ -449,6 +466,9 @@ class VariableTable(QtWidgets.QWidget):
         return w
 
     def populate_menu(self, menu: "QtWidgets.QMenu"):
+        rem = menu.addAction("Remove selected row")
+        rem.triggered.connect(self._remove_selected)
+        menu.addSeparator()
         present = {r["full"] for r in self._rows}
         for label, key, adder in (
             ("Add time column", TIME_KEY, self.add_time_row),
@@ -957,7 +977,7 @@ class _SnapshotChartSettingsDialog(QtWidgets.QDialog):
     """Title + legend settings shared by bar and pie charts."""
 
     def __init__(self, settings: dict, parent=None, *, y_label=False,
-                 pie_options=False):
+                 pie_options=False, hide_legend=False):
         super().__init__(parent)
         self.setWindowTitle("Chart settings")
         self._s = dict(settings)
@@ -971,14 +991,17 @@ class _SnapshotChartSettingsDialog(QtWidgets.QDialog):
         self._title_size.setValue(int(settings.get("title_size", 12)))
         form.addRow("Title size", self._title_size)
 
-        self._legend = QtWidgets.QCheckBox("Show legend")
-        self._legend.setChecked(bool(settings.get("legend", True)))
-        form.addRow("", self._legend)
+        self._legend = None
+        self._legend_pos = None
+        if not hide_legend:
+            self._legend = QtWidgets.QCheckBox("Show legend")
+            self._legend.setChecked(bool(settings.get("legend", True)))
+            form.addRow("", self._legend)
 
-        self._legend_pos = QtWidgets.QComboBox()
-        self._legend_pos.addItems(["bottom", "top", "left", "right"])
-        self._legend_pos.setCurrentText(settings.get("legend_pos", "bottom"))
-        form.addRow("Legend position", self._legend_pos)
+            self._legend_pos = QtWidgets.QComboBox()
+            self._legend_pos.addItems(["bottom", "top", "left", "right"])
+            self._legend_pos.setCurrentText(settings.get("legend_pos", "bottom"))
+            form.addRow("Legend position", self._legend_pos)
 
         self._y_title = None
         if y_label:
@@ -1003,9 +1026,11 @@ class _SnapshotChartSettingsDialog(QtWidgets.QDialog):
         self._s.update({
             "title": self._title.text(),
             "title_size": self._title_size.value(),
-            "legend": self._legend.isChecked(),
-            "legend_pos": self._legend_pos.currentText(),
         })
+        if self._legend is not None:
+            self._s["legend"] = self._legend.isChecked()
+        if self._legend_pos is not None:
+            self._s["legend_pos"] = self._legend_pos.currentText()
         if self._y_title is not None:
             self._s["y_title"] = self._y_title.text()
         if self._show_percent is not None:
@@ -1305,7 +1330,7 @@ class PieChart(_SnapshotChartBase):
     def __init__(self):
         super().__init__(self.DEFAULT_TITLE)
         self._settings = {
-            "title": self._title, "legend": True, "legend_pos": "right",
+            "title": self._title, "legend": False,
             "title_size": 12, "show_percent": True,
         }
         lay = QtWidgets.QVBoxLayout(self)
@@ -1339,10 +1364,7 @@ class PieChart(_SnapshotChartBase):
         tf.setBold(True)
         self._chart.setTitleFont(tf)
         legend = self._chart.legend()
-        legend.setVisible(bool(s.get("legend", True)))
-        legend.setAlignment(
-            TimeseriesChart._LEGEND_ALIGN.get(s.get("legend_pos", "right"),
-                                            QtCore.Qt.AlignRight))
+        legend.setVisible(False)
         show_pct = bool(s.get("show_percent", True))
         if self._pie_series is not None:
             self._pie_series.setLabelsVisible(show_pct)
@@ -1352,7 +1374,8 @@ class PieChart(_SnapshotChartBase):
 
     def _edit_settings(self):
         dlg = _SnapshotChartSettingsDialog(
-            self._settings, self._dialog_parent, pie_options=True)
+            self._settings, self._dialog_parent, pie_options=True,
+            hide_legend=True)
         if _exec_beside(dlg, self._dialog_anchor):
             self._settings = dlg.result_settings()
             self._title = self._settings.get("title") or self.DEFAULT_TITLE
@@ -1376,7 +1399,6 @@ class PieChart(_SnapshotChartBase):
             label = e.get("label", e["full"])
             slices.append((label, display, e.get("color", "#1f77b4")))
         total = sum(v for _, v, _ in slices)
-        legend_on = bool(self._settings.get("legend", True))
         use_inside = show_pct and len(slices) > 3
         for label, display, color in slices:
             pct = 100.0 * display / total if total > 0 else 0.0
@@ -1387,8 +1409,7 @@ class PieChart(_SnapshotChartBase):
                         else _pie_slice_label(label, pct, show_percent=True))
                 _style_pie_slice(sl, text=text, show_label=True, inside=use_inside)
             else:
-                _style_pie_slice(
-                    sl, text=label, show_label=not legend_on, inside=False)
+                _style_pie_slice(sl, text=label, show_label=True, inside=False)
         self._notify_render()
 
     def to_dict(self) -> dict:
@@ -1468,6 +1489,8 @@ class PlotItem(QtWidgets.QGraphicsObject):
         self._dialog = None
         # Content-area mouse interaction (forwarded to the off-screen widget).
         self._press_item_pos: QtCore.QPointF | None = None
+        self._press_mouse_target = None
+        self._press_toolbar_action = None
         self._dragging = False
 
         # Live data can request a re-render many times a second; coalesce those
@@ -1617,21 +1640,66 @@ class PlotItem(QtWidgets.QGraphicsObject):
         return QtCore.QPoint(int(item_pos.x() - self.MARGIN),
                              int(item_pos.y() - self.HEADER_H))
 
-    def _forward_mouse(self, event, etype):
-        """Deliver a synthetic mouse event to the child widget under the cursor
-        so the off-screen content stays interactive."""
-        if self.content is None:
-            return
-        cpos = self._content_point(event.pos())
+    def _content_widget_at(self, item_pos: QtCore.QPointF):
+        """Map an item-local point to (child widget, local point) in content."""
+        cpos = self._content_point(item_pos)
         cpos.setX(max(0, min(cpos.x(), self.content.width() - 1)))
         cpos.setY(max(0, min(cpos.y(), self.content.height() - 1)))
         target = self.content.childAt(cpos) or self.content
         local = target.mapFrom(self.content, cpos)
+        return target, local, cpos
+
+    def _forward_mouse(self, event, etype, target=None):
+        """Deliver a synthetic mouse event to the child widget under the cursor
+        so the off-screen content stays interactive."""
+        if self.content is None:
+            return None
+        if target is None:
+            target, local, _cpos = self._content_widget_at(event.pos())
+        else:
+            _t, local, _cpos = self._content_widget_at(event.pos())
+            local = target.mapFrom(self.content, _cpos)
         gp = event.screenPos()
         me = QtGui.QMouseEvent(
             etype, QtCore.QPointF(local), QtCore.QPointF(gp),
             event.button(), event.buttons(), event.modifiers())
         QtWidgets.QApplication.sendEvent(target, me)
+        return target
+
+    def remove_selected_row(self) -> bool:
+        """Remove a selected table row (keyboard / canvas shortcut)."""
+        fn = getattr(self.content, "remove_selected_row", None)
+        if fn is None or not fn():
+            return False
+        self._render()
+        return True
+
+    def _forward_wheel(self, item_pos: QtCore.QPointF, event) -> bool:
+        """Scroll table content when the wheel is over the content area."""
+        if (self.content is None
+                or getattr(self.content, "KIND", None) != "table"
+                or not self._in_content(item_pos)):
+            return False
+        table = getattr(self.content, "_table", None)
+        if table is None:
+            return False
+        sb = table.verticalScrollBar()
+        if sb is None or sb.maximum() <= 0:
+            return False
+        pixel = event.pixelDelta().y()
+        angle = event.angleDelta().y()
+        if not pixel and not angle:
+            return False
+        before = sb.value()
+        if pixel:
+            sb.setValue(before - pixel)
+        else:
+            step = max(1, table.verticalHeader().defaultSectionSize())
+            sb.setValue(before - int(angle / 120.0 * step * 3))
+        if sb.value() == before:
+            return False
+        self._render()
+        return True
 
     def hoverMoveEvent(self, event):
         if self._in_grip(event.pos()):
@@ -1652,9 +1720,20 @@ class PlotItem(QtWidgets.QGraphicsObject):
         if (event.button() == QtCore.Qt.LeftButton
                 and self._in_content(event.pos())):
             self.setSelected(True)
-            self._press_item_pos = event.pos()
             self._dragging = False
-            self._forward_mouse(event, QtCore.QEvent.MouseButtonPress)
+            self._press_mouse_target = None
+            self._press_toolbar_action = None
+            _target, _local, cpos = self._content_widget_at(event.pos())
+            toolbar_at = getattr(self.content, "toolbar_action_at", None)
+            if toolbar_at is not None and toolbar_at(cpos) is not None:
+                # Toolbar clicks on the off-screen pixmap are handled directly
+                # on release -- synthetic events often miss QToolButton targets.
+                self._press_toolbar_action = toolbar_at(cpos)
+                self._press_item_pos = None
+            else:
+                self._press_item_pos = event.pos()
+                self._press_mouse_target = self._forward_mouse(
+                    event, QtCore.QEvent.MouseButtonPress)
             event.accept()
             return
         super().mousePressEvent(event)        # header -> move / select
@@ -1685,13 +1764,23 @@ class PlotItem(QtWidgets.QGraphicsObject):
             self._notify_changed()
             event.accept()
             return
+        if self._press_toolbar_action is not None:
+            if event.button() == QtCore.Qt.LeftButton:
+                self._press_toolbar_action()
+            self._press_toolbar_action = None
+            self._render()
+            event.accept()
+            return
         if self._dragging:
             self._dragging = False
             event.accept()
             return
         if self._press_item_pos is not None:
-            self._forward_mouse(event, QtCore.QEvent.MouseButtonRelease)
+            self._forward_mouse(
+                event, QtCore.QEvent.MouseButtonRelease,
+                self._press_mouse_target)
             self._press_item_pos = None
+            self._press_mouse_target = None
             self._render()                    # reflect selection / button state
             event.accept()
             return
@@ -1732,7 +1821,7 @@ class PlotItem(QtWidgets.QGraphicsObject):
         menu.addSeparator()
         self.content.populate_menu(menu)
         menu.addSeparator()
-        menu.addAction("Delete").triggered.connect(self._delete)
+        menu.addAction("Delete object").triggered.connect(self._delete)
         exec_(menu, event.screenPos())
         event.accept()
 

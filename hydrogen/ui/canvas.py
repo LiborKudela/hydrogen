@@ -104,6 +104,7 @@ class Canvas(QtWidgets.QGraphicsView):
         self._show_params = True       # ui_label parameter labels
         self._show_port_names = True   # per-port name labels
         self._on_objects_changed = None     # () -> None, set by MainWindow
+        self._on_model_changed = None       # () -> None, set by MainWindow
         self._var_windows: dict[str, VariablesWindow] = {}  # comp_id -> open window
         self._objects: list[PlotItem] = []  # plot/table scene items
         self._scene = QtWidgets.QGraphicsScene(self)
@@ -127,6 +128,15 @@ class Canvas(QtWidgets.QGraphicsView):
 
     # --- zoom & pan --------------------------------------------------------- #
     def wheelEvent(self, event):
+        # QWheelEvent exposes `position()` (Qt6) / `pos()` (Qt5); `drop_point`
+        # normalises that to a viewport-local QPoint across bindings.
+        scene_pt = self.mapToScene(drop_point(event))
+        obj = self._object_at(scene_pt)
+        if obj is not None:
+            item_pos = obj.mapFromScene(scene_pt)
+            if obj._forward_wheel(item_pos, event):
+                event.accept()
+                return
         delta = event.angleDelta().y()
         if not delta:
             return
@@ -137,6 +147,7 @@ class Canvas(QtWidgets.QGraphicsView):
         self._zoom = new_zoom
         self.scale(factor, factor)
         self._rerender_objects()
+        event.accept()
 
     def reset_zoom(self):
         self.resetTransform()
@@ -308,6 +319,7 @@ class Canvas(QtWidgets.QGraphicsView):
         self._scene.clearSelection()
         node.setSelected(True)
         self._on_status(f"Added '{node.comp_id}'  ({self.node_count()} on canvas)")
+        self._model_changed()
         return node
 
     def add_node_at_center(self, entry: dict) -> NodeItem:
@@ -470,6 +482,7 @@ class Canvas(QtWidgets.QGraphicsView):
             for conn in list(pi.connections):
                 conn.remove()
         self._scene.removeItem(node)
+        self._model_changed()
 
     def clear_nodes(self):
         for node in self.nodes():
@@ -481,9 +494,19 @@ class Canvas(QtWidgets.QGraphicsView):
         self._objects.clear()
         self._connections.clear()
         self._objects_changed()
+        self._model_changed()
         self._on_status("Canvas cleared")
 
     # --- plot / table objects ---------------------------------------------- #
+    def set_model_changed_hook(self, fn):
+        """Register a callable when canvas topology/params change (wiring,
+        properties, add/remove components)."""
+        self._on_model_changed = fn
+
+    def _model_changed(self):
+        if self._on_model_changed is not None:
+            self._on_model_changed()
+
     def set_objects_changed_hook(self, fn):
         """Register a callable invoked whenever the set of plot/table objects
         (or their watched variables) changes, so the live pump can re-sync."""
@@ -497,10 +520,15 @@ class Canvas(QtWidgets.QGraphicsView):
         return list(self._objects)
 
     def _object_at(self, scene_pt: QtCore.QPointF) -> "PlotItem | None":
-        """Top-most plot/table object under a scene point (or None)."""
+        """Top-most plot/table object under a scene point (or None).
+
+        Only returns a plot when it is the topmost item at ``scene_pt``; a
+        component or wire drawn above a plot must not delegate wheel events
+        to the plot underneath."""
         for obj in self._scene.items(scene_pt):
             if isinstance(obj, PlotItem):
                 return obj
+            return None
         return None
 
     def _rerender_objects(self):
@@ -575,6 +603,13 @@ class Canvas(QtWidgets.QGraphicsView):
                 self._on_status(f"Rotated {rotated} selected component(s)")
                 return
         if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+            plots = [i for i in self._scene.selectedItems()
+                     if isinstance(i, PlotItem)]
+            for plot in plots:
+                if plot.remove_selected_row():
+                    self._on_status("Removed row")
+                    event.accept()
+                    return
             removed = [i for i in self._scene.selectedItems() if isinstance(i, NodeItem)]
             for node in removed:
                 self.remove_node(node)
@@ -621,6 +656,7 @@ class Canvas(QtWidgets.QGraphicsView):
     def forget_connection(self, conn: ConnectionItem):
         if conn in self._connections:
             self._connections.remove(conn)
+            self._model_changed()
 
     def refresh_connections(self, node: NodeItem):
         for pi in node.port_items:
@@ -663,6 +699,7 @@ class Canvas(QtWidgets.QGraphicsView):
         self._on_status(
             f"connected {src.node.comp_id}.{src.pname} ↔ "
             f"{target.node.comp_id}.{target.pname}")
+        self._model_changed()
 
     def _clear_temp(self):
         if self._temp is not None:
@@ -808,6 +845,7 @@ class Canvas(QtWidgets.QGraphicsView):
             self._on_status(
                 f"Updated '{node.comp_id}'"
                 + ("  (ports changed -> wires reset)" if changed else ""))
+            self._model_changed()
         node.update()
 
     def mouseDoubleClickEvent(self, event):

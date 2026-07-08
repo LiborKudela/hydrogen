@@ -308,6 +308,15 @@ class _SystemRuntime:
         self.total = 0
         self.stop_requested = False
         self.pause_requested = False
+        # Last run configuration (for continue after finish / stop).
+        self.run_dt = None
+        self.run_steps = None
+        self.run_stop_time = None
+        self.run_strategy = None
+        self.run_adaptive: dict = {}
+        self.run_every = 1
+        self.run_delay = 0.0
+        self.continuable = False
         # Open variable streams, keyed by stream id (see `_StreamState`). Each
         # is flushed after every committed step in the run loop.
         self.streams: dict[str, _StreamState] = {}
@@ -321,15 +330,30 @@ class _SystemRuntime:
 
     def status(self) -> dict:
         m = self.model
-        return {
+        t = _t_value(m)
+        out = {
             "system_id": self.id,
             "phase": self.phase,
             "step": self.step,
             "total": self.total,
-            "t": _t_value(m),
+            "t": t,
+            "stop_time": self.run_stop_time,
+            "continuable": bool(self.continuable),
             "last_residual": float(getattr(m, "_last_solve_error_norm", float("nan"))),
             "last_iters": int(getattr(m, "_last_solve_iters", 0)),
         }
+        rc = m.get_run_control()
+        if rc:
+            out["run_control"] = rc
+        return out
+
+    def _sync_continuable(self):
+        """True when the model can integrate further (``t < stop_time``)."""
+        if self.run_stop_time is None:
+            self.continuable = False
+            return
+        t = _t_value(self.model)
+        self.continuable = t < self.run_stop_time - 1e-9
 
     # --- variable resolution ---------------------------------------------
 
@@ -416,6 +440,75 @@ def _apply_params(model, assignments):
         fval = float(val)
         params[i].set_value(fval)
         applied[names[i]] = fval
+    return applied
+
+
+_LIVE_ADAPTIVE_KEYS = (
+    "dt_min", "dt_max", "grow", "shrink", "max_retries",
+    "relaxation", "tol", "max_iter", "line_search",
+)
+_LIVE_STRATEGY_KEYS = ("tol_local", "atol")
+_RUN_CONFIG_PHASES = frozenset({
+    "running", "paused", "finished", "stopped", "initialised",
+})
+
+
+def _apply_run_config(rt, args: dict) -> dict:
+    """Update the live run controller + persisted run config on ``rt``.
+
+    Honoured on the next committed step (or before a :meth:`continue_run`).
+    """
+    phase = rt.phase
+    if phase not in _RUN_CONFIG_PHASES:
+        raise RuntimeError(
+            f"run config cannot be changed while phase is {phase!r}")
+    applied: dict = {}
+    if "stop_time" in args and args["stop_time"] is not None:
+        rt.run_stop_time = float(args["stop_time"])
+        applied["stop_time"] = rt.run_stop_time
+    adaptive = dict(args.get("adaptive") or {})
+    for key in _LIVE_ADAPTIVE_KEYS:
+        if key in args and args[key] is not None:
+            adaptive[key] = args[key]
+    if adaptive:
+        rt.run_adaptive.update(adaptive)
+        applied["adaptive"] = dict(rt.run_adaptive)
+    strat_updates = {}
+    if "strategy" in args and args["strategy"] is not None:
+        strat_updates = dict(args["strategy"])
+    for key in _LIVE_STRATEGY_KEYS:
+        if key in args and args[key] is not None:
+            strat_updates[key] = args[key]
+    if strat_updates:
+        base = dict(rt.run_strategy or {"name": "richardson"})
+        if "name" in strat_updates and len(strat_updates) == 1:
+            base["name"] = strat_updates["name"]
+        else:
+            base.update(strat_updates)
+        rt.run_strategy = base
+        applied["strategy"] = dict(base)
+    ctrl_updates: dict = {}
+    if rt.run_stop_time is not None:
+        ctrl_updates["stop_time"] = rt.run_stop_time
+    for key in _LIVE_ADAPTIVE_KEYS:
+        if key in rt.run_adaptive:
+            ctrl_updates[key] = rt.run_adaptive[key]
+    if rt.run_strategy is not None:
+        ctrl_updates["strategy"] = rt.run_strategy
+    if ctrl_updates and rt.model.get_run_control():
+        applied["run_control"] = rt.model.update_run_control(**ctrl_updates)
+    elif ctrl_updates and phase in ("finished", "stopped", "initialised"):
+        seed = {k: v for k, v in rt.run_adaptive.items()
+                if k in _LIVE_ADAPTIVE_KEYS}
+        rt.model._init_run_control(
+            strategy=rt.run_strategy or {"name": "richardson"},
+            dt=rt.run_dt,
+            stop_time=rt.run_stop_time,
+            **seed,
+        )
+        applied["run_control"] = rt.model.get_run_control()
+    rt._sync_continuable()
+    applied["continuable"] = rt.continuable
     return applied
 
 
@@ -901,6 +994,48 @@ class _Engine:
         self._shutdown = True
         self._reply(req_id, {"shutdown": True})
 
+    def _cmd_update_run_config(self, req_id, args):
+        rt = self._require(args["system_id"])
+        try:
+            applied = _apply_run_config(rt, args)
+        except Exception as exc:  # noqa: BLE001
+            self._reply_error(req_id, exc, kind=type(exc).__name__)
+            return
+        self._reply(req_id, applied)
+        if rt.phase in ("finished", "stopped", "paused"):
+            self._bus.emit({"type": "status", **rt.status()})
+
+    def _cmd_continue_run(self, req_id, args):
+        rt = self._require(args["system_id"])
+        if not rt.continuable:
+            self._reply_error(
+                req_id,
+                "continue_run requires stop_time > current model time "
+                "(extend stop_time first)",
+                kind="ValueError")
+            return
+        if rt.run_stop_time is None:
+            self._reply_error(req_id, "no stop_time configured for this run",
+                              kind="ValueError")
+            return
+        stream = bool(args.get("stream", True))
+        every = max(1, args.get("every", rt.run_every) or rt.run_every)
+        delay = max(0.0, float(args.get("delay", rt.run_delay) or rt.run_delay))
+        cfg = (rt, rt.run_dt, rt.run_steps, rt.run_stop_time, rt.run_strategy,
+               rt.run_adaptive, every, delay)
+        if stream:
+            self._reply(req_id, {"streaming": True,
+                                 "stop_time": rt.run_stop_time})
+            t0 = time.monotonic()
+            self._run_loop(*cfg, stream=True, continue_from=rt.step)
+            done = {"type": "done", "elapsed": time.monotonic() - t0}
+            done.update(rt.status())
+            done["type"] = "done"
+            self._bus.emit(done)
+        else:
+            summary = self._run_loop(*cfg, stream=False, continue_from=rt.step)
+            self._reply(req_id, summary)
+
     def _cmd_run(self, req_id, args):
         rt = self._require(args["system_id"])
         dt = args.get("dt")
@@ -950,18 +1085,25 @@ class _Engine:
     # --- the run loop (cooperative stop + streaming) ----------------------
 
     def _run_loop(self, rt, dt, steps, stop_time, strategy, adaptive, every, delay,
-                  *, stream):
+                  *, stream, continue_from: int | None = None):
         rt.phase = "running"
         rt.total = steps if steps is not None else 0
         rt.stop_requested = False
         rt.pause_requested = False
+        rt.continuable = False
+
+        # Persist for continue / live config edits after this loop exits.
+        rt.run_dt = dt
+        rt.run_steps = steps
+        rt.run_stop_time = stop_time
+        rt.run_strategy = strategy
+        rt.run_adaptive = dict(adaptive or {})
+        rt.run_every = every
+        rt.run_delay = delay
 
         model = rt.model
         is_fixed = (strategy is None or strategy == "fixed"
                     or (isinstance(strategy, dict) and strategy.get("name") == "fixed"))
-        # Controller knobs forwarded to the shared `Model.iter_run` generator;
-        # `dt_start` defaults to the fixed `dt` so an adaptive run started
-        # without an explicit target still has a sensible first step.
         dt_min = adaptive.get("dt_min", 1e-9)
         dt_max = adaptive.get("dt_max")
         dt_start = adaptive.get("dt_start", dt)
@@ -969,23 +1111,17 @@ class _Engine:
                  ("grow", "shrink", "max_retries", "relaxation", "tol",
                   "max_iter", "line_search")
                  if k in adaptive}
-        # Drive the SAME per-step kernel as `Model.run`; the service loop only
-        # adds the interleaved socket polling / pause / MPI lock-step /
-        # streaming / pacing around each `next()`.  `strategy is None` means a
-        # fixed run on the host, so normalise it to "fixed" for the generator
-        # (which otherwise reads None as the predictor-corrector default).
         steps_gen = model.iter_run(
             stop_time=stop_time, strategy=("fixed" if is_fixed else strategy),
             dt=dt, dt_min=dt_min, dt_max=dt_max, dt_start=dt_start, **extra)
 
-        # Poll the command socket between steps so `stop` is honoured at a step
-        # boundary (never mid-solve). Only rank 0 owns the socket.
         sel = selectors.DefaultSelector()
         if self._sock is not None:
             sel.register(self._sock, selectors.EVENT_READ)
 
         def _done(k):
-            if stop_time is not None and _t_value(model) >= stop_time - 1e-9:
+            st = rt.run_stop_time
+            if st is not None and _t_value(model) >= st - 1e-9:
                 return True
             if steps is not None and k >= steps:
                 return True
@@ -994,7 +1130,7 @@ class _Engine:
         with _capture_logs(self._bus, rt.id, self._rank), \
                 _capture_warnings(self._bus, rt.id, self._rank,
                                   lambda: rt.model):
-            k = 0
+            k = int(continue_from or 0)
             while not _done(k):
                 self._drain_during_run(sel, rt)
                 # Honour a pause request at this step boundary: park here (still
@@ -1033,7 +1169,9 @@ class _Engine:
                         time.sleep(remaining)
 
         sel.close()
+        model.clear_run_control()
         rt.phase = "stopped" if rt.stop_requested else "finished"
+        rt._sync_continuable()
         if not stream:
             return rt.status()
         return None
@@ -1082,12 +1220,20 @@ class _Engine:
                     self._reply(req_id, applied)
                 except Exception as exc:  # noqa: BLE001 - surface to the UI
                     self._reply_error(req_id, exc, kind=type(exc).__name__)
+            elif cmd == "update_run_config":
+                try:
+                    applied = _apply_run_config(
+                        rt, msg.get("args", {}) or {})
+                    self._reply(req_id, applied)
+                except Exception as exc:  # noqa: BLE001
+                    self._reply_error(req_id, exc, kind=type(exc).__name__)
             else:
                 self._reply_error(
                     req_id,
                     f"system {rt.id} is running; only 'stop'/'pause'/'resume'/"
-                    f"'status'/'set_param'/'vars_stream'/'add_stream_vars'/"
-                    f"'close_stream' are accepted until it finishes",
+                    f"'status'/'set_param'/'update_run_config'/'vars_stream'/"
+                    f"'add_stream_vars'/'close_stream' are accepted until it "
+                    f"finishes",
                     kind="Busy",
                 )
 

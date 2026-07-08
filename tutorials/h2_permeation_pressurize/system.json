@@ -70,7 +70,8 @@
               "n_nodes": 8,
               "C_init": 0.0
             },
-            "dynamic": true
+            "dynamic": true,
+            "capacity_split": "uniform"
           }
         ],
         "multiphase": "single",
@@ -80,7 +81,25 @@
         "T_outer": 293.15,
         "p_ext": 1.0,
         "T_wall_init": 423.15,
-        "p_init": 100000.0
+        "p_init": 100000.0,
+        "count": 1,
+        "channel_engine": "segmented",
+        "dynamic": "static",
+        "dispersion": "general",
+        "D_axial": 0.0,
+        "advection_scheme": "U2D1",
+        "wall_elasticity": false,
+        "wall_E": 200000000000.0,
+        "wall_e": null,
+        "wall_c1": 1.0,
+        "unsteady_friction": false,
+        "k_uf": 0.033,
+        "viscoelastic_wall": false,
+        "J_ve": 0.0,
+        "tau_ve": 1.0,
+        "cavitation": false,
+        "p_vap": null,
+        "cav_eps": 0.01
       }
     },
     "cap": {

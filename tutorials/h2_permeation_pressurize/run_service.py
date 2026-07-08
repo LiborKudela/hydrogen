@@ -45,7 +45,8 @@ STEP_DELAY = None
 # figure, just skip the blocking plt.show().
 _HEADLESS = matplotlib.get_backend().lower() == "agg"
 
-P_VAR = "pipe_segment_0.p_in"
+# Inlet bore pressure (source outlet == pipe inlet after short-circuiting).
+P_VAR = "source.p_out"
 
 
 def main():

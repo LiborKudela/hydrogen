@@ -31,6 +31,7 @@ from .simulate import (
     default_sim_options,
     initialise_kwargs,
     instantiate_kwargs,
+    run_config_patch,
     run_kwargs,
 )
 
@@ -113,6 +114,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Live pump: refresh canvas plot/table objects off the simulation stream.
         self._live = LiveController(self._session)
         self._canvas.set_objects_changed_hook(self._sync_live_objects)
+        self._canvas.set_model_changed_hook(self._on_canvas_model_changed)
         # Persistent run log: every build/run log line is recorded here (even
         # for runs launched from the toolbar with no window open), so the
         # Simulate window shows the full output + summary whenever it is opened.
@@ -128,6 +130,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sim_settings.setToolTip("Edit the instantiate / initialise / simulate "
                                 "options used by every run.")
         sim_settings.clicked.connect(self._edit_sim_settings)
+        self._sim_settings_btn = sim_settings
         simulate = QtWidgets.QPushButton("▶ Simulate")
         simulate.setToolTip("Open the run window. The model is kept alive after "
                             "building and only re-instantiated when its "
@@ -603,16 +606,37 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = MediaManagerDialog(self._media, used_keys=used, parent=self)
         if exec_(dlg):
             self._media = dlg.media()
-            # Media is part of the structural signature, so the next run rebuilds
-            # automatically; no manual session reset needed.
+            self._on_canvas_model_changed()
             self._set_status("Media updated.")
 
+    def _on_canvas_model_changed(self):
+        """Canvas topology/params changed — resume is no longer valid."""
+        if self._session._run_checkpoint is not None or self._session._run_stale:
+            self._session.mark_model_stale()
+            self._update_runctl()
+            if self._session.run_phase in ("paused", "finished", "stopped"):
+                self._set_status(
+                    "Model changed — use Run to re-initialise (cannot resume).")
+
     def _edit_sim_settings(self):
+        phase = self._session.run_phase
+        if phase == "running":
+            self._set_status("Pause the simulation before changing settings.")
+            return
         nodes = self._canvas.nodes()
         system = self._build_system(nodes) if nodes else None
-        dlg = SimSettingsDialog(self._sim_options, system=system, parent=self)
+        live = (phase in ("paused", "finished", "stopped")
+                and self._session.built)
+        dlg = SimSettingsDialog(
+            self._sim_options, system=system, parent=self,
+            live_sim_only=live)
         if exec_(dlg):
-            self._sim_options = dlg.options()  # remember for save / reuse
+            self._sim_options = dlg.options()
+            if live:
+                patch = run_config_patch(self._sim_options)
+                self._session.push_run_config(
+                    patch, log=lambda m, level="status": self._record_log(m, level))
+            self._update_runctl()
             self._set_status("Simulation settings updated.")
 
     def _simulate(self):
@@ -649,26 +673,45 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_runctl(self):
         """Sync the Run/Pause/Resume + Stop buttons to the current run phase."""
         phase = self._session.run_phase
+        nodes = self._canvas.nodes()
+        inst_kw = instantiate_kwargs(self._sim_options)
+        system = self._build_system(nodes) if nodes else {}
+        can_resume = (bool(nodes)
+                      and self._session.can_steering_resume(system, inst_kw))
         # Once the run is actually live, drop any 'starting' state so the button
         # flips straight to Pause (the launch worker's done signal may lag).
         if phase in ("running", "paused"):
             self._starting = False
+        # Settings: editable when idle, paused, or finished/stopped (continuable
+        # or not — extending stop_time may enable resume).
+        if phase == "running":
+            self._sim_settings_btn.setEnabled(False)
+            self._sim_settings_btn.setToolTip(
+                "Pause the simulation to edit live run settings.")
+        else:
+            self._sim_settings_btn.setEnabled(True)
+            self._sim_settings_btn.setToolTip(
+                "Edit instantiate / initialise / simulate options.")
         if phase == "running":
             self._runctl_btn.setText("⏸ Pause")
             self._runctl_btn.setEnabled(True)
             self._stop_btn.setEnabled(True)
-        elif phase == "paused":
+        elif can_resume and phase == "paused":
             self._runctl_btn.setText("▶ Resume")
             self._runctl_btn.setEnabled(True)
             self._stop_btn.setEnabled(True)
+        elif can_resume:
+            self._runctl_btn.setText("▶ Resume")
+            self._runctl_btn.setEnabled(True)
+            self._stop_btn.setEnabled(False)
         elif self._starting:
             self._runctl_btn.setText("… Starting")
             self._runctl_btn.setEnabled(False)
             self._stop_btn.setEnabled(False)
-        else:                                # idle / finished / stopped / error
+        else:                                # idle / stale / finished / stopped
             self._runctl_btn.setText("▶ Run")
             self._runctl_btn.setEnabled(True)
-            self._stop_btn.setEnabled(False)
+            self._stop_btn.setEnabled(phase in ("running", "paused"))
 
     def _on_run_phase(self, phase: str):
         """React to a streaming run's phase change (driven by the live pump)."""
@@ -683,12 +726,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._canvas.set_component_warnings(self._session.component_warnings())
 
     def _on_runctl(self):
-        """Run when idle, pause when running, resume when paused."""
+        """Run when idle/stale, pause when running, resume when checkpoint matches."""
         phase = self._session.run_phase
+        nodes = self._canvas.nodes()
+        inst_kw = instantiate_kwargs(self._sim_options)
+        system = self._build_system(nodes) if nodes else {}
+        can_resume = (bool(nodes)
+                      and self._session.can_steering_resume(system, inst_kw))
         if phase == "running":
             self._session.pause_run()
-        elif phase == "paused":
+        elif can_resume and phase == "paused":
             self._session.resume_run()
+        elif can_resume:
+            self._continue_run_from_toolbar()
         else:
             self._start_run_from_toolbar()
 
@@ -699,7 +749,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Build (if needed) and launch a streaming run straight from the
         toolbar -- no Simulate window. The heavy build/initialise runs on a
         worker thread so the UI stays responsive."""
-        if self._session.run_active or self._starting:
+        if self._starting:
+            return
+        if self._session.run_phase == "running":
             return
         nodes = self._canvas.nodes()
         if not nodes:
@@ -707,6 +759,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         options = self._sim_options
         run_kw = run_kwargs(options)
+        inst_kw = instantiate_kwargs(options)
+        try:
+            system = self._build_system(nodes)
+        except Exception as exc:
+            self._set_status(f"Build failed: {type(exc).__name__}: {exc}")
+            return
+        if (self._session.run_phase == "paused"
+                and self._session.can_steering_resume(system, inst_kw)):
+            return
         if run_kw.get("stop_time") is None:
             self._set_status("Set a stop_time in ⚙ Settings first — the run is "
                              "driven by it.")
@@ -715,16 +776,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 and run_kw.get("dt") is None):
             self._set_status("strategy='fixed' needs a dt (set it in ⚙ Settings).")
             return
-        try:
-            system = self._build_system(nodes)
-        except Exception as exc:
-            self._set_status(f"Build failed: {type(exc).__name__}: {exc}")
-            return
-        inst_kw = instantiate_kwargs(options)
         init_kw = initialise_kwargs(options)
 
         def task(log):
+            if self._session.run_phase in ("running", "paused"):
+                self._session.stop_and_drain(log)
             self._session.ensure_built(system, inst_kw, log)
+            self._session.set_run_checkpoint(system, inst_kw)
             return self._session.start_run(init_kw, run_kw, log)
 
         self._starting = True
@@ -754,6 +812,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_worker = None
         self._set_status(f"Run failed: {kind}: {message}")
         self._update_runctl()
+
+    def _continue_run_from_toolbar(self):
+        """Continue a finished/stopped run without re-initialising."""
+        if self._session.run_active or self._starting:
+            return
+        if not self._session.can_continue:
+            return
+        self._starting = True
+        self._update_runctl()
+        self._set_status("Continuing simulation…")
+        self._record_log("\n— run continued from toolbar —", "status")
+
+        def task(log):
+            self._session.continue_run()
+            return "continued"
+
+        # continue_run is fire-and-forget on the host; poll handles phase.
+        def done(_):
+            self._starting = False
+            self._set_status("Simulation running — use ⏸/⏹ to steer it.")
+            self._update_runctl()
+
+        worker = _SessionWorker(task)
+        worker.logged.connect(self._on_toolbar_log)
+        worker.done.connect(done)
+        worker.failed.connect(self._on_toolbar_run_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._run_worker = worker
+        worker.start()
 
     def closeEvent(self, event):
         self._live.shutdown()

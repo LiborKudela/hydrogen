@@ -61,7 +61,11 @@ T_RAMP = 0.06          # s      pressurisation window (ramp 1 bar -> 20 MPa)
 # --- run configuration ------------------------------------------------------
 DAY = 24 * 3600.0
 T_END = T_RAMP + 365.0 * DAY                 # ramp, then ~1 year of leak
-STRATEGY = {"name": "richardson", "tol_local": 1e-3, "atol": 1.0}
+STRATEGY = {"name": "tr_bdf2", "tol_local": 1e-3, "atol": 1.0}
+
+# Inlet bore pressure: the source outlet is wired to the pipe inlet, and
+# connection short-circuiting drops the segment duplicate from the record.
+P_VAR = "source.p_out"
 
 
 class PressurizedPipe(hd.Model):
@@ -146,7 +150,7 @@ def main():
     # Read the timeseries back through the in-process Model accessors.
     report(
         t=system.record_time(),
-        p_bore=system.series("pipe_segment_0.p_in"),
+        p_bore=system.series(P_VAR),
         uptake=system.series_values("m_dot_a_leak").sum(axis=1),
         env=np.abs(system.series_values("m_dot_b_leak").sum(axis=1)),
     )

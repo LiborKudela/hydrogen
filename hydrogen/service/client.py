@@ -707,6 +707,26 @@ class SystemProxy:
         """Resume a paused run; it continues from where it was paused."""
         return self._conn.call("resume", system_id=self.system_id)
 
+    def update_run_config(self, **config):
+        """Change live run knobs (``stop_time``, ``dt_max``, …) at step boundaries.
+
+        Works while a run is *running* or *paused*, or after *finished* / *stopped*
+        to extend ``stop_time`` and mark the run *continuable* for
+        :meth:`continue_run`.
+        """
+        return self._conn.call(
+            "update_run_config", system_id=self.system_id, **config)
+
+    def continue_run(self, *, stream=True, every=1, delay=0.0):
+        """Resume integrating from the current model time without re-initialising.
+
+        Requires ``stop_time`` to lie ahead of the current model time (extend it
+        via :meth:`update_run_config` after a natural finish if needed).
+        """
+        return self._conn.call(
+            "continue_run", system_id=self.system_id,
+            stream=stream, every=every, delay=delay)
+
     def close(self):
         """Free this model on the host (the connection stays open)."""
         return self._conn.call("close", system_id=self.system_id)

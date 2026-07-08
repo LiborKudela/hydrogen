@@ -25,6 +25,7 @@ they are built on.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -204,15 +205,15 @@ class Pipe(Model):
         self,
         medium: CoolPropMedium,
         D: Annotated[float, ParamSpec("Pipe bore (inner) diameter.",
-                    unit="m", default=0.01, ui_label=True)],
+                    unit="m", default=0.01, ui_label=True, structural=True)],
         L: Annotated[float, ParamSpec("Total pipe length.", unit="m",
-                    default=1.0, ui_label=True)],
+                    default=1.0, ui_label=True, structural=True)],
         epsilon: Annotated[float, ParamSpec("Absolute wall roughness "
                           "(friction).", unit="m", default=1e-6)],
         z_in: Annotated[float, ParamSpec("Elevation of the inlet.", unit="m",
-                       default=0.0)],
+                       default=0.0, structural=True)],
         z_out: Annotated[float, ParamSpec("Elevation of the outlet.",
-                        unit="m", default=0.0)],
+                        unit="m", default=0.0, structural=True)],
         n_segments: Annotated[int, ParamSpec("Number of axial finite-volume "
                              "segments.", unit="1", default=1,
                              structural=True)],
@@ -261,16 +262,18 @@ class Pipe(Model):
                        choices=("segmented", "straight"), structural=True)]
                        = "segmented",
         dynamic: Annotated[str, ParamSpec("Flow dynamic level (segmented engine "
-                       "only): 'static' (quasi-steady, default), 'advective' "
-                       "(transient cell energy: conduction + dispersion + "
-                       "enthalpy storage), 'compressible' (advective + per-cell "
-                       "mass storage with a free cell pressure and staggered "
-                       "momentum -- use for a gas / two-phase medium whose "
-                       "density changes appreciably in time), or 'acoustic' "
-                       "(compressible + transient interior-face momentum "
-                       "inertia -- the exact all-regime option, well-conditioned "
-                       "even for an incompressible liquid, but the most "
-                       "expensive).",
+                       "only): 'static' (quasi-steady, default -- every segment "
+                       "equilibrates instantly; fine for steady operation or "
+                       "slow changes, but NOT for fast valve/source ramps that "
+                       "fill a long line), 'advective' (transient cell energy: "
+                       "conduction + dispersion + enthalpy storage), "
+                       "'compressible' (advective + per-cell mass storage with a "
+                       "free cell pressure and staggered momentum -- use for gas "
+                       "pressurisation / fill-up transients in long pipes), or "
+                       "'acoustic' (compressible + transient interior-face "
+                       "momentum inertia -- the exact all-regime option, "
+                       "well-conditioned even for an incompressible liquid, but "
+                       "the most expensive).",
                        choices=("static", "advective", "compressible",
                                 "acoustic"),
                        structural=True)] = "static",
@@ -403,6 +406,16 @@ class Pipe(Model):
         self.count = int(count)
         self.channel_engine = channel_engine
         self.dynamic = dynamic
+        if (channel_engine == "segmented" and dynamic == "static"
+                and float(L) > 5.0):
+            warnings.warn(
+                f"Pipe(dynamic='static', L={L} m): flow is quasi-steady in "
+                f"every segment, so a fast boundary transient (valve opening, "
+                f"ramped source, …) cannot pressurise/fill a long line — the "
+                f"solver typically fails when flow starts.  Use "
+                f"dynamic='compressible' (gas fill-up) or 'advective', or slow "
+                f"the boundary ramp.",
+                stacklevel=2)
         if dispersion not in ("general", "conduction", "taylor_aris",
                               "turbulent", "constant"):
             raise ValueError(

@@ -90,6 +90,11 @@ class SimulationSession:
         # elapsed the host reports on `done`.
         self._run_wall_t0: float | None = None
         self._run_wall_elapsed = 0.0
+        self._continuable = False
+        # Snapshot of the canvas model when the current run started / was paused;
+        # resume/continue is only offered while this still matches.
+        self._run_checkpoint: dict | None = None
+        self._run_stale = False
         # Guards state transitions so a background build and a GUI-thread abort
         # don't interleave; `_gen` bumps on every abort/reset so a build that
         # finishes *after* it was aborted discards its (now-dead) result.
@@ -151,6 +156,45 @@ class SimulationSession:
     def run_active(self) -> bool:
         """A streaming run is advancing or parked (i.e. controllable)."""
         return self._run_phase in ("running", "paused")
+
+    @property
+    def can_continue(self) -> bool:
+        """The built model can integrate further without re-initialising."""
+        return (self._continuable and not self._run_stale
+                and self._run_checkpoint is not None
+                and self._sysp is not None
+                and self._run_phase in ("finished", "stopped"))
+
+    def set_run_checkpoint(self, system: dict, inst_kw: dict):
+        """Remember the model definition the current run belongs to."""
+        self._run_checkpoint = {
+            "structural": self._structural_signature(system, inst_kw),
+            "params": self._pure_params(system),
+        }
+        self._run_stale = False
+
+    def is_checkpoint_current(self, system: dict, inst_kw: dict) -> bool:
+        if self._run_stale or self._run_checkpoint is None:
+            return False
+        if self._structural_signature(system, inst_kw) != self._run_checkpoint["structural"]:
+            return False
+        return self._pure_params(system) == self._run_checkpoint["params"]
+
+    def can_steering_resume(self, system: dict, inst_kw: dict) -> bool:
+        """True when pause/resume or continue is valid for this canvas state."""
+        if not self.is_checkpoint_current(system, inst_kw):
+            return False
+        if self._run_phase == "paused":
+            return True
+        return self.can_continue
+
+    def mark_model_stale(self):
+        """The canvas model no longer matches the run checkpoint."""
+        if self._run_checkpoint is None and not self._run_stale:
+            return
+        self._run_stale = True
+        self._continuable = False
+        self._run_checkpoint = None
 
     @property
     def run_step(self) -> int:
@@ -236,6 +280,11 @@ class SimulationSession:
         """
         sig = self._structural_signature(system, inst_kw)
         if self._sysp is None:
+            self._build(system, inst_kw, sig, log)
+            return "built"
+        if self._run_stale:
+            log("model changed since last run — re-instantiating model.",
+                "status")
             self._build(system, inst_kw, sig, log)
             return "built"
         if sig != self._sig:
@@ -424,8 +473,71 @@ class SimulationSession:
             self._dispatch_run_cmd("pause")
 
     def resume_run(self):
-        if self._run_phase == "paused":
+        if self._run_phase == "paused" and not self._run_stale:
             self._dispatch_run_cmd("resume")
+
+    def stop_and_drain(self, log: LogFn):
+        """Cooperatively stop a running/paused stream and wait for confirmation."""
+        if self._sysp is None:
+            return
+        if self._run_phase not in ("running", "paused"):
+            return
+        self._stopping = True
+        try:
+            self._sysp.stop()
+        except Exception:
+            pass
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            self._drain(log)
+            if self._run_phase in (None, "stopped", "finished", "error"):
+                break
+            time.sleep(0.05)
+        self._stopping = False
+
+    def continue_run(self, *, every: int = 20):
+        """Continue integrating from the current model time (no re-init)."""
+        sysp = self._sysp
+        if sysp is None or not self.can_continue or self._run_stale:
+            return
+        self._stopping = False
+        self._run_phase = "running"
+        self._continuable = False
+        self._run_wall_t0 = time.monotonic()
+
+        def go():
+            try:
+                sysp.continue_run(stream=True, every=every)
+            except Exception:
+                pass
+
+        threading.Thread(target=go, name="hydrogen-run-continue",
+                         daemon=True).start()
+
+    def push_run_config(self, config: dict, log: LogFn | None = None):
+        """Push live simulate knobs to the host (pause / finished / stopped)."""
+        if self._sysp is None or not config:
+            return
+        try:
+            applied = self._sysp.update_run_config(**config)
+        except Exception as exc:
+            if log is not None:
+                log(f"update_run_config failed: {type(exc).__name__}: {exc}",
+                    "error")
+            return
+        if "continuable" in applied:
+            self._continuable = bool(applied["continuable"])
+        if applied.get("stop_time") is not None:
+            self._run_stop_time = float(applied["stop_time"])
+        if log is not None:
+            bits = []
+            if "stop_time" in applied:
+                bits.append(f"stop_time={applied['stop_time']}")
+            rc = applied.get("run_control") or {}
+            if "dt_max" in rc:
+                bits.append(f"dt_max={rc['dt_max']}")
+            if bits:
+                log("Live run config: " + ", ".join(bits), "status")
 
     def stop_run(self):
         if self.run_active:
@@ -456,6 +568,9 @@ class SimulationSession:
             self._run_stop_time = None
             self._run_wall_t0 = None
             self._run_wall_elapsed = 0.0
+            self._continuable = False
+            self._run_checkpoint = None
+            self._run_stale = False
         self.clear_warnings()
 
     def shutdown(self):
@@ -494,6 +609,9 @@ class SimulationSession:
             self._run_stop_time = None
             self._run_wall_t0 = None
             self._run_wall_elapsed = 0.0
+            self._continuable = False
+            self._run_checkpoint = None
+            self._run_stale = False
         self.clear_warnings()
         if svc is not None:
             try:
@@ -532,6 +650,10 @@ class SimulationSession:
                 phase = ev.get("phase")
                 if phase:
                     self._run_phase = phase
+                if "continuable" in ev:
+                    self._continuable = bool(ev["continuable"])
+                if ev.get("stop_time") is not None:
+                    self._run_stop_time = float(ev["stop_time"])
                 self._capture_run_stats(ev)
             elif etype == "done":
                 self._capture_run_stats(ev)
@@ -540,6 +662,10 @@ class SimulationSession:
                 phase = ev.get("phase") or (
                     "stopped" if self._stopping else "finished")
                 self._run_phase = phase
+                if "continuable" in ev:
+                    self._continuable = bool(ev["continuable"])
+                if ev.get("stop_time") is not None:
+                    self._run_stop_time = float(ev["stop_time"])
                 self._stopping = False
                 self._log_run_summary(ev, phase, log)
 

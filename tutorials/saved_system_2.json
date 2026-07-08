@@ -99,12 +99,12 @@
         "mirror_y": false,
         "medium": "Hydrogen",
         "params": {
-          "D": 0.005,
-          "L": 1.0,
+          "D": 0.003,
+          "L": 10.0,
           "epsilon": 1e-06,
           "z_in": 0.0,
           "z_out": 0.0,
-          "n_segments": 50,
+          "n_segments": 20,
           "layers": [
             {
               "__type__": "WallLayer",
@@ -115,7 +115,7 @@
                 "cp": 500.0,
                 "k": 15.0
               },
-              "thickness": 0.002,
+              "thickness": 0.0015,
               "permeation": {
                 "__type__": "TransientDiffusion",
                 "transport_fit": {
@@ -149,7 +149,7 @@
           "p_init": 101325.0,
           "count": 1,
           "channel_engine": "segmented",
-          "dynamic": "static",
+          "dynamic": "compressible",
           "dispersion": "general",
           "D_axial": 0.0,
           "advection_scheme": "U2D1",
@@ -193,6 +193,71 @@
             "label": "pipe_2.m_dot_leak_env (integral)",
             "name": "m_dot_leak_env (integral)",
             "unit": "kg",
+            "value": null
+          },
+          {
+            "agg": {
+              "axis": "instances",
+              "op": "sum",
+              "sources": [
+                "pipe_2.pipe.m_dot_leak_0",
+                "pipe_2.pipe.m_dot_leak_1",
+                "pipe_2.pipe.m_dot_leak_10",
+                "pipe_2.pipe.m_dot_leak_11",
+                "pipe_2.pipe.m_dot_leak_12",
+                "pipe_2.pipe.m_dot_leak_13",
+                "pipe_2.pipe.m_dot_leak_14",
+                "pipe_2.pipe.m_dot_leak_15",
+                "pipe_2.pipe.m_dot_leak_16",
+                "pipe_2.pipe.m_dot_leak_17",
+                "pipe_2.pipe.m_dot_leak_18",
+                "pipe_2.pipe.m_dot_leak_19",
+                "pipe_2.pipe.m_dot_leak_2",
+                "pipe_2.pipe.m_dot_leak_20",
+                "pipe_2.pipe.m_dot_leak_21",
+                "pipe_2.pipe.m_dot_leak_22",
+                "pipe_2.pipe.m_dot_leak_23",
+                "pipe_2.pipe.m_dot_leak_24",
+                "pipe_2.pipe.m_dot_leak_25",
+                "pipe_2.pipe.m_dot_leak_26",
+                "pipe_2.pipe.m_dot_leak_27",
+                "pipe_2.pipe.m_dot_leak_28",
+                "pipe_2.pipe.m_dot_leak_29",
+                "pipe_2.pipe.m_dot_leak_3",
+                "pipe_2.pipe.m_dot_leak_30",
+                "pipe_2.pipe.m_dot_leak_31",
+                "pipe_2.pipe.m_dot_leak_32",
+                "pipe_2.pipe.m_dot_leak_33",
+                "pipe_2.pipe.m_dot_leak_34",
+                "pipe_2.pipe.m_dot_leak_35",
+                "pipe_2.pipe.m_dot_leak_36",
+                "pipe_2.pipe.m_dot_leak_37",
+                "pipe_2.pipe.m_dot_leak_38",
+                "pipe_2.pipe.m_dot_leak_39",
+                "pipe_2.pipe.m_dot_leak_4",
+                "pipe_2.pipe.m_dot_leak_40",
+                "pipe_2.pipe.m_dot_leak_41",
+                "pipe_2.pipe.m_dot_leak_42",
+                "pipe_2.pipe.m_dot_leak_43",
+                "pipe_2.pipe.m_dot_leak_44",
+                "pipe_2.pipe.m_dot_leak_45",
+                "pipe_2.pipe.m_dot_leak_46",
+                "pipe_2.pipe.m_dot_leak_47",
+                "pipe_2.pipe.m_dot_leak_48",
+                "pipe_2.pipe.m_dot_leak_49",
+                "pipe_2.pipe.m_dot_leak_5",
+                "pipe_2.pipe.m_dot_leak_6",
+                "pipe_2.pipe.m_dot_leak_7",
+                "pipe_2.pipe.m_dot_leak_8",
+                "pipe_2.pipe.m_dot_leak_9"
+              ]
+            },
+            "description": "sum of m_dot_leak_0, m_dot_leak_1, m_dot_leak_10, m_dot_leak_11, m_dot_leak_12, m_dot_leak_13 \u2026 (+44 more)",
+            "full": "__derived__:ab652a7a2071",
+            "kind": "derived",
+            "label": "pipe_2.sum(50)",
+            "name": "sum(50)",
+            "unit": "kg/s",
             "value": null
           }
         ]
@@ -266,7 +331,24 @@
           ]
         },
         "ports": {},
-        "derived_variables": []
+        "derived_variables": [
+          {
+            "agg": {
+              "axis": "time",
+              "op": "integral",
+              "sources": [
+                "tank_3.m_dot_leak_env"
+              ]
+            },
+            "description": "integral of tank_3.m_dot_leak_env",
+            "full": "__derived__:15a7eb2cfdd7",
+            "kind": "derived",
+            "label": "tank_3.m_dot_leak_env (integral)",
+            "name": "m_dot_leak_env (integral)",
+            "unit": "kg",
+            "value": null
+          }
+        ]
       }
     ],
     "connections": [
@@ -290,10 +372,10 @@
     "objects": [
       {
         "kind": "table",
-        "x": 701.3010037813223,
-        "y": 1096.7384678503677,
-        "w": 551.2773937922708,
-        "h": 353.941288032366,
+        "x": 735.1584097443388,
+        "y": 1115.077461986457,
+        "w": 820.3419446318832,
+        "h": 301.54549839691487,
         "content": {
           "title": "Variables",
           "rows": [
@@ -345,6 +427,97 @@
               "unit": "kg/s",
               "description": "",
               "value": 0.0
+            },
+            {
+              "full": "__derived__:83ff99d48fc3",
+              "label": "pipe_2.m_dot_leak_env (integral)",
+              "unit": "kg",
+              "description": "integral of pipe_2.m_dot_leak_env",
+              "value": null,
+              "agg": {
+                "axis": "time",
+                "op": "integral",
+                "sources": [
+                  "pipe_2.m_dot_leak_env"
+                ]
+              }
+            },
+            {
+              "full": "__derived__:15a7eb2cfdd7",
+              "label": "tank_3.m_dot_leak_env (integral)",
+              "unit": "kg",
+              "description": "integral of tank_3.m_dot_leak_env",
+              "value": null,
+              "agg": {
+                "axis": "time",
+                "op": "integral",
+                "sources": [
+                  "tank_3.m_dot_leak_env"
+                ]
+              }
+            },
+            {
+              "full": "__derived__:ab652a7a2071",
+              "label": "pipe_2.sum(50)",
+              "unit": "kg/s",
+              "description": "sum of m_dot_leak_0, m_dot_leak_1, m_dot_leak_10, m_dot_leak_11, m_dot_leak_12, m_dot_leak_13 \u2026 (+44 more)",
+              "value": null,
+              "agg": {
+                "axis": "instances",
+                "op": "sum",
+                "sources": [
+                  "pipe_2.pipe.m_dot_leak_0",
+                  "pipe_2.pipe.m_dot_leak_1",
+                  "pipe_2.pipe.m_dot_leak_10",
+                  "pipe_2.pipe.m_dot_leak_11",
+                  "pipe_2.pipe.m_dot_leak_12",
+                  "pipe_2.pipe.m_dot_leak_13",
+                  "pipe_2.pipe.m_dot_leak_14",
+                  "pipe_2.pipe.m_dot_leak_15",
+                  "pipe_2.pipe.m_dot_leak_16",
+                  "pipe_2.pipe.m_dot_leak_17",
+                  "pipe_2.pipe.m_dot_leak_18",
+                  "pipe_2.pipe.m_dot_leak_19",
+                  "pipe_2.pipe.m_dot_leak_2",
+                  "pipe_2.pipe.m_dot_leak_20",
+                  "pipe_2.pipe.m_dot_leak_21",
+                  "pipe_2.pipe.m_dot_leak_22",
+                  "pipe_2.pipe.m_dot_leak_23",
+                  "pipe_2.pipe.m_dot_leak_24",
+                  "pipe_2.pipe.m_dot_leak_25",
+                  "pipe_2.pipe.m_dot_leak_26",
+                  "pipe_2.pipe.m_dot_leak_27",
+                  "pipe_2.pipe.m_dot_leak_28",
+                  "pipe_2.pipe.m_dot_leak_29",
+                  "pipe_2.pipe.m_dot_leak_3",
+                  "pipe_2.pipe.m_dot_leak_30",
+                  "pipe_2.pipe.m_dot_leak_31",
+                  "pipe_2.pipe.m_dot_leak_32",
+                  "pipe_2.pipe.m_dot_leak_33",
+                  "pipe_2.pipe.m_dot_leak_34",
+                  "pipe_2.pipe.m_dot_leak_35",
+                  "pipe_2.pipe.m_dot_leak_36",
+                  "pipe_2.pipe.m_dot_leak_37",
+                  "pipe_2.pipe.m_dot_leak_38",
+                  "pipe_2.pipe.m_dot_leak_39",
+                  "pipe_2.pipe.m_dot_leak_4",
+                  "pipe_2.pipe.m_dot_leak_40",
+                  "pipe_2.pipe.m_dot_leak_41",
+                  "pipe_2.pipe.m_dot_leak_42",
+                  "pipe_2.pipe.m_dot_leak_43",
+                  "pipe_2.pipe.m_dot_leak_44",
+                  "pipe_2.pipe.m_dot_leak_45",
+                  "pipe_2.pipe.m_dot_leak_46",
+                  "pipe_2.pipe.m_dot_leak_47",
+                  "pipe_2.pipe.m_dot_leak_48",
+                  "pipe_2.pipe.m_dot_leak_49",
+                  "pipe_2.pipe.m_dot_leak_5",
+                  "pipe_2.pipe.m_dot_leak_6",
+                  "pipe_2.pipe.m_dot_leak_7",
+                  "pipe_2.pipe.m_dot_leak_8",
+                  "pipe_2.pipe.m_dot_leak_9"
+                ]
+              }
             }
           ]
         }
@@ -483,7 +656,7 @@
           "title": "Pie chart",
           "entries": [
             {
-              "full": "__derived__:0916d4670b2c",
+              "full": "__derived__:83ff99d48fc3",
               "label": "pipe_2.m_dot_leak_env (integral)",
               "color": "#1f77b4",
               "visible": true,
@@ -496,7 +669,7 @@
               }
             },
             {
-              "full": "__derived__:057556e2a84e",
+              "full": "__derived__:15a7eb2cfdd7",
               "label": "tank_3.m_dot_leak_env (integral)",
               "color": "#d62728",
               "visible": true,
@@ -512,9 +685,9 @@
           "settings": {
             "title": "Pie chart",
             "legend": true,
-            "legend_pos": "right",
             "title_size": 12,
-            "show_percent": true
+            "show_percent": true,
+            "legend_pos": "right"
           }
         }
       },
@@ -578,14 +751,14 @@
       "stop_time": 50.0,
       "dt_start": 0.0001,
       "dt_min": 1e-09,
-      "dt_max": 1000.0,
+      "dt_max": 100000.0,
       "grow": 1.5,
       "shrink": 0.5,
-      "max_retries": 20,
+      "max_retries": 200,
       "relaxation": 1.0,
       "tol": 1e-06,
-      "max_iter": 200,
-      "line_search": false,
+      "max_iter": 20,
+      "line_search": true,
       "tol_local": 0.001,
       "atol": 1.0
     }

@@ -85,12 +85,12 @@ _SPEC_LEAKY = ParamSpec(
     "If true, expose a permeation `leak` port whose mass-flow is subtracted "
     "from the continuity balance; if false the wall is sealed.", structural=True)
 _SPEC_Z_IN = ParamSpec("Elevation of the inlet face (gravity head).",
-                       unit="m", default=0.0)
+                       unit="m", default=0.0, structural=True)
 _SPEC_Z_OUT = ParamSpec("Elevation of the outlet face (gravity head).",
-                        unit="m", default=0.0)
+                        unit="m", default=0.0, structural=True)
 _SPEC_EPSILON = ParamSpec("Absolute wall roughness (friction).", unit="m",
                           default=1e-6)
-_SPEC_L = ParamSpec("Flow length.", unit="m", default=1.0)
+_SPEC_L = ParamSpec("Flow length.", unit="m", default=1.0, structural=True)
 _SPEC_COUNT = ParamSpec(
     "Number of identical parallel segments this one component represents "
     "(multiplicity >= 1).  A live Parameter (NOT structural): retuning it "
@@ -709,9 +709,9 @@ class StraightPipe(Model):
         self,
         medium: CoolPropMedium,
         D: Annotated[float, ParamSpec("Pipe bore (inner) diameter.", unit="m",
-                    default=0.01)],
+                    default=0.01, structural=True)],
         L: Annotated[float, ParamSpec("Total pipe length.", unit="m",
-                    default=1.0)],
+                    default=1.0, structural=True)],
         epsilon: Annotated[float, _SPEC_EPSILON],
         z_in: Annotated[float, _SPEC_Z_IN],
         z_out: Annotated[float, _SPEC_Z_OUT],
@@ -1165,9 +1165,9 @@ class SegmentedChannel(Model):
         self,
         medium: CoolPropMedium,
         D: Annotated[float, ParamSpec("Pipe bore (inner) diameter.", unit="m",
-                    default=0.01)],
+                    default=0.01, structural=True)],
         L: Annotated[float, ParamSpec("Total flow length.", unit="m",
-                    default=1.0)],
+                    default=1.0, structural=True)],
         epsilon: Annotated[float, _SPEC_EPSILON],
         z_in: Annotated[float, _SPEC_Z_IN],
         z_out: Annotated[float, _SPEC_Z_OUT],

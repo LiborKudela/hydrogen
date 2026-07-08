@@ -23,7 +23,7 @@ from .session import SimulationSession
 __all__ = [
     "OptionsForm", "LogPanel", "SimSettingsDialog", "SimulateDialog",
     "default_sim_options", "instantiate_kwargs", "initialise_kwargs",
-    "run_kwargs",
+    "run_kwargs", "run_config_patch", "LIVE_SIM_FIELDS",
 ]
 
 #: Field descriptors for the Simulate window's option tabs.  Each entry is
@@ -115,6 +115,40 @@ def _opts_defaults(fields: list[dict]) -> dict:
         elif d is not None:
             out[f["name"]] = d
     return out
+
+
+#: Simulate options that can be pushed mid-run / after finish (step boundaries).
+LIVE_SIM_FIELDS = frozenset({
+    "stop_time", "dt_max", "dt_min", "grow", "shrink", "max_retries",
+    "relaxation", "tol", "max_iter", "line_search", "tol_local", "atol",
+})
+
+
+def run_config_patch(options: dict) -> dict:
+    """Build :meth:`SystemProxy.update_run_config` kwargs from simulate options."""
+    sim = dict(options.get("simulate", {}))
+    patch: dict = {}
+    if "stop_time" in sim and sim["stop_time"] is not None:
+        patch["stop_time"] = float(sim["stop_time"])
+    adaptive = {}
+    for key in (
+        "dt_min", "dt_max", "grow", "shrink", "max_retries",
+        "relaxation", "tol", "max_iter", "line_search",
+    ):
+        if key in sim and sim[key] is not None:
+            adaptive[key] = sim[key]
+    if adaptive:
+        patch["adaptive"] = adaptive
+    strat_name = sim.get("strategy")
+    strat_extra = {}
+    for key in ("tol_local", "atol"):
+        if key in sim and sim[key] is not None:
+            strat_extra[key] = sim[key]
+    if strat_name in ("richardson", "tr_bdf2") and strat_extra:
+        patch["strategy"] = {"name": strat_name, **strat_extra}
+    elif strat_extra:
+        patch.update(strat_extra)
+    return patch
 
 
 def default_sim_options() -> dict:
@@ -314,15 +348,22 @@ class SimSettingsDialog(QtWidgets.QDialog):
     """
 
     def __init__(self, options: dict | None = None, system: dict | None = None,
-                 parent=None):
+                 parent=None, *, live_sim_only: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Simulation settings")
+        self._live_sim_only = live_sim_only
 
         outer = QtWidgets.QVBoxLayout(self)
-        header = QtWidgets.QLabel(
-            "<b>Simulation settings</b> &mdash; these drive the host's "
-            "instantiate / initialise / run calls. They are saved with the "
-            "project and reused on every run.")
+        if live_sim_only:
+            header = QtWidgets.QLabel(
+                "<b>Live simulation controls</b> &mdash; apply at the next step "
+                "(or before resuming). Instantiation / initialisation options "
+                "are locked while a run is in progress.")
+        else:
+            header = QtWidgets.QLabel(
+                "<b>Simulation settings</b> &mdash; these drive the host's "
+                "instantiate / initialise / run calls. They are saved with the "
+                "project and reused on every run.")
         header.setWordWrap(True)
         outer.addWidget(header)
 
@@ -335,6 +376,7 @@ class SimSettingsDialog(QtWidgets.QDialog):
             self._sim_form.set_values(options.get("simulate", {}))
 
         tabs = QtWidgets.QTabWidget()
+        self._tabs = tabs
         tabs.addTab(_scroll(self._inst_form), "Instantiation")
         tabs.addTab(_scroll(self._init_form), "Initialisation")
         tabs.addTab(_scroll(self._sim_form), "Simulation")
@@ -345,10 +387,26 @@ class SimSettingsDialog(QtWidgets.QDialog):
             tabs.addTab(spec, "Spec JSON")
         outer.addWidget(tabs, 1)
 
+        if live_sim_only:
+            tabs.setTabEnabled(0, False)
+            tabs.setTabEnabled(1, False)
+            if tabs.count() > 3:
+                tabs.setTabEnabled(3, False)
+            tabs.setCurrentIndex(2)
+            for name, (ftype, w) in self._sim_form._editors.items():
+                ro = name not in LIVE_SIM_FIELDS
+                w.setEnabled(not ro)
+                if ro:
+                    w.setToolTip(w.toolTip() + " (locked during a live run)")
+
         note = QtWidgets.QLabel(
             "Changing an <b>instantiation</b> option re-compiles the model on "
             "the next run; initialise / simulate options apply without a "
             "rebuild.")
+        if live_sim_only:
+            note.setText(
+                "Only the highlighted <b>simulation</b> knobs are pushed to the "
+                "host; stop the run to edit instantiation / strategy.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #666;")
         outer.addWidget(note)
@@ -701,6 +759,7 @@ class SimulateDialog(QtWidgets.QDialog):
         def task(log):
             outcome = self._session.ensure_built(system, inst_kw, log)
             log(f"model {outcome}; starting run …", "status")
+            self._session.set_run_checkpoint(system, inst_kw)
             return self._session.start_run(init_kw, run_kw, log)
 
         self._start_worker(
