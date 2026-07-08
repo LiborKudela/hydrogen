@@ -145,6 +145,21 @@ _WORKER_CACHE_DIR = None
 _WORKER_PAYLOADS = None  # list of (label, key, args_mat, block, cse), indexed by task
 
 
+def _mp_fork_available() -> bool:
+    """Return whether the multiprocessing ``fork`` start method exists.
+
+    Parallel template lambdify relies on fork so worker processes inherit the
+    parent's module globals (CoolProp ``Symbolic_property`` classes are not
+    pickle-safe).  Windows has no ``fork`` context, so callers must fall back
+    to the sequential path.
+    """
+    try:
+        _mp.get_context("fork")
+    except ValueError:
+        return False
+    return True
+
+
 # Step B's `declare_equations()` template cache (see `Model.collect_equations`).
 #
 # Scoped to ONE `Model.instantiate()` call via a `ContextVar` rather than a
@@ -2872,7 +2887,13 @@ class Model:
             "HYDROGEN_PARALLEL_LAMBDIFY",
             str(min(len(cache_misses), max(1, (os.cpu_count() or 1))))
         ))
-        if cache_misses and worker_procs > 1 and self._lambda_cache_dir is not None:
+        use_parallel_lambdify = (
+            cache_misses
+            and worker_procs > 1
+            and self._lambda_cache_dir is not None
+            and _mp_fork_available()
+        )
+        if use_parallel_lambdify:
             payloads = [
                 (p["label"], p["key"], p["args_mat"], p["block"], cse)
                 for p in cache_misses
@@ -2914,7 +2935,11 @@ class Model:
                 prep["cached_func"] = fn
                 print(f"  [lambda-cache MISS for {prep['label']}: {key[:8] if key else '????????'} (saved)]")
         elif cache_misses:
-            # Sequential fallback.
+            if worker_procs > 1 and not _mp_fork_available():
+                print("  [parallel lambdify skipped: 'fork' is unavailable on "
+                      "this platform; using sequential fallback]")
+            # Sequential fallback (also used when worker_procs <= 1 or the user
+            # set HYDROGEN_PARALLEL_LAMBDIFY=0).
             for prep in cache_misses:
                 fn = lambdify_compat(
                     prep["args_mat"], prep["block"],
