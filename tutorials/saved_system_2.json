@@ -5,115 +5,30 @@
   "canvas": {
     "nodes": [
       {
-        "comp_id": "pressuresource_5",
-        "type": "hydrogen.thermofluid.PressureSource",
-        "x": 453.6357909248202,
-        "y": 570.8513804200315,
-        "rot": 0,
-        "mirror_x": false,
-        "mirror_y": false,
-        "medium": "Hydrogen",
-        "params": {
-          "p_source": 1001325.0,
-          "T_source": 293.15,
-          "A": 0.001,
-          "p_control": false
-        },
-        "ports_locked": true,
-        "label_offsets": {
-          "title": [
-            -2.1520270778028134,
-            -0.6486498672667267
-          ],
-          "params": [
-            0.0,
-            0.0
-          ]
-        },
-        "ports": {},
-        "derived_variables": []
-      },
-      {
-        "comp_id": "compressiblevalve_4",
-        "type": "hydrogen.thermofluid.CompressibleValve",
-        "x": 676.1800951457715,
-        "y": 577.894357498732,
-        "rot": 0,
-        "mirror_x": false,
-        "mirror_y": false,
-        "medium": "Hydrogen",
-        "params": null,
-        "ports_locked": true,
-        "label_offsets": {
-          "title": [
-            0.7322517488694302,
-            96.00499192829477
-          ],
-          "params": [
-            0.0,
-            0.0
-          ]
-        },
-        "ports": {},
-        "derived_variables": []
-      },
-      {
-        "comp_id": "ramp_6",
-        "type": "hydrogen.control.Ramp",
-        "x": 559.43827294283,
-        "y": 443.73726341912607,
-        "rot": 0,
-        "mirror_x": false,
-        "mirror_y": false,
-        "medium": null,
-        "params": {
-          "height": 1.0,
-          "duration": 1.0,
-          "start_time": 1.0,
-          "offset": 0.0,
-          "unit": "1"
-        },
-        "ports_locked": true,
-        "label_offsets": {
-          "title": [
-            0.0,
-            0.0
-          ],
-          "params": [
-            0.0,
-            0.0
-          ]
-        },
-        "ports": {},
-        "derived_variables": [],
-        "w": 150.0,
-        "h": 78.0
-      },
-      {
         "comp_id": "pipe_2",
         "type": "hydrogen.thermofluid.Pipe",
-        "x": 937.47016510055,
-        "y": 584.6053935523491,
+        "x": 659.8230160152193,
+        "y": 607.5189954116931,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
         "medium": "Hydrogen",
         "params": {
-          "D": 0.003,
+          "D": 0.012,
           "L": 10.0,
           "epsilon": 1e-06,
           "z_in": 0.0,
           "z_out": 0.0,
-          "n_segments": 20,
+          "n_segments": 25,
           "layers": [
             {
               "__type__": "WallLayer",
               "material": {
                 "__type__": "WallMaterial",
-                "name": "AISI 316/316L",
-                "rho": 7990.0,
+                "name": "AISI 304/304L",
+                "rho": 7900.0,
                 "cp": 500.0,
-                "k": 15.0
+                "k": 16.2
               },
               "thickness": 0.0015,
               "permeation": {
@@ -140,7 +55,7 @@
             }
           ],
           "multiphase": "single",
-          "outer_thermal": "adiabatic",
+          "outer_thermal": "convective",
           "h_ext": 10.0,
           "T_ext": 293.15,
           "T_outer": 293.15,
@@ -181,92 +96,61 @@
         "derived_variables": [
           {
             "agg": {
-              "axis": "time",
-              "op": "integral",
-              "sources": [
-                "pipe_2.m_dot_leak_env"
-              ]
+              "axis": "formula",
+              "expr": "abs(sum(g1))",
+              "groups": {
+                "g1": {
+                  "regex": "env_[0-9]*.m_dot",
+                  "scope": "pipe_2"
+                }
+              },
+              "op": "formula"
             },
-            "description": "integral of pipe_2.m_dot_leak_env",
-            "full": "__derived__:83ff99d48fc3",
+            "description": "formula abs(sum(g1)) over g1=/env_[0-9]*.m_dot/",
+            "full": "__derived__:2587979f0d1a",
             "kind": "derived",
-            "label": "pipe_2.m_dot_leak_env (integral)",
-            "name": "m_dot_leak_env (integral)",
-            "unit": "kg",
-            "value": null
-          },
-          {
-            "agg": {
-              "axis": "instances",
-              "op": "sum",
-              "sources": [
-                "pipe_2.pipe.m_dot_leak_0",
-                "pipe_2.pipe.m_dot_leak_1",
-                "pipe_2.pipe.m_dot_leak_10",
-                "pipe_2.pipe.m_dot_leak_11",
-                "pipe_2.pipe.m_dot_leak_12",
-                "pipe_2.pipe.m_dot_leak_13",
-                "pipe_2.pipe.m_dot_leak_14",
-                "pipe_2.pipe.m_dot_leak_15",
-                "pipe_2.pipe.m_dot_leak_16",
-                "pipe_2.pipe.m_dot_leak_17",
-                "pipe_2.pipe.m_dot_leak_18",
-                "pipe_2.pipe.m_dot_leak_19",
-                "pipe_2.pipe.m_dot_leak_2",
-                "pipe_2.pipe.m_dot_leak_20",
-                "pipe_2.pipe.m_dot_leak_21",
-                "pipe_2.pipe.m_dot_leak_22",
-                "pipe_2.pipe.m_dot_leak_23",
-                "pipe_2.pipe.m_dot_leak_24",
-                "pipe_2.pipe.m_dot_leak_25",
-                "pipe_2.pipe.m_dot_leak_26",
-                "pipe_2.pipe.m_dot_leak_27",
-                "pipe_2.pipe.m_dot_leak_28",
-                "pipe_2.pipe.m_dot_leak_29",
-                "pipe_2.pipe.m_dot_leak_3",
-                "pipe_2.pipe.m_dot_leak_30",
-                "pipe_2.pipe.m_dot_leak_31",
-                "pipe_2.pipe.m_dot_leak_32",
-                "pipe_2.pipe.m_dot_leak_33",
-                "pipe_2.pipe.m_dot_leak_34",
-                "pipe_2.pipe.m_dot_leak_35",
-                "pipe_2.pipe.m_dot_leak_36",
-                "pipe_2.pipe.m_dot_leak_37",
-                "pipe_2.pipe.m_dot_leak_38",
-                "pipe_2.pipe.m_dot_leak_39",
-                "pipe_2.pipe.m_dot_leak_4",
-                "pipe_2.pipe.m_dot_leak_40",
-                "pipe_2.pipe.m_dot_leak_41",
-                "pipe_2.pipe.m_dot_leak_42",
-                "pipe_2.pipe.m_dot_leak_43",
-                "pipe_2.pipe.m_dot_leak_44",
-                "pipe_2.pipe.m_dot_leak_45",
-                "pipe_2.pipe.m_dot_leak_46",
-                "pipe_2.pipe.m_dot_leak_47",
-                "pipe_2.pipe.m_dot_leak_48",
-                "pipe_2.pipe.m_dot_leak_49",
-                "pipe_2.pipe.m_dot_leak_5",
-                "pipe_2.pipe.m_dot_leak_6",
-                "pipe_2.pipe.m_dot_leak_7",
-                "pipe_2.pipe.m_dot_leak_8",
-                "pipe_2.pipe.m_dot_leak_9"
-              ]
-            },
-            "description": "sum of m_dot_leak_0, m_dot_leak_1, m_dot_leak_10, m_dot_leak_11, m_dot_leak_12, m_dot_leak_13 \u2026 (+44 more)",
-            "full": "__derived__:ab652a7a2071",
-            "kind": "derived",
-            "label": "pipe_2.sum(50)",
-            "name": "sum(50)",
-            "unit": "kg/s",
+            "label": "pipe_2.(abs(sum(g1)))",
+            "name": "(abs(sum(g1)))",
+            "unit": "",
             "value": null
           }
         ]
       },
       {
+        "comp_id": "ramp_12",
+        "type": "hydrogen.control.Ramp",
+        "x": 222.31098627048408,
+        "y": 606.305183545769,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": null,
+        "params": {
+          "height": 0.016,
+          "duration": 10.0,
+          "start_time": 0.0,
+          "offset": 0.0,
+          "unit": "kg/s"
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.0,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {},
+        "derived_variables": []
+      },
+      {
         "comp_id": "tank_3",
         "type": "hydrogen.thermofluid.Tank",
-        "x": 1138.9045162938216,
-        "y": 456.2517682164953,
+        "x": 862.5173732881365,
+        "y": 480.42537615548474,
         "rot": -90,
         "mirror_x": false,
         "mirror_y": false,
@@ -310,7 +194,7 @@
           ],
           "h_inner": 50.0,
           "count": 2,
-          "outer_thermal": "adiabatic",
+          "outer_thermal": "convective",
           "h_ext": 10.0,
           "T_ext": 293.15,
           "T_outer": 293.15,
@@ -349,33 +233,58 @@
             "value": null
           }
         ]
+      },
+      {
+        "comp_id": "masssource_9",
+        "type": "hydrogen.thermofluid.MassSource",
+        "x": 436.7599164502845,
+        "y": 605.9991846385245,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": {
+          "m_flow": 0.1,
+          "T_source": 293.15,
+          "p_init": 101325.0,
+          "m_control": true
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            0.0,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {},
+        "derived_variables": []
       }
     ],
     "connections": [
-      {
-        "from": "compressiblevalve_4.outlet",
-        "to": "pipe_2.inlet"
-      },
       {
         "from": "pipe_2.outlet",
         "to": "tank_3.inlet"
       },
       {
-        "from": "pressuresource_5.outlet",
-        "to": "compressiblevalve_4.inlet"
+        "from": "masssource_9.outlet",
+        "to": "pipe_2.inlet"
       },
       {
-        "from": "ramp_6.y",
-        "to": "compressiblevalve_4.opening"
+        "from": "ramp_12.y",
+        "to": "masssource_9.m_set"
       }
     ],
     "objects": [
       {
         "kind": "table",
-        "x": 735.1584097443388,
-        "y": 1115.077461986457,
-        "w": 820.3419446318832,
-        "h": 301.54549839691487,
+        "x": 705.0956384967287,
+        "y": 1093.4767495756016,
+        "w": 745.2758846971966,
+        "h": 486.64712272728076,
         "content": {
           "title": "Variables",
           "rows": [
@@ -415,6 +324,39 @@
               "value": null
             },
             {
+              "full": "__derived__:9502843798b3",
+              "label": "total_leak(integral(v1))",
+              "unit": "kg/s",
+              "description": "formula integral(v1) over v1=pipe_2.m_dot_leak_env",
+              "value": null,
+              "agg": {
+                "axis": "formula",
+                "expr": "integral(v1)",
+                "op": "formula",
+                "variables": {
+                  "v1": "pipe_2.m_dot_leak_env"
+                }
+              }
+            },
+            {
+              "full": "__derived__:36bbc20afd39",
+              "label": "test_leak_sum",
+              "unit": "kg/s",
+              "description": "formula integral(abs(sum(g1))) over g1=/pipe_2.env_[0-9]*.m_dot/",
+              "value": null,
+              "agg": {
+                "op": "formula",
+                "axis": "formula",
+                "expr": "integral(abs(sum(g1)))",
+                "groups": {
+                  "g1": {
+                    "regex": "pipe_2.env_[0-9]*.m_dot",
+                    "scope": ""
+                  }
+                }
+              }
+            },
+            {
               "full": "pipe_2.m_dot_leak_env",
               "label": "pipe_2.m_dot_leak_env",
               "unit": "kg/s",
@@ -429,94 +371,33 @@
               "value": 0.0
             },
             {
-              "full": "__derived__:83ff99d48fc3",
+              "full": "__derived__:57eb043734f8",
               "label": "pipe_2.m_dot_leak_env (integral)",
               "unit": "kg",
               "description": "integral of pipe_2.m_dot_leak_env",
               "value": null,
               "agg": {
-                "axis": "time",
-                "op": "integral",
-                "sources": [
-                  "pipe_2.m_dot_leak_env"
-                ]
+                "axis": "formula",
+                "expr": "integral(v1)",
+                "op": "formula",
+                "variables": {
+                  "v1": "pipe_2.m_dot_leak_env"
+                }
               }
             },
             {
-              "full": "__derived__:15a7eb2cfdd7",
+              "full": "__derived__:4976401f6619",
               "label": "tank_3.m_dot_leak_env (integral)",
               "unit": "kg",
               "description": "integral of tank_3.m_dot_leak_env",
               "value": null,
               "agg": {
-                "axis": "time",
-                "op": "integral",
-                "sources": [
-                  "tank_3.m_dot_leak_env"
-                ]
-              }
-            },
-            {
-              "full": "__derived__:ab652a7a2071",
-              "label": "pipe_2.sum(50)",
-              "unit": "kg/s",
-              "description": "sum of m_dot_leak_0, m_dot_leak_1, m_dot_leak_10, m_dot_leak_11, m_dot_leak_12, m_dot_leak_13 \u2026 (+44 more)",
-              "value": null,
-              "agg": {
-                "axis": "instances",
-                "op": "sum",
-                "sources": [
-                  "pipe_2.pipe.m_dot_leak_0",
-                  "pipe_2.pipe.m_dot_leak_1",
-                  "pipe_2.pipe.m_dot_leak_10",
-                  "pipe_2.pipe.m_dot_leak_11",
-                  "pipe_2.pipe.m_dot_leak_12",
-                  "pipe_2.pipe.m_dot_leak_13",
-                  "pipe_2.pipe.m_dot_leak_14",
-                  "pipe_2.pipe.m_dot_leak_15",
-                  "pipe_2.pipe.m_dot_leak_16",
-                  "pipe_2.pipe.m_dot_leak_17",
-                  "pipe_2.pipe.m_dot_leak_18",
-                  "pipe_2.pipe.m_dot_leak_19",
-                  "pipe_2.pipe.m_dot_leak_2",
-                  "pipe_2.pipe.m_dot_leak_20",
-                  "pipe_2.pipe.m_dot_leak_21",
-                  "pipe_2.pipe.m_dot_leak_22",
-                  "pipe_2.pipe.m_dot_leak_23",
-                  "pipe_2.pipe.m_dot_leak_24",
-                  "pipe_2.pipe.m_dot_leak_25",
-                  "pipe_2.pipe.m_dot_leak_26",
-                  "pipe_2.pipe.m_dot_leak_27",
-                  "pipe_2.pipe.m_dot_leak_28",
-                  "pipe_2.pipe.m_dot_leak_29",
-                  "pipe_2.pipe.m_dot_leak_3",
-                  "pipe_2.pipe.m_dot_leak_30",
-                  "pipe_2.pipe.m_dot_leak_31",
-                  "pipe_2.pipe.m_dot_leak_32",
-                  "pipe_2.pipe.m_dot_leak_33",
-                  "pipe_2.pipe.m_dot_leak_34",
-                  "pipe_2.pipe.m_dot_leak_35",
-                  "pipe_2.pipe.m_dot_leak_36",
-                  "pipe_2.pipe.m_dot_leak_37",
-                  "pipe_2.pipe.m_dot_leak_38",
-                  "pipe_2.pipe.m_dot_leak_39",
-                  "pipe_2.pipe.m_dot_leak_4",
-                  "pipe_2.pipe.m_dot_leak_40",
-                  "pipe_2.pipe.m_dot_leak_41",
-                  "pipe_2.pipe.m_dot_leak_42",
-                  "pipe_2.pipe.m_dot_leak_43",
-                  "pipe_2.pipe.m_dot_leak_44",
-                  "pipe_2.pipe.m_dot_leak_45",
-                  "pipe_2.pipe.m_dot_leak_46",
-                  "pipe_2.pipe.m_dot_leak_47",
-                  "pipe_2.pipe.m_dot_leak_48",
-                  "pipe_2.pipe.m_dot_leak_49",
-                  "pipe_2.pipe.m_dot_leak_5",
-                  "pipe_2.pipe.m_dot_leak_6",
-                  "pipe_2.pipe.m_dot_leak_7",
-                  "pipe_2.pipe.m_dot_leak_8",
-                  "pipe_2.pipe.m_dot_leak_9"
-                ]
+                "axis": "formula",
+                "expr": "integral(v1)",
+                "op": "formula",
+                "variables": {
+                  "v1": "tank_3.m_dot_leak_env"
+                }
               }
             }
           ]
@@ -542,6 +423,14 @@
             {
               "full": "pipe_2.pipe.T_0",
               "label": "pipe_2.pipe.T_0",
+              "color": "#2ca02c",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            },
+            {
+              "full": "pipe_2.wall_0_0.T_a",
+              "label": "pipe_2.wall_0_0.T_a",
               "color": "#2ca02c",
               "width": 2.0,
               "dash": "solid",
@@ -650,8 +539,8 @@
         "kind": "pie",
         "x": -495.1153697854391,
         "y": 335.8062975834083,
-        "w": 850.4087840386993,
-        "h": 372.93510992877964,
+        "w": 607.8916946986392,
+        "h": 381.7717650059478,
         "content": {
           "title": "Pie chart",
           "entries": [
@@ -693,10 +582,10 @@
       },
       {
         "kind": "timeseries",
-        "x": -491.13316026646004,
-        "y": 729.3235958985434,
-        "w": 614.4408916964131,
-        "h": 348.7330056732326,
+        "x": -490.8117466356649,
+        "y": 728.6234833297859,
+        "w": 610.1293959167158,
+        "h": 358.47058121773387,
         "content": {
           "title": "Timeseries",
           "traces": [
@@ -728,6 +617,79 @@
           }
         }
       }
+    ],
+    "system_derived": [
+      {
+        "agg": {
+          "axis": "formula",
+          "expr": "integral(v1)",
+          "op": "formula",
+          "variables": {
+            "v1": "pipe_2.m_dot_leak_env"
+          }
+        },
+        "description": "formula integral(v1) over v1=pipe_2.m_dot_leak_env",
+        "full": "__derived__:9502843798b3",
+        "kind": "derived",
+        "label": "total_leak(integral(v1))",
+        "name": "total_leak(integral(v1))",
+        "unit": "kg/s",
+        "value": null
+      },
+      {
+        "agg": {
+          "axis": "formula",
+          "expr": "integral(abs(sum(g1)))",
+          "groups": {
+            "g1": {
+              "regex": "pipe_2.env_[0-9]*.m_dot",
+              "scope": ""
+            }
+          },
+          "op": "formula"
+        },
+        "description": "formula integral(abs(sum(g1))) over g1=/pipe_2.env_[0-9]*.m_dot/",
+        "full": "__derived__:36bbc20afd39",
+        "kind": "derived",
+        "label": "test_leak_sum",
+        "name": "test_leak_sum",
+        "unit": "kg/s",
+        "value": null
+      },
+      {
+        "agg": {
+          "axis": "formula",
+          "expr": "integral(v1)",
+          "op": "formula",
+          "variables": {
+            "v1": "pipe_2.m_dot_leak_env"
+          }
+        },
+        "description": "integral of pipe_2.m_dot_leak_env",
+        "full": "__derived__:57eb043734f8",
+        "kind": "derived",
+        "label": "pipe_2.m_dot_leak_env (integral)",
+        "name": "m_dot_leak_env (integral)",
+        "unit": "kg",
+        "value": null
+      },
+      {
+        "agg": {
+          "axis": "formula",
+          "expr": "integral(v1)",
+          "op": "formula",
+          "variables": {
+            "v1": "tank_3.m_dot_leak_env"
+          }
+        },
+        "description": "integral of tank_3.m_dot_leak_env",
+        "full": "__derived__:4976401f6619",
+        "kind": "derived",
+        "label": "tank_3.m_dot_leak_env (integral)",
+        "name": "m_dot_leak_env (integral)",
+        "unit": "kg",
+        "value": null
+      }
     ]
   },
   "sim_options": {
@@ -748,7 +710,7 @@
     },
     "simulate": {
       "strategy": "tr_bdf2",
-      "stop_time": 50.0,
+      "stop_time": 180.0,
       "dt_start": 0.0001,
       "dt_min": 1e-09,
       "dt_max": 100000.0,

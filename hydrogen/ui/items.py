@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from hydrogen.components.icons import icon_path
 
+from . import theme
 from .introspect import introspect, introspect_ports
 from .qt import QtCore, QtGui, QtSvg, QtWidgets
 from .style import domain_color, kind_color, port_on_right
@@ -112,8 +113,13 @@ class PortItem(QtWidgets.QGraphicsEllipseItem):
         lf = self._label.font()
         lf.setPointSize(7)
         self._label.setFont(lf)
-        self._label.setBrush(QtGui.QColor("#333"))
+        self._label.setBrush(QtGui.QColor(theme.current().port_label))
         self._reposition_label()
+
+    def restyle(self):
+        """Re-apply the port label colour for the active theme."""
+        self._label.setBrush(QtGui.QColor(theme.current().port_label))
+        self.update()
 
     def _update_tooltip(self):
         if self.node.ports_locked:
@@ -186,9 +192,10 @@ class PortItem(QtWidgets.QGraphicsEllipseItem):
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        c = theme.current()
         r = self.R + (2 if self._hovered else 0)
-        pen = QtGui.QPen(QtGui.QColor("#1b1b1b") if self._hovered
-                         else QtGui.QColor("#3a3a3a"))
+        pen = QtGui.QPen(QtGui.QColor(c.port_border_hover) if self._hovered
+                         else QtGui.QColor(c.port_border))
         pen.setWidth(2 if self._hovered else 1)
         painter.setPen(pen)
         painter.setBrush(kind_color(self.kind))
@@ -306,14 +313,6 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
     # the invalidated region -- otherwise shrinking leaves uncleared corner
     # trails (especially visible over X-forwarding).
     BOUND_MARGIN = 8.0
-    ICON_ONLY_TYPES = {
-        "hydrogen.thermofluid.CompressibleValve",
-        "hydrogen.thermofluid.IncompressibleValve",
-        "hydrogen.thermofluid.Pipe",
-        "hydrogen.thermofluid.PressureSource",
-        "hydrogen.thermofluid.Tank",
-        "hydrogen.thermofluid.Valve",
-    }
     DEFAULT_ROTATIONS = {
         "hydrogen.thermofluid.Tank": -90,
     }
@@ -329,8 +328,11 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._fill = domain_color(entry["domain"])
         self._icon = icon_renderer(entry.get("icon"))   # None -> generic box render
         self._is_control = entry.get("domain") == "control"
+        # ``icon_only`` is declared on the component class as ``UI_ICON_ONLY``
+        # and surfaced through the catalog; control blocks are icon-only by
+        # convention whenever they ship a symbol.
         self._icon_only = self._icon is not None and (
-            self.type_name in self.ICON_ONLY_TYPES or self._is_control
+            bool(entry.get("icon_only")) or self._is_control
         )
         self._ports_locked = self._icon_only
         self._hovered = False
@@ -377,7 +379,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         tf.setBold(True)
         tf.setPointSize(10)
         self._title.setFont(tf)
-        self._title.setBrush(QtGui.QColor("#222"))
+        self._title.setBrush(QtGui.QColor(theme.current().node_title))
         self._title.setPos(12, 7)
         self._title.setZValue(6)
 
@@ -387,7 +389,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         sf = self._sub.font()
         sf.setPointSize(8)
         self._sub.setFont(sf)
-        self._sub.setBrush(QtGui.QColor("#555"))
+        self._sub.setBrush(QtGui.QColor(theme.current().node_sub))
         self._sub.setPos(12, 21)
         self._sub.setZValue(6)
 
@@ -399,7 +401,8 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
                 continue
             name_item = LabelTextItem("", self, "params")
             value_item = LabelTextItem("", self, "params")
-            for item, color in ((name_item, "#555"), (value_item, "#222")):
+            for item, color in ((name_item, theme.current().node_name),
+                                (value_item, theme.current().node_value)):
                 fnt = item.font()
                 fnt.setPointSize(8)
                 if item is value_item:
@@ -498,7 +501,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         extras_top = []
         extras_bottom = []
         for name, kind in specs:
-            if name in ("inlet", "p_set"):
+            if name in ("inlet", "p_set", "m_set"):
                 pt = QtCore.QPointF(rect.left(), rect.center().y())
                 side = -1
             elif name == "outlet":
@@ -657,6 +660,13 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._port_labels_visible = visible
         for port in self.port_items:
             port._label.setVisible(visible)
+
+    def restyle(self):
+        """Re-apply every themed brush after a theme change and repaint."""
+        self._sync_label_hover_brushes()      # title / sub / param label colours
+        for port in self.port_items:
+            port.restyle()
+        self.update()
 
     def refresh_param_labels(self):
         params = self.params or {}
@@ -838,6 +848,7 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         self._canvas._on_status(f"Moved {group} label on '{self.comp_id}'")
 
     def _sync_label_hover_brushes(self):
+        c = theme.current()
         primary = {self._title}
         muted = {self._sub}
         for _field, name_item, value_item in self._param_labels:
@@ -847,9 +858,10 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             active = group == self._label_hover_group or group == self._label_drag_group
             for item in self._label_items(group):
                 if active:
-                    item.setBrush(QtGui.QColor("#d62828"))
+                    item.setBrush(QtGui.QColor(c.node_label_active))
                 else:
-                    item.setBrush(QtGui.QColor("#222" if item in primary else "#555"))
+                    item.setBrush(QtGui.QColor(
+                        c.node_value if item in primary else c.node_sub))
 
     def _visual_header_line(self) -> tuple[QtCore.QPointF, QtCore.QPointF] | None:
         """Line under the visual title, kept with the text after transforms."""
@@ -893,18 +905,27 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             fitted.height(),
         )
 
-    def _draw_pressure_source_control_guide(self, painter, icon_rect: QtCore.QRectF):
-        if self.type_name != "hydrogen.thermofluid.PressureSource":
+    #: Source symbols whose control signal enters the reservoir circle on the
+    #: left: ``{type_name: control-port name}``.  Both icons share the same
+    #: viewBox (0 0 120 60) with a circle at x=40, r=20 -> left tangent x=20.
+    _CONTROL_GUIDE_SOURCES = {
+        "hydrogen.thermofluid.PressureSource": "p_set",
+        "hydrogen.thermofluid.MassSource": "m_set",
+    }
+
+    def _draw_source_control_guide(self, painter, icon_rect: QtCore.QRectF):
+        port_name = self._CONTROL_GUIDE_SOURCES.get(self.type_name)
+        if port_name is None:
             return
-        port = next((p for p in self.port_items if p.pname == "p_set"), None)
+        port = next((p for p in self.port_items if p.pname == port_name), None)
         if port is None:
             return
         pen = QtGui.QPen(kind_color("signal_real"), 1.6)
         pen.setStyle(QtCore.Qt.DashLine)
         pen.setCapStyle(QtCore.Qt.RoundCap)
         painter.setPen(pen)
-        # pressure_source.svg uses viewBox 0 0 120 60 and a circle at x=40,
-        # r=20; the left tangent is x=20, on the vertical centreline.
+        # The icon uses viewBox 0 0 120 60 and a circle at x=40, r=20; the left
+        # tangent is x=20, on the vertical centreline.
         target = QtCore.QPointF(
             icon_rect.left() + icon_rect.width() * (20.0 / 120.0),
             icon_rect.center().y(),
@@ -1112,11 +1133,12 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
         on rotated/mirrored nodes.  Hover the node for the state list."""
         if not self._is_dynamic:
             return
+        c = theme.current()
         painter.save()
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         center = QtCore.QPointF(rect.right() - 11.0, rect.top() + 11.0)
-        painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 1.4))
-        painter.setBrush(QtGui.QColor("#0a9396"))
+        painter.setPen(QtGui.QPen(QtGui.QColor(c.badge_outline), 1.4))
+        painter.setBrush(QtGui.QColor(c.badge_dynamic))
         painter.drawEllipse(center, 4.5, 4.5)
         painter.restore()
 
@@ -1134,26 +1156,29 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             QtCore.QPointF(cx - r * 0.92, cy + r * 0.72),
             QtCore.QPointF(cx + r * 0.92, cy + r * 0.72),
         ])
-        painter.setPen(QtGui.QPen(QtGui.QColor("#8a5a00"), 1.2))
-        painter.setBrush(QtGui.QColor("#ffcc33"))
+        c = theme.current()
+        painter.setPen(QtGui.QPen(QtGui.QColor(c.warn_border), 1.2))
+        painter.setBrush(QtGui.QColor(c.warn_fill))
         painter.drawPolygon(tri)
         # Exclamation mark.
-        painter.setPen(QtGui.QPen(QtGui.QColor("#5a3d00"), 1.5))
+        painter.setPen(QtGui.QPen(QtGui.QColor(c.warn_mark), 1.5))
         painter.drawLine(QtCore.QPointF(cx, cy - r * 0.30),
                          QtCore.QPointF(cx, cy + r * 0.28))
-        painter.setBrush(QtGui.QColor("#5a3d00"))
+        painter.setBrush(QtGui.QColor(c.warn_mark))
         painter.drawEllipse(QtCore.QPointF(cx, cy + r * 0.52), 0.9, 0.9)
         painter.restore()
 
     def _draw_resize_handles(self, painter):
         if self._hover_corner is None and self._resize_corner is None:
             return
+        c = theme.current()
         painter.save()
         for name, corner in self._resize_handles().items():
             active = name in (self._hover_corner, self._resize_corner)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#d62828" if active else "#333"),
-                                      1.2))
-            painter.setBrush(QtGui.QColor("#ffffff"))
+            painter.setPen(QtGui.QPen(
+                QtGui.QColor(c.resize_handle_active if active else c.resize_handle),
+                1.2))
+            painter.setBrush(QtGui.QColor(c.resize_handle_fill))
             painter.drawEllipse(corner, 3.5 if active else 3.0, 3.5 if active else 3.0)
         painter.restore()
 
@@ -1166,36 +1191,37 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        c = theme.current()
         selected = self.isSelected()
         if selected:
-            color, w = QtGui.QColor("#d62828"), 2
+            color, w = QtGui.QColor(c.node_border_selected), 2
         elif self._hovered:
-            color, w = QtGui.QColor("#1b6fb3"), 2
+            color, w = QtGui.QColor(c.node_border_hover), 2
         else:
-            color, w = QtGui.QColor("#5a5a5a"), 1
+            color, w = QtGui.QColor(c.node_border), 1
         rect = self.rect()
 
         if self._icon is not None:
             if self._icon_only:
                 if self._is_control or selected or self._hovered:
-                    border = color if selected else QtGui.QColor("#111111")
+                    border = color if selected else QtGui.QColor(c.node_icon_border)
                     painter.setPen(QtGui.QPen(border, w))
                     painter.setBrush(QtCore.Qt.NoBrush)
                     painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 8, 8)
                 body = self._visual_icon_rect(self._icon.defaultSize())
                 if body is not None:
                     self._icon.render(painter, body)
-                    self._draw_pressure_source_control_guide(painter, body)
+                    self._draw_source_control_guide(painter, body)
                 self._draw_dynamic_badge(painter, rect)
                 self._draw_warning_badge(painter, rect)
                 self._draw_resize_handles(painter)
                 return
 
-            # P&ID symbol on a clean (white) card: a domain-coloured header strip
+            # P&ID symbol on a clean card: a domain-coloured header strip
             # carries the labels, the SVG fills the body below the separator.
             painter.setPen(QtGui.QPen(color, w))
-            painter.setBrush(QtGui.QColor("#fdfdfd") if not self._hovered
-                             else QtGui.QColor("#ffffff"))
+            painter.setBrush(QtGui.QColor(c.node_card) if not self._hovered
+                             else QtGui.QColor(c.node_card_hover))
             painter.drawRoundedRect(rect, 9, 9)
             painter.setPen(QtGui.QPen(self._fill.darker(135), 1.5))
             header_line = self._visual_header_line()

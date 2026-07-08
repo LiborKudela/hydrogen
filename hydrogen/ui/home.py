@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .qt import QtCore, QtGui, QtWidgets, Signal
 from .recent import recent_files
+from .theme import home_stylesheet
 from .thumbnail import render_canvas_thumbnail
 
 __all__ = ["HomeScreen"]
@@ -21,16 +22,6 @@ __all__ = ["HomeScreen"]
 #: Recent-card thumbnail size (logical px); rendered at 2x for crispness.
 _THUMB_W = 132
 _THUMB_H = 76
-
-
-# Palette shared across the home screen's stylesheet.
-_ACCENT = "#2563eb"
-_ACCENT_HOVER = "#1d4ed8"
-_INK = "#0f172a"
-_MUTED = "#64748b"
-_BORDER = "#e2e8f0"
-_CARD_BG = "#ffffff"
-_CARD_HOVER = "#f1f5f9"
 
 
 class _RecentCard(QtWidgets.QFrame):
@@ -74,7 +65,7 @@ class _RecentCard(QtWidgets.QFrame):
         text.addWidget(sub)
         text.addStretch(1)
 
-        chevron = QtWidgets.QLabel("›")
+        chevron = QtWidgets.QLabel(">")
         chevron.setObjectName("recentChevron")
 
         row = QtWidgets.QHBoxLayout(self)
@@ -110,7 +101,7 @@ class HomeScreen(QtWidgets.QWidget):
         # path -> (mtime, pixmap); avoids rebuilding the scene on every visit.
         self._thumb_cache: dict[str, tuple[float, QtGui.QPixmap]] = {}
         self.setObjectName("homeScreen")
-        self.setStyleSheet(self._stylesheet())
+        self.setStyleSheet(home_stylesheet())
 
         # A centred fixed-width "card" so the page looks deliberate at any size.
         card = QtWidgets.QWidget()
@@ -136,7 +127,7 @@ class HomeScreen(QtWidgets.QWidget):
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(10)
-        new_btn = QtWidgets.QPushButton("＋  New project")
+        new_btn = QtWidgets.QPushButton("New project")
         new_btn.setObjectName("primaryBtn")
         new_btn.setCursor(QtCore.Qt.PointingHandCursor)
         new_btn.clicked.connect(self.newRequested)
@@ -193,6 +184,13 @@ class HomeScreen(QtWidgets.QWidget):
         self._by_type = by_type or {}
         self._thumb_cache.clear()      # symbols/colours may have changed
 
+    def restyle(self):
+        """Re-apply the theme stylesheet and re-render thumbnails against the
+        new backdrop (called after a light/dark swap)."""
+        self.setStyleSheet(home_stylesheet())
+        self._thumb_cache.clear()      # thumbnails baked the old canvas backdrop
+        self.refresh()
+
     def refresh(self):
         """Repopulate the recent-projects list from the persistent store."""
         # Drop the existing cards (keep the trailing stretch at the end).
@@ -240,81 +238,3 @@ class HomeScreen(QtWidgets.QWidget):
         self._thumb_cache[path] = (mtime, pm)
         return pm
 
-    @staticmethod
-    def _stylesheet() -> str:
-        return f"""
-        #homeScreen {{
-            background: #eef2f7;
-        }}
-        #homeCard {{
-            background: {_CARD_BG};
-            border: 1px solid {_BORDER};
-            border-radius: 16px;
-        }}
-        #brand {{
-            color: {_ACCENT};
-            font-size: 34px;
-            font-weight: 800;
-        }}
-        #tagline {{
-            color: {_INK};
-            font-size: 16px;
-            font-weight: 600;
-        }}
-        #subtitle {{
-            color: {_MUTED};
-            font-size: 13px;
-        }}
-        #sectionLabel {{
-            color: {_MUTED};
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 1px;
-        }}
-        #primaryBtn {{
-            background: {_ACCENT};
-            color: white;
-            border: none;
-            border-radius: 9px;
-            padding: 9px 18px;
-            font-size: 13px;
-            font-weight: 600;
-        }}
-        #primaryBtn:hover {{ background: {_ACCENT_HOVER}; }}
-        #primaryBtn:pressed {{ background: {_ACCENT_HOVER}; }}
-        #secondaryBtn {{
-            background: {_CARD_BG};
-            color: {_INK};
-            border: 1px solid {_BORDER};
-            border-radius: 9px;
-            padding: 9px 18px;
-            font-size: 13px;
-            font-weight: 600;
-        }}
-        #secondaryBtn:hover {{ background: {_CARD_HOVER}; }}
-        #recentScroll {{ background: transparent; }}
-        #recentScroll > QWidget > QWidget {{ background: transparent; }}
-        #recentCard {{
-            background: {_CARD_BG};
-            border: 1px solid {_BORDER};
-            border-radius: 10px;
-        }}
-        #recentCard:hover {{
-            background: {_CARD_HOVER};
-            border: 1px solid {_ACCENT};
-        }}
-        #recentCard[missing="true"] {{ background: #fbfbfc; }}
-        #recentThumb {{
-            background: #f8fafc;
-            border: 1px solid {_BORDER};
-            border-radius: 7px;
-            color: #94a3b8;
-            font-size: 10px;
-        }}
-        #recentThumb[missing="true"] {{ color: #f59e0b; }}
-        #recentTitle {{ color: {_INK}; font-size: 13px; font-weight: 600; }}
-        #recentSub {{ color: {_MUTED}; font-size: 11px; }}
-        #recentIcon {{ font-size: 15px; }}
-        #recentChevron {{ color: {_MUTED}; font-size: 20px; font-weight: 700; }}
-        #emptyHint {{ color: #94a3b8; font-size: 12px; padding: 18px 2px; }}
-        """

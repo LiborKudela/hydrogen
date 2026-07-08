@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from . import theme
 from .qt import QtCore, QtGui, QtWidgets
 
 __all__ = ["MediaManagerDialog", "default_media_spec", "BACKENDS",
@@ -239,7 +240,10 @@ class MediaManagerDialog(QtWidgets.QDialog):
         if fluid_item is None or status_item is None:
             return
         state, message = fluid_status(fluid_item.text().strip())
-        glyph, color = _STATUS_STYLE[state]
+        glyph, _fallback = _STATUS_STYLE[state]
+        c = theme.current()
+        color = {"ok": c.param_pure, "bad": c.param_structural,
+                 "unknown": c.warn_fill}.get(state, _fallback)
         self._suppress = True
         try:
             status_item.setText(glyph)

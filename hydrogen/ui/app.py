@@ -24,6 +24,8 @@ from .project import is_project, make_project
 from .qt import QtCore, QtGui, QtSvg, QtWidgets, exec_
 from .recent import add_recent_file, recent_files, remove_recent_file
 from .session import SimulationSession
+from . import theme
+from .theme import apply_theme
 from .simulate import (
     SimSettingsDialog,
     SimulateDialog,
@@ -67,6 +69,67 @@ _FLOPPY_AS_SVG = """
   </g>
 </svg>
 """
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    """Editor preferences.  Currently a single group: the appearance (theme)
+    selector, applied live so the effect is visible before committing."""
+
+    _MODES = [
+        ("Light", "light"),
+        ("Dark", "dark"),
+        ("Match system", "system"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(360)
+        self._start_mode = theme.mode()
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 14)
+        layout.setSpacing(12)
+
+        group = QtWidgets.QGroupBox("Appearance")
+        form = QtWidgets.QFormLayout(group)
+        self._theme_combo = QtWidgets.QComboBox()
+        for label, key in self._MODES:
+            self._theme_combo.addItem(label, key)
+        self._theme_combo.setCurrentIndex(
+            max(0, self._theme_combo.findData(self._start_mode)))
+        self._theme_combo.currentIndexChanged.connect(self._preview)
+        form.addRow("Theme", self._theme_combo)
+        layout.addWidget(group)
+
+        hint = QtWidgets.QLabel(
+            "Dark mode restyles the whole editor, including the canvas and "
+            "plot objects.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.current().muted}; font-size: 11px;")
+        layout.addWidget(hint)
+
+        layout.addStretch(1)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_mode(self) -> str:
+        return self._theme_combo.currentData()
+
+    def _preview(self):
+        """Apply the highlighted theme immediately for a live preview."""
+        chosen = self.selected_mode()
+        if chosen != theme.mode():
+            theme.set_mode(chosen)
+
+    def reject(self):
+        """Restore the theme active when the dialog opened if the user cancels."""
+        if theme.mode() != self._start_mode:
+            theme.set_mode(self._start_mode)
+        super().reject()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -126,12 +189,12 @@ class MainWindow(QtWidgets.QMainWindow):
         media_btn.setToolTip("Manage the shared CoolProp fluids (backend, cache) "
                              "the components reference.")
         media_btn.clicked.connect(self._edit_media)
-        sim_settings = QtWidgets.QPushButton("⚙ Settings")
+        sim_settings = QtWidgets.QPushButton("Settings")
         sim_settings.setToolTip("Edit the instantiate / initialise / simulate "
                                 "options used by every run.")
         sim_settings.clicked.connect(self._edit_sim_settings)
         self._sim_settings_btn = sim_settings
-        simulate = QtWidgets.QPushButton("▶ Simulate")
+        simulate = QtWidgets.QPushButton("Simulate")
         simulate.setToolTip("Open the run window. The model is kept alive after "
                             "building and only re-instantiated when its "
                             "structure changes.")
@@ -144,12 +207,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # closed, so these stay meaningful. Driven by the pump's phaseChanged.
         self._starting = False              # a toolbar-launched run is building
         self._run_worker = None             # keep the launch worker alive
-        self._runctl_btn = QtWidgets.QPushButton("▶ Run")
+        self._runctl_btn = QtWidgets.QPushButton("Run")
         self._runctl_btn.setToolTip(
             "Run the model (build if needed, then simulate) — no window needed. "
             "While running this pauses/resumes the live run.")
         self._runctl_btn.clicked.connect(self._on_runctl)
-        self._stop_btn = QtWidgets.QPushButton("⏹ Stop")
+        self._stop_btn = QtWidgets.QPushButton("Stop")
         self._stop_btn.setToolTip("Stop the running simulation (the built model "
                                   "stays alive for another run).")
         self._stop_btn.setEnabled(False)
@@ -188,6 +251,13 @@ class MainWindow(QtWidgets.QMainWindow):
         markers.setMenu(markers_menu)
         self._markers_btn = markers
 
+        variables = QtWidgets.QPushButton("Variables")
+        variables.setToolTip(
+            "Browse every variable in the whole system and drag them (or build "
+            "derived aggregates/formulas) onto plots and tables.")
+        variables.clicked.connect(self._canvas.open_system_variables)
+        self._variables_btn = variables
+
         right = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(right)
         rl.setContentsMargins(6, 6, 6, 6)
@@ -195,6 +265,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(QtWidgets.QLabel("<b>Canvas</b>"))
         bar.addWidget(fit)
         bar.addWidget(self._markers_btn)
+        bar.addWidget(self._variables_btn)
         bar.addStretch(1)
         bar.addWidget(media_btn)
         bar.addWidget(sim_settings)
@@ -227,13 +298,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tabs.setMovable(False)
         self._tabs.setTabsClosable(True)
         self._tabs.tabCloseRequested.connect(self._close_tab)
-        self._tabs.addTab(self._home, "⌂  Home")
+        self._tabs.addTab(self._home, "Home")
         self._tabs.addTab(self._editor, "Model")
         tab_bar = self._tabs.tabBar()
         for i in (0, 1):                      # strip close buttons off the permanent tabs
             for side in (QtWidgets.QTabBar.RightSide, QtWidgets.QTabBar.LeftSide):
                 tab_bar.setTabButton(i, side, None)
         self.setCentralWidget(self._tabs)
+
+        theme.manager().changed.connect(self._on_theme_changed)
 
         self.statusBar().showMessage("Ready")
         self._show_home()
@@ -268,6 +341,11 @@ class MainWindow(QtWidgets.QMainWindow):
         save_as_act.setShortcut(QtGui.QKeySequence.SaveAs)
         save_as_act.triggered.connect(self._save_project_as)
         self._save_as_act = save_as_act
+
+        file_menu.addSeparator()
+        settings_act = file_menu.addAction("Se&ttings…")
+        settings_act.setShortcut(QtGui.QKeySequence("Ctrl+,"))
+        settings_act.triggered.connect(self._open_settings)
 
         file_menu.addSeparator()
         quit_act = file_menu.addAction("&Quit")
@@ -322,16 +400,19 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(2)
 
         self._minimize_btn = QtWidgets.QToolButton(controls)
-        self._minimize_btn.setText("−")
+        self._minimize_btn.setObjectName("winCtlBtn")
+        self._minimize_btn.setText("_")
         self._minimize_btn.setToolTip("Minimize")
         self._minimize_btn.clicked.connect(self.showMinimized)
 
         self._fullscreen_btn = QtWidgets.QToolButton(controls)
+        self._fullscreen_btn.setObjectName("winCtlBtn")
         self._fullscreen_btn.setToolTip("Restore")
         self._fullscreen_btn.clicked.connect(self._toggle_fullscreen)
 
         self._close_btn = QtWidgets.QToolButton(controls)
-        self._close_btn.setText("×")
+        self._close_btn.setObjectName("winCloseBtn")
+        self._close_btn.setText("x")
         self._close_btn.setToolTip("Close")
         self._close_btn.clicked.connect(self.close)
 
@@ -356,16 +437,31 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "_fullscreen_btn"):
             return
         if self.isFullScreen():
-            self._fullscreen_btn.setText("□")
+            self._fullscreen_btn.setText("[]")
             self._fullscreen_btn.setToolTip("Restore")
         else:
-            self._fullscreen_btn.setText("▣")
+            self._fullscreen_btn.setText("[ ]")
             self._fullscreen_btn.setToolTip("Full screen")
 
     def changeEvent(self, event):
         super().changeEvent(event)
         if event.type() == QtCore.QEvent.WindowStateChange:
             self._sync_window_controls()
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
+        if exec_(dlg):
+            # The dialog previews (and persists) the chosen theme live; accepting
+            # simply keeps it.
+            self._set_status(f"Appearance set to {theme.mode()}.")
+
+    def _on_theme_changed(self):
+        """Re-theme every custom-painted / stylesheet-driven surface after a
+        light/dark swap (the standard widgets already followed the app palette
+        + stylesheet applied by :func:`theme.set_mode`)."""
+        self._home.restyle()
+        self._tree.restyle()
+        self._canvas.apply_theme()
 
     def _show_home(self):
         self._home.refresh()
@@ -625,8 +721,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         nodes = self._canvas.nodes()
         system = self._build_system(nodes) if nodes else None
-        live = (phase in ("paused", "finished", "stopped")
-                and self._session.built)
+        # Only a *paused* run locks the instantiation / initialisation / spec
+        # tabs: it is mid-flight and resumable, so the compiled model can't be
+        # rebuilt without invalidating it.  A finished or stopped run is idle --
+        # all settings are editable again, and changing an instantiation option
+        # simply re-instantiates on the next Run (the continuation checkpoint no
+        # longer matches).
+        live = phase == "paused" and self._session.built
         dlg = SimSettingsDialog(
             self._sim_options, system=system, parent=self,
             live_sim_only=live)
@@ -649,6 +750,7 @@ class MainWindow(QtWidgets.QMainWindow):
             get_options=lambda: self._sim_options,
             parent=self,
             log_sink=self._record_log,
+            on_run_started=self._on_live_run_started,
         )
         # Show everything recorded so far (e.g. a run started from the toolbar),
         # then mirror new lines into this panel while it is open.
@@ -693,15 +795,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sim_settings_btn.setToolTip(
                 "Edit instantiate / initialise / simulate options.")
         if phase == "running":
-            self._runctl_btn.setText("⏸ Pause")
+            self._runctl_btn.setText("Pause")
             self._runctl_btn.setEnabled(True)
             self._stop_btn.setEnabled(True)
         elif can_resume and phase == "paused":
-            self._runctl_btn.setText("▶ Resume")
+            self._runctl_btn.setText("Resume")
             self._runctl_btn.setEnabled(True)
             self._stop_btn.setEnabled(True)
         elif can_resume:
-            self._runctl_btn.setText("▶ Resume")
+            self._runctl_btn.setText("Resume")
             self._runctl_btn.setEnabled(True)
             self._stop_btn.setEnabled(False)
         elif self._starting:
@@ -709,7 +811,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._runctl_btn.setEnabled(False)
             self._stop_btn.setEnabled(False)
         else:                                # idle / stale / finished / stopped
-            self._runctl_btn.setText("▶ Run")
+            self._runctl_btn.setText("Run")
             self._runctl_btn.setEnabled(True)
             self._stop_btn.setEnabled(phase in ("running", "paused"))
 
@@ -769,12 +871,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 and self._session.can_steering_resume(system, inst_kw)):
             return
         if run_kw.get("stop_time") is None:
-            self._set_status("Set a stop_time in ⚙ Settings first — the run is "
+            self._set_status("Set a stop_time in Settings first — the run is "
                              "driven by it.")
             return
         if (run_kw.get("strategy", {}).get("name") == "fixed"
                 and run_kw.get("dt") is None):
-            self._set_status("strategy='fixed' needs a dt (set it in ⚙ Settings).")
+            self._set_status("strategy='fixed' needs a dt (set it in Settings).")
             return
         init_kw = initialise_kwargs(options)
 
@@ -801,10 +903,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._record_log(message, level)
         self._set_status(message.strip() or level)
 
+    def _on_live_run_started(self):
+        self._sync_live_objects()
+        self._live.notify_model_ready()
+
     def _on_toolbar_run_started(self, _ack):
         self._starting = False
         self._run_worker = None
-        self._set_status("Simulation running — use ⏸/⏹ to steer it.")
+        self._on_live_run_started()
+        self._set_status("Simulation running — use Pause/Stop to steer it.")
         self._update_runctl()
 
     def _on_toolbar_run_failed(self, kind: str, message: str):
@@ -831,7 +938,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # continue_run is fire-and-forget on the host; poll handles phase.
         def done(_):
             self._starting = False
-            self._set_status("Simulation running — use ⏸/⏹ to steer it.")
+            self._set_status("Simulation running — use Pause/Stop to steer it.")
             self._update_runctl()
 
         worker = _SessionWorker(task)
@@ -862,6 +969,7 @@ class MainWindow(QtWidgets.QMainWindow):
 def main(argv: list[str] | None = None):
     argv = list(sys.argv if argv is None else argv)
     app = QtWidgets.QApplication(argv)
+    apply_theme(app)
     app.setOrganizationName("hydrogen")
     app.setApplicationName("hydrogen-ui")
     win = MainWindow()

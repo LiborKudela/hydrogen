@@ -18,6 +18,7 @@ into the plain dict shape a spec's ``params`` expects.
 
 from __future__ import annotations
 
+from . import theme
 from .qt import QtCore, QtWidgets, Signal
 
 __all__ = [
@@ -213,8 +214,9 @@ class FieldsForm(QtWidgets.QWidget):
 
         ``names`` is the set of structural parameter names for this scope.
         """
+        c = theme.current()
         for f, toggles, _, _ in self._rows:
-            color = "#b00020" if f.get("name") in names else "#1b7a31"
+            color = c.param_structural if f.get("name") in names else c.param_pure
             head = toggles[0] if toggles else None
             if isinstance(head, QtWidgets.QGroupBox):
                 head.setStyleSheet(f"QGroupBox::title {{ color: {color}; }}")

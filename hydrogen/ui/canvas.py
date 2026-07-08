@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import re
 
+from . import theme
 from .catalog import MIME_TYPE
 from .items import ConnectionItem, NodeItem, PortItem, display_type_name
 from .plots import VARIABLE_MIME, PlotItem, decode_variables, make_content
@@ -26,13 +27,14 @@ def _transform_icon(kind: str) -> QtGui.QIcon:
     pix = QtGui.QPixmap(18, 18)
     pix.fill(QtCore.Qt.transparent)
 
+    ink = theme.current().menu_icon
     p = QtGui.QPainter(pix)
     p.setRenderHint(QtGui.QPainter.Antialiasing)
-    pen = QtGui.QPen(QtGui.QColor("#4b5563"), 1.8)
+    pen = QtGui.QPen(QtGui.QColor(ink), 1.8)
     pen.setCapStyle(QtCore.Qt.RoundCap)
     pen.setJoinStyle(QtCore.Qt.RoundJoin)
     p.setPen(pen)
-    p.setBrush(QtGui.QColor("#4b5563"))
+    p.setBrush(QtGui.QColor(ink))
 
     if kind in {"rotate-cw", "rotate-ccw", "rotate-180", "transforms"}:
         rect = QtCore.QRectF(3.5, 3.5, 11.0, 11.0)
@@ -74,7 +76,7 @@ def _transform_icon(kind: str) -> QtGui.QIcon:
     elif kind == "reset":
         p.setBrush(QtCore.Qt.NoBrush)
         p.drawRoundedRect(QtCore.QRectF(4, 5, 10, 8), 1.8, 1.8)
-        p.setBrush(QtGui.QColor("#4b5563"))
+        p.setBrush(QtGui.QColor(ink))
         p.drawLine(QtCore.QPointF(5.0, 3.0), QtCore.QPointF(2.5, 3.0))
         p.drawLine(QtCore.QPointF(2.5, 3.0), QtCore.QPointF(2.5, 5.5))
         p.drawLine(QtCore.QPointF(2.5, 3.0), QtCore.QPointF(5.0, 5.5))
@@ -106,6 +108,8 @@ class Canvas(QtWidgets.QGraphicsView):
         self._on_objects_changed = None     # () -> None, set by MainWindow
         self._on_model_changed = None       # () -> None, set by MainWindow
         self._var_windows: dict[str, VariablesWindow] = {}  # comp_id -> open window
+        self._system_var_window: VariablesWindow | None = None
+        self._system_derived: list[dict] = []  # whole-system derived variables
         self._objects: list[PlotItem] = []  # plot/table scene items
         self._scene = QtWidgets.QGraphicsScene(self)
         self._scene.setSceneRect(-2000, -2000, 6800, 5200)
@@ -117,6 +121,7 @@ class Canvas(QtWidgets.QGraphicsView):
         # cheap at schematic scale and removes the artefact entirely.
         self._scene.setItemIndexMethod(QtWidgets.QGraphicsScene.NoIndex)
         self.setScene(self._scene)
+        self.setBackgroundBrush(QtGui.QColor(theme.current().canvas_bg))
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setRenderHint(QtGui.QPainter.Antialiasing)
@@ -211,7 +216,7 @@ class Canvas(QtWidgets.QGraphicsView):
     def drawBackground(self, painter, rect):
         super().drawBackground(painter, rect)
         step = 24
-        pen = QtGui.QPen(QtGui.QColor("#ececec"))
+        pen = QtGui.QPen(QtGui.QColor(theme.current().grid))
         pen.setWidth(0)
         painter.setPen(pen)
         left = int(rect.left()) - (int(rect.left()) % step)
@@ -397,11 +402,13 @@ class Canvas(QtWidgets.QGraphicsView):
             for c in self.connections()
         ]
         objects = [o.to_dict() for o in self.overlays()]
-        return {"nodes": nodes, "connections": connections, "objects": objects}
+        return {"nodes": nodes, "connections": connections, "objects": objects,
+                "system_derived": copy.deepcopy(self._system_derived)}
 
     def load_project(self, data: dict):
         """Rebuild the canvas from :meth:`to_project` output (replacing it)."""
         self.clear_nodes()
+        self._system_derived = copy.deepcopy(data.get("system_derived", []))
         by_id: dict[str, NodeItem] = {}
         max_suffix = 0
         for nd in data.get("nodes", []):
@@ -485,6 +492,7 @@ class Canvas(QtWidgets.QGraphicsView):
         self._model_changed()
 
     def clear_nodes(self):
+        self._system_derived = []
         for node in self.nodes():
             self.remove_node(node)
         for overlay in list(self._objects):
@@ -537,6 +545,19 @@ class Canvas(QtWidgets.QGraphicsView):
         for obj in self._objects:
             obj.on_view_scaled()
 
+    def apply_theme(self):
+        """Re-theme the canvas after a light/dark swap: backdrop, grid, every
+        node's brushes, and the plot/table objects' chrome + content."""
+        self.setBackgroundBrush(QtGui.QColor(theme.current().canvas_bg))
+        for node in self.nodes():
+            node.restyle()
+        for obj in self._objects:
+            obj.restyle()
+        self.resetCachedContent()
+        if self.viewport() is not None:
+            self.viewport().update()
+        self._scene.update()
+
     def _register_object(self, obj: PlotItem):
         self._objects.append(obj)
         self._scene.addItem(obj)
@@ -575,10 +596,11 @@ class Canvas(QtWidgets.QGraphicsView):
             existing.raise_()
             existing.activateWindow()
             return
-        win = VariablesWindow(
+        win = VariablesWindow.for_component(
             node.comp_id, node.type_name, node.medium, node.params,
             derived=node.derived_variables,
             on_derived_changed=lambda payloads, n=node: self._set_derived(n, payloads),
+            on_derived_edited=self.update_derived_variable,
             parent=self.window())
         win.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         win.destroyed.connect(lambda *_: self._forget_var_window(node.comp_id))
@@ -588,6 +610,56 @@ class Canvas(QtWidgets.QGraphicsView):
 
     def _set_derived(self, node: NodeItem, payloads: list[dict]):
         node.derived_variables = copy.deepcopy(payloads)
+
+    def open_system_variables(self):
+        """Open a whole-system Variables window listing every component's
+        variables (a drag source for plots), with its own derived variables."""
+        existing = self._system_var_window
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        nodes = self.nodes()
+        if not nodes:
+            self._on_status("Place at least one component first.")
+            return
+        components = [{"comp_id": n.comp_id, "type_name": n.type_name,
+                       "medium": n.medium, "params": n.params}
+                      for n in sorted(nodes, key=lambda n: n.comp_id)]
+        win = VariablesWindow(
+            components, scope=None, title="Variables — whole system",
+            derived=self._system_derived,
+            on_derived_changed=self._set_system_derived,
+            on_derived_edited=self.update_derived_variable,
+            parent=self.window())
+        win.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        win.destroyed.connect(lambda *_: self._forget_system_var_window())
+        self._system_var_window = win
+        win.show()
+        win.raise_()
+
+    def _set_system_derived(self, payloads: list[dict]):
+        self._system_derived = copy.deepcopy(payloads)
+
+    def update_derived_variable(self, payload: dict):
+        """Propagate an edited derived variable (same ``full`` id) to every plot
+        / table object referencing it, so its label, unit and aggregation update
+        in place on the canvas."""
+        full = payload.get("full")
+        if not full:
+            return
+        for overlay in self.overlays():
+            content = getattr(overlay, "content", None)
+            fn = getattr(content, "update_variable_meta", None)
+            if callable(fn):
+                try:
+                    fn(payload)
+                except Exception:
+                    pass
+
+    def _forget_system_var_window(self):
+        self._system_var_window = None
 
     def _forget_var_window(self, comp_id: str):
         self._var_windows.pop(comp_id, None)
@@ -758,7 +830,6 @@ class Canvas(QtWidgets.QGraphicsView):
             return
         menu = QtWidgets.QMenu(self)
         act_props = menu.addAction("Properties…")
-        act_vars = menu.addAction("Variables…")
 
         act_warn = None
         if node.has_warnings:
@@ -786,8 +857,6 @@ class Canvas(QtWidgets.QGraphicsView):
         chosen = exec_(menu, event.globalPos())
         if chosen == act_props:
             self.open_properties(node)
-        elif chosen == act_vars:
-            self.open_variables(node)
         elif act_warn is not None and chosen == act_warn:
             self.show_warnings(node)
         elif chosen == act_cw:

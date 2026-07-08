@@ -10,6 +10,7 @@ rendered scene shows symbols + wires on a clean background.
 
 from __future__ import annotations
 
+from . import theme
 from .qt import QtCore, QtGui
 
 __all__ = ["render_canvas_thumbnail"]
@@ -19,10 +20,15 @@ _PAD = 8.0           # inner padding inside the pixmap, in device px
 
 def render_canvas_thumbnail(canvas_state: dict, size: QtCore.QSize,
                             by_type: dict | None = None,
-                            bg: str = "#ffffff") -> QtGui.QPixmap:
+                            bg: str | None = None) -> QtGui.QPixmap:
     """A ``size`` pixmap previewing ``canvas_state`` (``{"nodes", "connections"}``)
     as a scaled-down, text-free copy of the editor canvas. An empty layout (or
-    one whose component types aren't in ``by_type``) yields a blank pixmap."""
+    one whose component types aren't in ``by_type``) yields a blank pixmap.
+
+    ``bg`` defaults to the active theme's canvas backdrop so thumbnails match
+    the editor in both light and dark mode."""
+    if bg is None:
+        bg = theme.current().canvas_bg
     pm = QtGui.QPixmap(size)
     pm.fill(QtGui.QColor(bg))
 

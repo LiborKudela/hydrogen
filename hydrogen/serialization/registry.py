@@ -657,6 +657,10 @@ def _component_entry(obj: type) -> dict:
         # UI symbol declared on the class as ``UI_ICON`` (filename in
         # ``hydrogen/components/icons/``); ``None`` -> generic box rendering.
         "icon": getattr(obj, "UI_ICON", None),
+        # When ``UI_ICON_ONLY`` is truthy the UI draws the bare symbol (no
+        # labelled box / editable ports); declared on the class next to
+        # ``UI_ICON``.  Only meaningful when an icon is present.
+        "icon_only": bool(getattr(obj, "UI_ICON_ONLY", False)),
         "parameters": params,
         "literals": literals,
     }

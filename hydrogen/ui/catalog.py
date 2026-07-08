@@ -10,7 +10,7 @@ from __future__ import annotations
 from hydrogen.components.icons import icon_path
 
 from .qt import QtCore, QtGui, QtWidgets
-from .style import domain_color
+from .style import domain_leaf_color
 
 __all__ = ["MIME_TYPE", "ComponentTree"]
 
@@ -34,9 +34,11 @@ class ComponentTree(QtWidgets.QTreeWidget):
         self.setDragEnabled(True)
         self.setDragDropMode(QtWidgets.QAbstractItemView.DragOnly)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._catalog: list[dict] = []
         self.set_catalog(catalog)
 
     def set_catalog(self, catalog: list[dict]):
+        self._catalog = list(catalog)
         self.clear()
         by_domain: dict[str, dict[str, list[dict]]] = {}
         for entry in catalog:
@@ -58,11 +60,25 @@ class ComponentTree(QtWidgets.QTreeWidget):
                     if entry.get("needs_medium"):
                         tip += "\n(needs a medium)"
                     leaf.setToolTip(0, f"{entry['type']}\n\n{tip}")
-                    leaf.setForeground(0, QtGui.QBrush(domain_color(domain).darker(170)))
+                    leaf.setForeground(0, QtGui.QBrush(domain_leaf_color(domain)))
                     path = icon_path(entry.get("icon"))
                     if path:
                         leaf.setIcon(0, QtGui.QIcon(path))
         self.expandAll()
+
+    def restyle(self):
+        """Recolour leaf text for the active theme (called after a theme swap)
+        without rebuilding the tree."""
+        def walk(item):
+            for i in range(item.childCount()):
+                child = item.child(i)
+                entry = child.data(0, self.ENTRY_ROLE)
+                if entry:
+                    child.setForeground(
+                        0, QtGui.QBrush(domain_leaf_color(entry["domain"])))
+                walk(child)
+        root = self.invisibleRootItem()
+        walk(root)
 
     @staticmethod
     def _style_group(item):

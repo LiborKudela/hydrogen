@@ -1203,6 +1203,14 @@ class _Engine:
                 self._reply(req_id, {"resuming": rt.id})
             elif cmd == "status":
                 self._reply(req_id, rt.status())
+            elif cmd == "list_vars":
+                # Read-only introspection of the recorded-variable names, which
+                # are fixed for the life of the model.  Servicing it mid-run lets
+                # a UI resolve e.g. a regex aggregate's columns during the *first*
+                # run instead of having to wait until the run finishes.
+                self._reply(req_id, rt.var_names())
+            elif cmd == "list_params":
+                self._reply(req_id, rt.param_names())
             elif cmd == "vars_stream":
                 self._handle_open_stream(rt, req_id, msg.get("args", {}) or {})
             elif cmd == "add_stream_vars":
@@ -1231,9 +1239,9 @@ class _Engine:
                 self._reply_error(
                     req_id,
                     f"system {rt.id} is running; only 'stop'/'pause'/'resume'/"
-                    f"'status'/'set_param'/'update_run_config'/'vars_stream'/"
-                    f"'add_stream_vars'/'close_stream' are accepted until it "
-                    f"finishes",
+                    f"'status'/'list_vars'/'list_params'/'set_param'/"
+                    f"'update_run_config'/'vars_stream'/'add_stream_vars'/"
+                    f"'close_stream' are accepted until it finishes",
                     kind="Busy",
                 )
 

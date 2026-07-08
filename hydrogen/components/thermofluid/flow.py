@@ -1,8 +1,8 @@
 """Fluid-flow components of the `thermofluid` library, built on `hydrogen.model`.
 
 Components: AmbientInlet, AmbientOutlet, TwoPortSegment, AdiabaticPump,
-PressureOutlet, Splitter, PressureSource, PressureVessel, MixingJunction,
-LoopBuffer, StraightPipe.
+PressureOutlet, Splitter, PressureSource, MassSource, PressureVessel,
+MixingJunction, LoopBuffer, StraightPipe.
 
 The typed connectors (`FluidPort_phm`, `ThermalPort_TQ`, `PermeationPort_pN`)
 live in the sibling `ports` module; the leaky `TwoPortSegment` exposes a heat
@@ -2627,6 +2627,9 @@ class Valve(SegmentedChannel):
     #: ``hydrogen/components/icons/``; surfaced via the catalog as ``"icon"``).
     #: Inherited by the concrete valve subclasses below.
     UI_ICON = "valve.svg"
+    #: Draw the bare symbol (no labelled box / editable ports) on the canvas.
+    #: Inherited by the concrete valve subclasses below.
+    UI_ICON_ONLY = True
 
     def __init__(
         self,
@@ -3101,6 +3104,8 @@ class PressureSource(Model):
     #: P&ID-style SVG symbol for the UI canvas (file in
     #: ``hydrogen/components/icons/``; surfaced via the catalog as ``"icon"``).
     UI_ICON = "pressure_source.svg"
+    #: Draw the bare symbol (no labelled box / editable ports) on the canvas.
+    UI_ICON_ONLY = True
 
     def __init__(
         self,
@@ -3176,6 +3181,105 @@ class PressureSource(Model):
         eq_h_total = h_total - self.medium.h_pT(p_src, T_src)
         eq_s_total = s_total - self.medium.s_ph(p_src, h_total)
         return [eq_w, eq_isentropic, eq_energy, eq_h_total, eq_s_total]
+
+
+class MassSource(Model):
+    """Mass-flow-imposed inlet boundary (the flow-imposed dual of `PressureSource`).
+
+    Injects fluid at a prescribed mass flow rate `m_flow` drawn from a reservoir
+    at temperature `T_source`, and lets the *downstream* system set the pressure.
+    Where `PressureSource` pins `(p_source, T_source)` and lets the mass flow
+    float, `MassSource` pins `(m_flow, T_source)` and lets the pressure float:
+
+        m_dot_out = -m_flow                       (continuity, "flow into me")
+        h_out     = h(p_out, T_source)            (reservoir enthalpy at local p)
+
+    Only two residuals are imposed locally; the third closure (`p_out`) comes
+    from whatever this source is wired into downstream, so terminate the line
+    with a fixed-pressure sink (e.g. `PressureOutlet`) to set the pressure level.
+    The enthalpy is evaluated at the *local* boundary pressure and the reservoir
+    temperature, so the injected stream carries the reservoir's thermal state
+    while the network sorts out the pressure.  The kinetic-energy correction is
+    dropped (negligible for liquids / low-Mach flows), matching `TemperatureInlet`.
+
+    Use this to drive a system by a commanded throughput -- e.g. a metering pump,
+    a dosing feed, or replaying a measured flow history -- rather than by a
+    pressure differential.
+
+    `m_control`:
+        - `False` (default): `m_flow` is a `Parameter` the caller sets directly
+          (e.g. ``src["m_flow"].set_value(...)``).
+        - `True`: `m_flow` becomes an algebraic `Variable` exposed on a
+          `RealSignal` INPUT port named ``m_set``, so a control block drives the
+          delivered mass flow: wire a `control.Ramp` to spin up throughput over
+          time, a `control.Constant` for a fixed rate, a `control.CsvTable` to
+          replay a measured profile, or a `control.PID` for closed-loop control.
+          The port is ``require_connection=True`` -- an unconnected ``m_set``
+          leaves the mass flow unclosed (singular system), which `instantiate()`
+          flags by name.
+
+    Port (matches the (p, h, m_dot) convention used everywhere):
+        p_out, h_out, m_dot_out        - drives the downstream component
+        m_set (signal, if `m_control`) - commanded mass flow rate [kg/s]
+    """
+
+    #: P&ID-style SVG symbol for the UI canvas (file in
+    #: ``hydrogen/components/icons/``; surfaced via the catalog as ``"icon"``).
+    UI_ICON = "mass_source.svg"
+    #: Draw the bare symbol (no labelled box / editable ports) on the canvas.
+    UI_ICON_ONLY = True
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        m_flow: Annotated[float, ParamSpec("Imposed mass flow rate delivered "
+                         "to the outlet.", unit="kg/s")] = 0.1,
+        T_source: Annotated[float, ParamSpec("Reservoir (supply) temperature "
+                           "setting the injected enthalpy.", unit="K")] = 293.15,
+        p_init: Annotated[float, ParamSpec("Initial boundary-pressure guess "
+                         "(the level is set downstream).", unit="Pa")]
+                = 101325.0,
+        m_control: Annotated[bool, ParamSpec("If true, expose `m_flow` on an "
+                            "`m_set` signal input so a control block drives the "
+                            "delivered mass flow; if false it is a fixed "
+                            "parameter.", structural=True)] = False,
+    ):
+        self.medium = medium
+        self.m_flow = m_flow
+        self.T_source = T_source
+        self.p_init = p_init
+        self.m_control = bool(m_control)
+        self._h_init = float(medium.eval_h_pT(p_init, T_source))
+        super().__init__()
+
+    def declare_components(self):
+        spec = merged_param_specs(type(self))
+        if self.m_control:
+            # Delivered mass flow driven by an external signal (e.g. a control.Ramp).
+            self.add_component('m_flow', Variable(self.m_flow, "kg/s"))
+            self.add_port('m_set', RealSignal.as_input(
+                self, self['m_flow'], name='m_set'))
+        else:
+            self.add_component('m_flow', Parameter(self.m_flow, **spec['m_flow'].param_kwargs()))
+        self.add_component('T_source', Parameter(self.T_source, **spec['T_source'].param_kwargs()))
+        # Boundary pressure floats -- the downstream network sets its level.
+        self.add_component('p_out', Variable(self.p_init, "Pa"))
+        self.add_component('h_out', Variable(self._h_init, "J/kg"))
+        self.add_component('m_dot_out', Variable(-self.m_flow, "kg/s"))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': self['p_out'], 'h': self['h_out'], 'm_dot': self['m_dot_out']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+
+    def declare_equations(self):
+        # Continuity (mass flow imposed); "flow into me" => m_dot_out = -m_flow.
+        eq_cont = self['m_flow'].symbol + self['m_dot_out'].symbol
+        # Injected enthalpy = reservoir enthalpy at the local boundary pressure.
+        eq_h = self['h_out'].symbol - self.medium.h_pT(
+            self['p_out'].symbol, self['T_source'].symbol)
+        return [eq_cont, eq_h]
 
 
 class PressureVessel(Model):

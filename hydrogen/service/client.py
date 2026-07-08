@@ -475,7 +475,36 @@ class Stream:
             self._drain_until(added)
         return added
 
-    def _drain_until(self, names, timeout=0.5):
+    def _ensure_watched_many(self, names) -> list:
+        """Register several ``names`` on the host in a *single* round-trip.
+
+        Batching matters for a wide aggregate (e.g. one column per pipe segment):
+        one ``add_stream_vars`` call means one host backfill and one buffer reset
+        instead of N sequential ones, each of which could stall or time out while
+        the host is busy stepping.  Returns the names actually added.
+        """
+        want = [n for n in dict.fromkeys(names)
+                if not self._closed and n not in self._requested]
+        if not want:
+            return []
+        for n in want:
+            self._requested.add(n)
+        try:
+            res = self._conn.call(
+                "add_stream_vars", system_id=self.system_id,
+                stream_id=self.stream_id, vars=want,
+            )
+        except (HostError, HostConnectionError, TimeoutError):
+            for n in want:
+                self._requested.discard(n)   # allow a later retry
+            raise
+        self.vars = res.get("vars", self.vars)
+        added = res.get("added", []) or []
+        if added:
+            self._drain_until(added)
+        return added
+
+    def _drain_until(self, names, timeout=2.0):
         """Poll until every name in ``names`` is present in the buffer (or a
         short timeout elapses)."""
         deadline = time.monotonic() + timeout
@@ -514,16 +543,24 @@ class Stream:
         """Rows safe to expose this frame.
 
         The time length, clamped to the shortest column any *registered handle*
-        needs.  Columns are normally all equal; this only bites in the brief
-        window after a handle is registered but before its freshly-added
-        column's backfill has arrived -- there we report fewer rows (possibly 0)
-        so every handle stays the same length rather than one lagging at 0.
+        needs, so columns that share data stay aligned.  A column that is
+        watched but whose backfill has **not landed yet** (empty) is *ignored*
+        rather than clamping the whole stream to 0: otherwise a single lagging
+        column -- e.g. one of many per-instance columns whose ``add_stream_vars``
+        backfill timed out while the host was busy stepping -- would blank every
+        other handle (and any derived aggregate reading them) until it arrives,
+        which can look like a value that appears for a moment and then reverts to
+        a dash.  The lagging column's own handle simply reads short until its
+        data shows up.
         """
         n = len(self._time)
         for key in self._handle_keys():
             if key is None:        # unmatched name -> don't stall the whole stream
                 continue
-            n = min(n, len(self._data.get(key, [])))
+            col = self._data.get(key)
+            if not col:            # watched but not yet backfilled -> don't stall
+                continue
+            n = min(n, len(col))
         return n
 
     def _handle_keys(self):
@@ -535,6 +572,9 @@ class Stream:
                 keys.add(_match_one_name(self._buffer_keys(), sel[1]))
             elif sel[0] == "series_values":
                 keys.update(_match_all_names(self._buffer_keys(), sel[1]))
+            elif sel[0] == "series_multi":
+                for r in sel[1]:
+                    keys.add(_match_one_name(self._buffer_keys(), r))
         return keys
 
     def time(self):
@@ -564,6 +604,22 @@ class Stream:
         self._ensure_watched(name)
         return self._register(("series_values", name))
 
+    def series_multi(self, names):
+        """A live :class:`StreamHandle` (2-D, rows = time, columns = ``names``)
+        over an *explicit* list of recorded variable names.
+
+        Unlike :meth:`series_values` (which expands one suffix host-side), this
+        watches a caller-resolved set -- e.g. every variable a regex aggregate
+        matched -- and registers them all in a *single* ``add_stream_vars`` call
+        (one backfill), so a client can pass the pattern once and then reduce the
+        held handle with ``handle.array.sum(axis=1)`` on every frame.  A column
+        whose backfill hasn't landed yet is simply omitted until it arrives, so a
+        slow instance never blanks the whole matrix.
+        """
+        names = list(names)
+        self._ensure_watched_many(names)
+        return self._register(("series_multi", tuple(names)))
+
     def _register(self, selector) -> "StreamHandle":
         import numpy as np
         h = StreamHandle(self, selector, np.empty(0))
@@ -584,12 +640,34 @@ class Stream:
             if key is None:
                 return np.empty(0)
             return np.asarray(self._data.get(key, [])[:n], dtype=float)
-        # series_values -> 2-D (rows = time, columns = matches)
-        keys = _match_all_names(self._buffer_keys(), selector[1])
-        if not keys:
-            return np.empty((n, 0))
-        cols = [np.asarray(self._data.get(k, [])[:n], dtype=float) for k in keys]
-        return np.column_stack(cols)
+        if kind == "series_values":
+            keys = _match_all_names(self._buffer_keys(), selector[1])
+            return self._stack_columns(keys, n)
+        # series_multi -> 2-D over an explicit, caller-resolved name list.
+        keys = [_match_one_name(self._buffer_keys(), r) for r in selector[1]]
+        return self._stack_columns(keys, n)
+
+    def _stack_columns(self, keys, n):
+        """Column-stack the buffer columns for ``keys`` into a 2-D array.
+
+        Columns with no data yet are dropped (rather than making the matrix
+        ragged or forcing a zero column), and the rest are truncated to their
+        shortest common length so the result is rectangular.  Returns an empty
+        2-D array when nothing has data.
+        """
+        import numpy as np
+        cols = []
+        for k in keys:
+            if k is None:
+                continue
+            col = self._data.get(k)
+            if not col:
+                continue
+            cols.append(np.asarray(col[:n], dtype=float))
+        if not cols:
+            return np.empty((0, 0))
+        m = min(len(c) for c in cols)
+        return np.column_stack([c[:m] for c in cols])
 
     def _buffer_keys(self):
         """Watched key names, preferring the host-reported order in

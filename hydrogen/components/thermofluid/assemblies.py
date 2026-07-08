@@ -194,6 +194,8 @@ class Pipe(Model):
     #: filename in ``hydrogen/components/icons/``; surfaced via the catalog as
     #: ``"icon"``).  Components without one fall back to the generic box.
     UI_ICON = "pipe.svg"
+    #: Draw the bare symbol (no labelled box / editable ports) on the canvas.
+    UI_ICON_ONLY = True
 
     #: Named predicates referenced by `relevant_when` below, so a UI can gate
     #: list-content-dependent fields without understanding the list internals.
@@ -772,6 +774,8 @@ class Tank(Model):
     #: P&ID-style SVG symbol for the UI canvas (file in
     #: ``hydrogen/components/icons/``; surfaced via the catalog as ``"icon"``).
     UI_ICON = "pressure_vessel.svg"
+    #: Draw the bare symbol (no labelled box / editable ports) on the canvas.
+    UI_ICON_ONLY = True
 
     #: Named predicates referenced by `relevant_when` (see `Pipe`).
     CONDITIONS = {

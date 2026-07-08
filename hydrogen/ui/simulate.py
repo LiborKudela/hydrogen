@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 
+from . import theme
 from .qt import QtCore, QtGui, QtWidgets, Signal
 from .session import SimulationSession
 
@@ -408,7 +409,7 @@ class SimSettingsDialog(QtWidgets.QDialog):
                 "Only the highlighted <b>simulation</b> knobs are pushed to the "
                 "host; stop the run to edit instantiation / strategy.")
         note.setWordWrap(True)
-        note.setStyleSheet("color: #666;")
+        note.setStyleSheet(f"color: {theme.current().muted};")
         outer.addWidget(note)
 
         buttons = QtWidgets.QDialogButtonBox(
@@ -466,11 +467,12 @@ class SimulateDialog(QtWidgets.QDialog):
     """
 
     def __init__(self, session: SimulationSession, build_system, get_options,
-                 parent=None, log_sink=None):
+                 parent=None, log_sink=None, on_run_started=None):
         super().__init__(parent)
         self._session = session
         self._build_system = build_system   # () -> system spec dict
         self._get_options = get_options     # () -> persisted options dict
+        self._on_run_started = on_run_started
         # Optional shared recorder: when set, every log line is routed through
         # it (so the run output is persisted and visible even for runs launched
         # from the toolbar, not this window).  It mirrors back into this panel.
@@ -530,7 +532,7 @@ class SimulateDialog(QtWidgets.QDialog):
         self._more_btn.setMenu(more_menu)
         bar.addWidget(self._more_btn)
 
-        self._run_btn = QtWidgets.QPushButton("▶ Run")
+        self._run_btn = QtWidgets.QPushButton("Run")
         self._run_btn.setToolTip(
             "Build the model if needed, then initialise and run it.")
         self._run_btn.clicked.connect(self._on_run)
@@ -540,7 +542,7 @@ class SimulateDialog(QtWidgets.QDialog):
         self._close_btn = QtWidgets.QPushButton("Close")
         self._close_btn.setToolTip(
             "Close this window. A streaming run keeps advancing on the host "
-            "(steer it with the ⏸/⏹ controls next to Simulate); only a build / "
+            "(steer it with the Pause/Stop controls next to Simulate); only a build / "
             "initialise still in progress is cancelled first. The built model "
             "stays alive on the host.")
         self._close_btn.clicked.connect(self._on_close_clicked)
@@ -633,6 +635,12 @@ class SimulateDialog(QtWidgets.QDialog):
                   "status")
         self._session.abort()
 
+    def _after_run_started(self, message: str):
+        hook = self._on_run_started
+        if hook is not None:
+            hook()
+        self._log(message)
+
     def _worker_finished(self, on_done, result):
         if self._cancelling:
             self._log(f"\n{self._op_label} cancelled.", "status")
@@ -698,7 +706,7 @@ class SimulateDialog(QtWidgets.QDialog):
     def _on_force_init(self):
         """Re-solve the built model to t=0 without launching a run."""
         if self._session.run_active:
-            self._log("Stop the run before re-initialising (use the ⏹ "
+            self._log("Stop the run before re-initialising (use the Stop "
                       "control).", "status")
             return
         if not self._session.built:
@@ -717,7 +725,7 @@ class SimulateDialog(QtWidgets.QDialog):
         """Drop the built model from the host (next run re-instantiates)."""
         if self._session.run_active:
             self._log("Stop the run before resetting the model "
-                      "(use the ⏹ control).", "status")
+                      "(use the Stop control).", "status")
             return
         if not self._session.built:
             self._log("No built model to reset.", "status")
@@ -735,7 +743,7 @@ class SimulateDialog(QtWidgets.QDialog):
     def _on_run(self):
         if self._session.run_active:
             self._log("A run is already in progress — pause or stop it first "
-                      "(the ⏸/⏹ controls next to Simulate).", "status")
+                      "(the Pause/Stop controls next to Simulate).", "status")
             return
         options = self._get_options()
         run_kw = run_kwargs(options)
@@ -764,9 +772,9 @@ class SimulateDialog(QtWidgets.QDialog):
 
         self._start_worker(
             task,
-            lambda _ack: self._log(
+            lambda _ack: self._after_run_started(
                 "\nrun started — it streams live and keeps running in the "
-                "background. You can close this window; use the ⏸/⏹ controls "
+                "background. You can close this window; use the Pause/Stop controls "
                 "next to Simulate to pause or stop it."),
             op_label="run")
 

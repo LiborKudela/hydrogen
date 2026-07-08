@@ -35,6 +35,7 @@ import math
 
 import numpy as np
 
+from . import theme
 from .qt import QtCharts, QtCore, QtGui, QtWidgets, Signal, exec_
 
 __all__ = [
@@ -119,6 +120,42 @@ def _exec_beside(dlg: "QtWidgets.QDialog", anchor: "QtCore.QPoint | None"):
     return exec_(dlg)
 
 
+def _style_chart(chart, axes=()):
+    """Tint a ``QChart``'s chrome (background, title, legend, axes, grid) for the
+    active theme *without* touching series colours (those are user-picked).
+
+    ``setTheme`` is deliberately avoided because it would overwrite each trace's
+    pen; instead the individual brushes/pens are set by hand."""
+    if chart is None or QtCharts is None:
+        return
+    c = theme.current()
+    ink = QtGui.QColor(c.ink)
+    muted = QtGui.QColor(c.muted)
+    grid = QtGui.QColor(c.grid)
+    chart.setBackgroundVisible(False)
+    chart.setBackgroundBrush(QtCore.Qt.NoBrush)
+    try:
+        chart.setPlotAreaBackgroundVisible(False)
+    except (AttributeError, TypeError):
+        pass
+    chart.setTitleBrush(ink)
+    legend = chart.legend()
+    if legend is not None:
+        legend.setLabelColor(ink)
+    for axis in axes:
+        if axis is None:
+            continue
+        try:
+            axis.setLabelsColor(muted)
+            axis.setTitleBrush(ink)
+            axis.setGridLineColor(grid)
+            line_pen = axis.linePen()
+            line_pen.setColor(muted)
+            axis.setLinePen(line_pen)
+        except (AttributeError, TypeError):
+            pass
+
+
 # --------------------------------------------------------------------------- #
 # Content: the variable table.
 # --------------------------------------------------------------------------- #
@@ -187,9 +224,10 @@ class VariableTable(QtWidgets.QWidget):
             bar.addWidget(b)
             self._toolbar_buttons.append((b, slot))
         bar.addStretch(1)
-        hint = QtWidgets.QLabel("drag rows to a plot")
-        hint.setStyleSheet("color:#999; font-size:10px;")
-        bar.addWidget(hint)
+        self._hint = QtWidgets.QLabel("drag rows to a plot")
+        self._hint.setStyleSheet(
+            f"color:{theme.current().muted}; font-size:10px;")
+        bar.addWidget(self._hint)
         lay.addLayout(bar)
 
         self._table = _RowDragTable(self._row_payload, 0, len(self._COLS))
@@ -259,6 +297,25 @@ class VariableTable(QtWidgets.QWidget):
                 for r in self._rows
                 if r.get("agg") and r["full"] not in SPECIAL_KEYS}
 
+    def update_variable_meta(self, payload: dict) -> bool:
+        """Apply an edited variable payload (label / unit / description / agg) to
+        any row referencing the same ``full``; returns True if a row changed."""
+        full = payload.get("full")
+        changed = False
+        for r in self._rows:
+            if r["full"] != full:
+                continue
+            r["label"] = payload.get("label", r.get("label", full))
+            r["unit"] = payload.get("unit", r.get("unit", ""))
+            r["description"] = payload.get("description", r.get("description", ""))
+            if payload.get("agg"):
+                r["agg"] = dict(payload["agg"])
+            changed = True
+        if changed:
+            self._rebuild()
+            self.changed.emit()
+        return changed
+
     def _add_special_row(self, full, label, unit, description):
         if any(r["full"] == full for r in self._rows):
             return
@@ -295,6 +352,12 @@ class VariableTable(QtWidgets.QWidget):
         """Register a callback invoked whenever the visible content changes, so
         the hosting scene item can re-render its pixmap."""
         self._render_hook = fn
+
+    def restyle(self):
+        """Re-apply theme-dependent chrome (the table itself follows the app
+        palette automatically)."""
+        self._hint.setStyleSheet(
+            f"color:{theme.current().muted}; font-size:10px;")
 
     def _notify_render(self):
         if self._render_hook is not None:
@@ -711,6 +774,24 @@ class TimeseriesChart(QtWidgets.QWidget):
         return {t["full"]: dict(t["agg"])
                 for t in self._traces if t.get("agg")}
 
+    def update_variable_meta(self, payload: dict) -> bool:
+        """Apply an edited variable payload (label / agg) to any trace
+        referencing the same ``full``; returns True if a trace changed."""
+        full = payload.get("full")
+        changed = False
+        for t in self._traces:
+            if t["full"] != full:
+                continue
+            t["label"] = payload.get("label", t.get("label", full))
+            if payload.get("agg"):
+                t["agg"] = dict(payload["agg"])
+            self._style_series(t)          # refresh the legend / series name
+            changed = True
+        if changed:
+            self.refresh_live()
+            self.changed.emit()
+        return changed
+
     # --- drop target ------------------------------------------------------- #
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat(VARIABLE_MIME):
@@ -761,9 +842,14 @@ class TimeseriesChart(QtWidgets.QWidget):
                 xmax = xmx if xmax is None else max(xmax, xmx)
                 ymin = ymn if ymin is None else min(ymin, ymn)
                 ymax = ymx if ymax is None else max(ymax, ymx)
-        if xmin is not None and xmax > xmin:
-            self._axis_x.setRange(xmin, xmax)
-            self._axis_x.setLabelFormat(self._axis_label_format(xmin, xmax))
+        if xmin is not None:
+            if xmax <= xmin:
+                xpad = max(abs(xmin) * 0.05, 0.5) if xmin != 0 else 0.5
+                lo, hi = xmin - xpad, xmax + xpad
+            else:
+                lo, hi = xmin, xmax
+            self._axis_x.setRange(lo, hi)
+            self._axis_x.setLabelFormat(self._axis_label_format(lo, hi))
         if ymin is not None:
             pad = (ymax - ymin) * 0.05 or (abs(ymax) * 0.05 or 1.0)
             lo, hi = ymin - pad, ymax + pad
@@ -860,7 +946,12 @@ class TimeseriesChart(QtWidgets.QWidget):
             axis.setLabelsFont(af)
             axis.setTitleText(s.get(key, ""))
             axis.setTitleVisible(bool(s.get(key)))
+        _style_chart(self._chart, (self._axis_x, self._axis_y))
         self._notify_render()
+
+    def restyle(self):
+        """Re-tint the chart chrome for the active theme."""
+        self._apply_settings()
 
     # --- context-menu actions ---------------------------------------------- #
     def set_dialog_context(self, parent, anchor):
@@ -1056,6 +1147,7 @@ def _style_pie_slice(sl, *, text: str, show_label: bool, inside: bool):
     if inside:
         sl.setLabelColor(QtGui.QColor("#ffffff"))
     else:
+        sl.setLabelColor(QtGui.QColor(theme.current().ink))
         sl.setLabelArmLengthFactor(0.12)
     font = sl.labelFont()
     font.setPointSize(9 if inside else 8)
@@ -1127,6 +1219,23 @@ class _SnapshotChartBase(QtWidgets.QWidget):
     def derived_specs(self) -> dict[str, dict]:
         return {e["full"]: dict(e["agg"])
                 for e in self._entries if e.get("agg")}
+
+    def update_variable_meta(self, payload: dict) -> bool:
+        """Apply an edited variable payload (label / agg) to any entry
+        referencing the same ``full``; returns True if an entry changed."""
+        full = payload.get("full")
+        changed = False
+        for e in self._entries:
+            if e["full"] != full:
+                continue
+            e["label"] = payload.get("label", e.get("label", full))
+            if payload.get("agg"):
+                e["agg"] = dict(payload["agg"])
+            changed = True
+        if changed:
+            self._rebuild_entries()
+            self.changed.emit()
+        return changed
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat(VARIABLE_MIME):
@@ -1249,7 +1358,12 @@ class BarChart(_SnapshotChartBase):
                                             QtCore.Qt.AlignBottom))
         self._axis_y.setTitleText(s.get("y_title", ""))
         self._axis_y.setTitleVisible(bool(s.get("y_title")))
+        _style_chart(self._chart, (self._axis_x, self._axis_y))
         self._notify_render()
+
+    def restyle(self):
+        """Re-tint the chart chrome for the active theme."""
+        self._apply_settings()
 
     def _edit_settings(self):
         dlg = _SnapshotChartSettingsDialog(
@@ -1370,7 +1484,12 @@ class PieChart(_SnapshotChartBase):
             self._pie_series.setLabelsVisible(show_pct)
             # Leave room for outside callout labels when percentages are on.
             self._pie_series.setPieSize(0.62 if show_pct else 0.78)
+        _style_chart(self._chart)
         self._notify_render()
+
+    def restyle(self):
+        """Re-tint the chart chrome for the active theme."""
+        self._apply_settings()
 
     def _edit_settings(self):
         dlg = _SnapshotChartSettingsDialog(
@@ -1570,23 +1689,36 @@ class PlotItem(QtWidgets.QGraphicsObject):
         self._rendered_scale = scale
         if self.content.size() != QtCore.QSize(cw, ch):
             self.content.resize(cw, ch)
+        view = getattr(self.content, "_view", None)
+        if view is not None:
+            view.repaint()
         pm = QtGui.QPixmap(max(1, int(cw * scale)), max(1, int(ch * scale)))
         pm.setDevicePixelRatio(scale)
-        pm.fill(QtCore.Qt.white)
+        pm.fill(QtGui.QColor(theme.current().plot_bg))
         self.content.render(pm)
         self._pixmap = pm
         self.update()
 
     # --- painting ---------------------------------------------------------- #
+    def restyle(self):
+        """Re-theme this object's chrome and content, then re-render its pixmap
+        (called after a light/dark swap)."""
+        content_restyle = getattr(self.content, "restyle", None)
+        if callable(content_restyle):
+            content_restyle()
+        self._render()
+        self.update()
+
     def paint(self, p, _option, _widget=None):
         if self.content is None:                  # disposed; nothing to draw
             return
+        c = theme.current()
         r = self.boundingRect()
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
         path = QtGui.QPainterPath()
         path.addRoundedRect(r, 6, 6)
-        p.fillPath(path, QtGui.QColor("#ffffff"))
+        p.fillPath(path, QtGui.QColor(c.plot_bg))
 
         if self._pixmap is not None:
             p.save()
@@ -1597,9 +1729,9 @@ class PlotItem(QtWidgets.QGraphicsObject):
         p.save()
         p.setClipPath(path)
         p.fillRect(QtCore.QRectF(0.0, 0.0, self._w, self.HEADER_H),
-                   QtGui.QColor("#546e7a"))
+                   QtGui.QColor(c.plot_header))
         p.restore()
-        p.setPen(QtGui.QColor("#ffffff"))
+        p.setPen(QtGui.QColor(c.plot_header_text))
         f = p.font()
         f.setPointSizeF(10.0)
         f.setBold(True)
@@ -1609,12 +1741,13 @@ class PlotItem(QtWidgets.QGraphicsObject):
                    f"{self.content.title()}  ·  {self.kind}")
 
         selected = self.isSelected()
-        p.setPen(QtGui.QPen(QtGui.QColor("#1976d2" if selected else "#90a4ae"),
-                            1.5 if selected else 1.0))
+        p.setPen(QtGui.QPen(
+            QtGui.QColor(c.plot_border_selected if selected else c.plot_border),
+            1.5 if selected else 1.0))
         p.setBrush(QtCore.Qt.NoBrush)
         p.drawPath(path)
 
-        p.setPen(QtGui.QPen(QtGui.QColor("#607d8b"), 1.2))
+        p.setPen(QtGui.QPen(QtGui.QColor(c.plot_grip), 1.2))
         for d in (4.0, 8.0, 12.0):
             p.drawLine(QtCore.QPointF(self._w - d, self._h - 2.0),
                        QtCore.QPointF(self._w - 2.0, self._h - d))

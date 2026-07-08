@@ -7,9 +7,10 @@ These are purely presentational -- wiring *validity* never depends on them
 
 from __future__ import annotations
 
+from . import theme
 from .qt import QtGui
 
-__all__ = ["domain_color", "kind_color", "port_on_right"]
+__all__ = ["domain_color", "kind_color", "port_on_right", "domain_leaf_color"]
 
 #: Pastel fills cycled per domain so canvas nodes are visually grouped.
 _PALETTE = ["#cfe8ff", "#d8f5d0", "#ffe3c2", "#f3d4ff",
@@ -23,6 +24,12 @@ def domain_color(domain: str) -> QtGui.QColor:
         _DOMAIN_COLORS[domain] = QtGui.QColor(
             _PALETTE[len(_DOMAIN_COLORS) % len(_PALETTE)])
     return _DOMAIN_COLORS[domain]
+
+
+def domain_leaf_color(domain: str) -> QtGui.QColor:
+    """The catalogue-tree text colour for a domain: a pastel derivative kept
+    legible against the active theme's backdrop."""
+    return theme.catalog_leaf_color(domain_color(domain))
 
 
 #: One colour per port *kind* (the ``connect()`` discriminator).  Only same-kind
