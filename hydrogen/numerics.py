@@ -15,6 +15,33 @@ from sympy.printing.numpy import NumPyPrinter as _NumPyPrinter
 G_const = 9.81
 
 
+def smooth_max(a, b, eps):
+    """Smooth (C-infinity) approximation of ``max(a, b)``.
+
+    ``0.5 * (a + b + sqrt((a - b)**2 + eps**2))`` -- a hyperbola that rounds the
+    kink of a hard ``max`` over a blend width ``~eps`` around ``a == b``, so the
+    result stays differentiable and Newton keeps a continuous Jacobian.  The
+    bias is at most ``eps/2`` (at ``a == b``) and decays to ~0 more than a few
+    ``eps`` away from the corner; ``smooth_max(a, b, eps) >= max(a, b)`` always.
+
+    ``eps`` MUST be in the SAME units / magnitude as ``a`` and ``b`` (e.g. Pa for
+    pressures, or a small fraction of a signal's range) -- there is no sensible
+    default, so it is a required argument.  Intended for building symbolic
+    (sympy) residual expressions.
+    """
+    return 0.5 * (a + b + sp.sqrt((a - b) ** 2 + eps ** 2))
+
+
+def smooth_min(a, b, eps):
+    """Smooth (C-infinity) approximation of ``min(a, b)``; see :func:`smooth_max`.
+
+    ``0.5 * (a + b - sqrt((a - b)**2 + eps**2))``.  ``smooth_min`` is bounded
+    ABOVE by ``min(a, b)`` (bias at most ``-eps/2`` at ``a == b``).  ``eps`` must
+    match the units / magnitude of ``a`` and ``b``.
+    """
+    return 0.5 * (a + b - sp.sqrt((a - b) ** 2 + eps ** 2))
+
+
 def lambdify_compat(args, expr, modules=None, cse=True, docstring_limit=-1,
                     printer=None):
     """Wrapper around `sympy.lambdify` that tolerates older sympy versions.

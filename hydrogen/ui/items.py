@@ -507,7 +507,11 @@ class NodeItem(QtWidgets.QGraphicsRectItem):
             elif name == "outlet":
                 pt = QtCore.QPointF(rect.right(), rect.center().y())
                 side = 1
-            elif name == "opening" or kind == "thermal":
+            elif name == "opening" or kind == "thermal" or kind == "signal_real":
+                # Signal OUTPUTS (e.g. a sensor's `y`) rise from the top edge,
+                # matching the signal stub drawn on the P&ID symbol.  Signal
+                # INPUTS (`p_set` / `m_set`) are caught by name above and sit on
+                # the left with the inlet.
                 extras_top.append((name, kind))
                 continue
             else:

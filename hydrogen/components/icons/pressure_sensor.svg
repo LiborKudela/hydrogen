@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- P&ID-style inline pressure sensor: an instrument bubble on the flow
+     centreline with inlet/outlet stubs, a signal-output stub on top, and a
+     "P" denoting pressure. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <line x1="2" y1="30" x2="42" y2="30"/>
+  <line x1="78" y1="30" x2="118" y2="30"/>
+  <circle cx="60" cy="30" r="18"/>
+  <line x1="60" y1="12" x2="60" y2="2"/>
+  <text x="60" y="38" font-family="sans-serif" font-size="20" font-weight="bold"
+        text-anchor="middle" fill="#1b1b1b" stroke="none">P</text>
+</svg>

@@ -9,6 +9,9 @@ component, not three).  Organised into submodules:
     `PermeationPort_pN`.
   * `flow`        -- compressible-flow components: `TwoPortSegment`,
     `StraightPipe`, vessels, valves, junctions, sources/outlets.
+  * `sensors`     -- inline, drop-free flow instruments that publish a reading
+    on a `control.RealSignal` output: `MassFlowSensor`, `MassTotalizer`,
+    `TemperatureSensor` (static or total temperature), `VolumeFlowSensor`.
   * `walls`       -- lumped wall conduction: `TwoNodeWall`, `FlatWall`,
     `CylindricalWall`, `SphericalWall` (any `leaky=True` for gas permeation),
     plus thermal boundary conditions.

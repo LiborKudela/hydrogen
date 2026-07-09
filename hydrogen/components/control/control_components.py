@@ -37,6 +37,7 @@ import numpy as np
 import sympy as sp
 
 from ...model import DifferentialVariable, Input, Model, Parameter, Variable
+from ...numerics import smooth_max, smooth_min
 from ...paramspec import ParamSpec
 from ...ports import Port
 
@@ -372,7 +373,13 @@ class CsvTable(_TimeSource):
         self.value_offset = value_offset
         self.time_scale = time_scale
         self.unit = unit
-        self._t, self._v = self._load()
+        # The CSV is read lazily (on the first `signal` evaluation) rather than
+        # at construction: this lets the component be *built* with an as-yet
+        # unset / placeholder `filename` (e.g. when the canvas introspects it to
+        # discover its single output port), while a real run still surfaces a
+        # missing / malformed file the moment the solver samples the source.
+        self._t = None
+        self._v = None
         super().__init__()
 
     def _load(self):
@@ -401,6 +408,15 @@ class CsvTable(_TimeSource):
 
     def signal(self, t):
         # np.interp holds the end values flat outside the span (no extrapolation).
+        if self._t is None:
+            # An unset `filename` means the source isn't configured yet (e.g. the
+            # canvas is only introspecting the block to place its output port);
+            # emit the flat offset rather than reading a file.  A *configured*
+            # file that fails to load still raises -- a real run must not run on
+            # silently-wrong data.
+            if self.filename is None:
+                return self.value_offset
+            self._t, self._v = self._load()
         return float(np.interp(float(t), self._t, self._v))
 
 
@@ -572,13 +588,7 @@ class Limiter(Block):
         hi = self['hi'].symbol
         eps = self['eps'].symbol
 
-        def smooth_max(a, b):
-            return 0.5 * (a + b + sp.sqrt((a - b) ** 2 + eps ** 2))
-
-        def smooth_min(a, b):
-            return 0.5 * (a + b - sp.sqrt((a - b) ** 2 + eps ** 2))
-
-        y_clamped = smooth_min(smooth_max(u, lo), hi)
+        y_clamped = smooth_min(smooth_max(u, lo, eps), hi, eps)
         return [self['y'].symbol - y_clamped]
 
 
@@ -648,20 +658,39 @@ class FirstOrder(Block):
 
 
 class PID(Block):
-    """Parallel PID controller with a filtered derivative.
+    """Parallel PID controller with a filtered derivative, output limits and
+    anti-windup.
 
-        y = kp*e + ki*x_i + kd*der(x_d)
+        v = kp*e + x_i + kd*der(x_d),      e = reference - feedback
+        y = clamp(v, y_min, y_max)         (when `limited`, else y = v)
 
-    where the single input ``u`` is the control error ``e`` (put a `Feedback`
-    in front to form ``setpoint - measurement``), ``x_i`` is the integral
-    state (``der(x_i) = e``) and ``x_d`` is a first-order derivative filter
-    (``der(x_d) = (e - x_d)/Tf``) so ``der(x_d) -> de/dt`` as ``Tf -> 0`` --
-    a proper, noise-tolerant derivative instead of a raw (unbounded) one.
+    The controller exposes three signal ports: two inputs ``reference`` (the
+    setpoint) and ``feedback`` (the measurement), and one output ``y``.  The
+    control error ``e = reference - feedback`` is formed internally (no need
+    for a separate `Feedback` block).
 
-    Note: this is a textbook PID without output saturation / anti-windup, so
-    drive its output through a `Limiter` when commanding a bounded actuator
-    (e.g. a ``[0, 1]`` valve opening); integrator anti-windup is a planned
-    enhancement.
+    States:
+      * ``x_i`` -- the integral action, in OUTPUT units, so ``der(x_i) = ki*e``
+        (equivalently ``ki*integral(e)``).  Its initial value is ``y_start``,
+        which therefore seeds the controller's **initial output** (bumpless
+        start when the error begins near zero -- needs ``ki > 0`` to be held).
+      * ``x_d`` -- a first-order derivative filter, ``der(x_d) = (e - x_d)/Tf``,
+        so ``kd*der(x_d) -> kd*de/dt`` as ``Tf -> 0`` -- a proper, noise-tolerant
+        derivative instead of a raw (unbounded) one.
+
+    Output limiting (``limited=True``):
+      * The output is smoothly saturated to ``[y_min, y_max]`` (a soft min/max
+        so Newton keeps a smooth Jacobian near the bounds).
+      * **Back-calculation anti-windup** feeds the saturation error back into
+        the integrator, ``der(x_i) = ki*(e + Ni*(y - v))``: while saturated the
+        term ``y - v`` is non-zero and bleeds the integral state back toward the
+        limit so it cannot wind up.  ``Ni`` is the (dimensionless) anti-windup
+        gain ratio, so the back-calculation gain ``Ni*ki`` scales WITH the
+        integral gain -- and, crucially, vanishes for a pure P / PD controller
+        (``ki = 0``), where there is no integrator to unwind.  A pure-P loop
+        with limits is then exactly ``y = clamp(kp*e + y_start, y_min, y_max)``.
+        With ``limited=False`` there is no saturation and ``der(x_i) = ki*e``
+        (a textbook PID).
     """
 
     UI_ICON = "pid.svg"
@@ -673,15 +702,44 @@ class PID(Block):
         kd: Annotated[float, ParamSpec("Derivative gain.", unit="s")] = 0.0,
         Tf: Annotated[float, ParamSpec("Derivative-filter time constant (> 0); "
                      "der(x_d) -> de/dt as Tf -> 0.", unit="s")] = 0.1,
+        y_start: Annotated[float, ParamSpec("Initial output: seeds the integral "
+                          "state x_i, so the controller starts at this value "
+                          "(needs ki > 0 to be held).")] = 0.0,
+        limited: Annotated[bool, ParamSpec("If true, saturate the output to "
+                          "[y_min, y_max] with back-calculation anti-windup; if "
+                          "false the output is unbounded.", structural=True)]
+        = False,
+        y_min: Annotated[float, ParamSpec("Lower output limit (used when "
+                        "limited).")] = 0.0,
+        y_max: Annotated[float, ParamSpec("Upper output limit (used when "
+                        "limited); must be > y_min.")] = 1.0,
+        Ni: Annotated[float, ParamSpec("Anti-windup gain ratio (dimensionless, "
+                     ">= 0, used when limited): the back-calculation gain is "
+                     "Ni*ki, so anti-windup scales with the integral gain and "
+                     "vanishes for a pure P/PD controller (ki = 0). 0 disables "
+                     "it.")] = 1.0,
         unit: Annotated[str, _SPEC_SIGNAL_UNIT] = None,
     ):
         if Tf <= 0.0:
             raise ValueError("PID derivative-filter time Tf must be > 0")
+        self.limited = bool(limited)
+        if self.limited:
+            if y_max <= y_min:
+                raise ValueError("PID output limits require y_max > y_min")
+            if Ni < 0.0:
+                raise ValueError("PID anti-windup ratio Ni must be >= 0")
         self.kp = kp
         self.ki = ki
         self.kd = kd
         self.Tf = Tf
+        self.y_start = y_start
+        self.y_min = y_min
+        self.y_max = y_max
+        self.Ni = Ni
         self.unit = unit
+        # Soft-saturation blend width: a small fraction of the limit span so the
+        # rounding is imperceptible yet keeps the min/max corners differentiable.
+        self._sat_eps = 1e-3 * (y_max - y_min) if self.limited else 0.0
         super().__init__()
 
     def declare_components(self):
@@ -689,19 +747,71 @@ class PID(Block):
         self.add_component('ki', Parameter(self.ki, "1/s"))
         self.add_component('kd', Parameter(self.kd, "s"))
         self.add_component('Tf', Parameter(self.Tf, "s"))
-        self._add_input('u', unit=self.unit)
-        self.add_component('x_i', DifferentialVariable(0.0, self.unit))
+        self._add_input('reference', unit=self.unit)
+        self._add_input('feedback', unit=self.unit)
+        # Integral state carries the integral action directly (output units), so
+        # its initial value y_start seeds the controller's initial output.
+        self.add_component('x_i', DifferentialVariable(self.y_start, self.unit))
         self.add_component('x_d', DifferentialVariable(0.0, self.unit))
-        self._add_output('y', unit=self.unit)
+        if self.limited:
+            self.add_component('y_min', Parameter(self.y_min, self.unit))
+            self.add_component('y_max', Parameter(self.y_max, self.unit))
+            self.add_component('Ni', Parameter(self.Ni, "-"))
+            # Unsaturated command, recorded as a leaf variable (plottable) and
+            # used by the anti-windup back-calculation.  NOTE: the OUTPUT clamp
+            # deliberately does NOT read this leaf -- it saturates the live
+            # expression `v_expr` instead (see `declare_equations`), so the
+            # output's Jacobian reflects the true saturation state at every
+            # Newton iterate rather than the leaf's stale (corner) start value.
+            self.add_component('v', Variable(self.y_start, self.unit))
+        self._add_output('y', init=self._saturated_start(), unit=self.unit)
+
+    def _saturated_start(self):
+        """Initial output, clamped to the limits so it starts inside the valid
+        range even if `y_start` was left at a default outside [y_min, y_max]."""
+        if not self.limited:
+            return self.y_start
+        return min(max(self.y_start, self.y_min), self.y_max)
 
     def declare_equations(self):
-        e = self['u'].symbol
+        e = self['reference'].symbol - self['feedback'].symbol
         kp = self['kp'].symbol
         ki = self['ki'].symbol
         kd = self['kd'].symbol
         Tf = self['Tf'].symbol
         der_x_d = self['der_x_d'].symbol
-        eq_int = self['der_x_i'].symbol - e
+        x_i = self['x_i'].symbol
+        y = self['y'].symbol
+
         eq_der = der_x_d - (e - self['x_d'].symbol) / Tf
-        eq_out = self['y'].symbol - (kp * e + ki * self['x_i'].symbol + kd * der_x_d)
-        return [eq_int, eq_der, eq_out]
+        v_expr = kp * e + x_i + kd * der_x_d
+
+        if not self.limited:
+            eq_int = self['der_x_i'].symbol - ki * e
+            eq_out = y - v_expr
+            return [eq_int, eq_der, eq_out]
+
+        v = self['v'].symbol
+        y_min = self['y_min'].symbol
+        y_max = self['y_max'].symbol
+        Ni = self['Ni'].symbol
+        eps = self._sat_eps
+
+        # Record the unsaturated command as a leaf (for plotting / anti-windup).
+        eq_v = v - v_expr
+        # Saturate the LIVE expression, not the leaf `v`.  This is the key to a
+        # robust initialisation: `v_expr` is evaluated from the current state, so
+        # if the proportional term kp*e is huge (large error, high gain) the
+        # clamp is already deep in saturation where its slope ~ 0 -- the output
+        # decouples and stays at the limit at EVERY Newton iterate.  Clamping the
+        # leaf `v` instead would use its stale start value (y_start, at the clip
+        # corner where the slope ~ 0.5), leaking the huge unsaturated command
+        # into the first Newton step and driving the coupled plant (e.g. a
+        # compressible pipe) to non-physical states (negative pressure).
+        eq_out = y - smooth_min(smooth_max(v_expr, y_min, eps), y_max, eps)
+        # Back-calculation anti-windup, gain Ni*ki so it scales with the
+        # integral gain: (y - v_expr) is 0 unless saturated, where it bleeds the
+        # integral back toward the active limit.  With ki = 0 the whole
+        # integrator (and its windup) disappears -> a clean limited P/PD loop.
+        eq_int = self['der_x_i'].symbol - ki * (e + Ni * (y - v_expr))
+        return [eq_int, eq_der, eq_v, eq_out]

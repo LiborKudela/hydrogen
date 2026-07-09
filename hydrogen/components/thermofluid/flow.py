@@ -20,7 +20,7 @@ import sympy as sp
 
 from ...medium import CoolPropMedium
 from ...model import DifferentialVariable, Model, Parameter, Variable
-from ...numerics import G_const
+from ...numerics import G_const, smooth_max, smooth_min
 from ...paramspec import ParamSpec, merged_param_specs
 from ..control.control_components import RealSignal
 from .ports import FluidPort_phm, PermeationPort_pN, ThermalPort_TQ
@@ -2816,23 +2816,19 @@ class IncompressibleValve(Valve):
         rho_in = self['rho_0'].symbol
         rho_out = self['rho_1'].symbol
 
-        def smax(a, b):
-            return 0.5 * (a + b + sp.sqrt((a - b) ** 2 + p_eps ** 2))
-
-        def smin(a, b):
-            return 0.5 * (a + b - sp.sqrt((a - b) ** 2 + p_eps ** 2))
-
+        # All smooth-max/min arguments here are PRESSURES (Pa), so `p_eps` (Pa)
+        # is the single blending scale (shared helper in `hydrogen.numerics`).
         # Upstream pressure / (liquid) density picked smoothly by flow
         # direction -- the downstream face may be a flashing two-phase
         # mixture whose density must NOT enter the sizing law.
         s = dp / sp.sqrt(dp ** 2 + dp_eps ** 2)             # smooth sign(dp)
         frac = 0.5 * (1 + s)                                # ~1 fwd, ~0 rev
-        p_up = smax(p_in, p_out)
+        p_up = smooth_max(p_in, p_out, p_eps)
         rho_up = frac * rho_in + (1 - frac) * rho_out
         # ISA liquid-choking clamp (floored at p_eps so the sqrt stays real
         # even if an iterate drags p_up below FF*p_vap).
-        dp_choke = FL ** 2 * smax(p_up - FF * pv, p_eps)
-        dp_used = smin(smax(dp, -dp_choke), dp_choke)
+        dp_choke = FL ** 2 * smooth_max(p_up - FF * pv, p_eps, p_eps)
+        dp_used = smooth_min(smooth_max(dp, -dp_choke, p_eps), dp_choke, p_eps)
         return (C * th * sp.sqrt(rho_up)
                 * dp_used / (dp_used ** 2 + dp_eps ** 2) ** 0.25)
 
@@ -2914,15 +2910,10 @@ class CompressibleValve(Valve):
 
         # All smooth-max/min arguments below are PRESSURES (Pa), so `p_eps`
         # (Pa) is the only blending scale -- no dimensionless/dimensional mix.
-        def smax(a, b):
-            return 0.5 * (a + b + sp.sqrt((a - b) ** 2 + p_eps ** 2))
-
-        def smin(a, b):
-            return 0.5 * (a + b - sp.sqrt((a - b) ** 2 + p_eps ** 2))
-
+        # (shared helper in `hydrogen.numerics`).
         s = dp / sp.sqrt(dp ** 2 + dp_eps ** 2)            # smooth sign(dp)
         frac = 0.5 * (1 + s)                                # ~1 fwd, ~0 rev
-        p_up = smax(p_in, p_out)                            # upstream pressure
+        p_up = smooth_max(p_in, p_out, p_eps)               # upstream pressure
         rho_up = frac * rho_in + (1 - frac) * rho_out       # upstream density
         Fg = gamma / 1.4
         x_choke = Fg * xT                                   # critical x
@@ -2931,7 +2922,7 @@ class CompressibleValve(Valve):
         # Cap the (signed) pressure drop at +/- the choke value in Pascals,
         # then take the always-real regularised sign*sqrt(|.|).  Because the
         # cap and the sqrt are both in Pa, the radicand is never negative.
-        dp_used = smin(smax(dp, -dp_choke), dp_choke)
+        dp_used = smooth_min(smooth_max(dp, -dp_choke, p_eps), dp_choke, p_eps)
         x_eff = sp.sqrt(dp_used ** 2 + dp_eps ** 2) / p_up  # |dp_used| / p_up
         Y = 1 - x_eff / (3 * x_choke)                       # 2/3 .. 1
         g = dp_used / (dp_used ** 2 + dp_eps ** 2) ** 0.25  # sign*sqrt(|dp_used|)

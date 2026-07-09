@@ -177,20 +177,157 @@ def test_pid_closed_loop_tracks_setpoint():
     class Loop(Model):
         def declare_components(self):
             self.add_component('sp', Constant(k=1.0))
-            self.add_component('fb', Feedback())
             self.add_component('pid', PID(kp=2.0, ki=1.5, kd=0.0, Tf=0.1))
             self.add_component('plant', FirstOrder(T=0.5, k=1.0))
 
         def declare_equations(self):
-            self.connect(self['sp'].ports['y'], self['fb'].ports['u1'])
-            self.connect(self['plant'].ports['y'], self['fb'].ports['u2'])
-            self.connect(self['fb'].ports['y'], self['pid'].ports['u'])
+            # PID forms the error internally: reference - feedback.
+            self.connect(self['sp'].ports['y'], self['pid'].ports['reference'])
+            self.connect(self['plant'].ports['y'], self['pid'].ports['feedback'])
             self.connect(self['pid'].ports['y'], self['plant'].ports['u'])
             return []
 
     _, trace = _solve(Loop(), steps=300, dt=0.1)
     # Integral action removes steady-state offset -> output tracks setpoint.
     assert trace('.plant.y')[-1] == pytest.approx(1.0, abs=2e-2)
+
+
+def test_pid_initial_output_state():
+    """`y_start` seeds the integral state, so with zero error the output holds
+    at y_start from the very first step."""
+    class S(Model):
+        def declare_components(self):
+            self.add_component('r', Constant(k=1.0))
+            self.add_component('m', Constant(k=1.0))     # e = r - m = 0
+            self.add_component('pid', PID(kp=2.0, ki=3.0, kd=0.1, Tf=0.1,
+                                          y_start=0.7))
+
+        def declare_equations(self):
+            self.connect(self['r'].ports['y'], self['pid'].ports['reference'])
+            self.connect(self['m'].ports['y'], self['pid'].ports['feedback'])
+            return []
+
+    _, trace = _solve(S(), steps=5, dt=0.1)
+    y = trace('.pid.y')
+    assert np.allclose(y, 0.7, atol=1e-9)
+
+
+def test_pid_output_limits_and_antiwindup():
+    """A large constant error drives the output hard against `y_max`; the smooth
+    saturation clamps it and back-calculation keeps the integral bounded."""
+    class S(Model):
+        def declare_components(self):
+            self.add_component('r', Constant(k=10.0))
+            self.add_component('m', Constant(k=0.0))     # e = 10 (constant)
+            self.add_component('pid', PID(kp=1.0, ki=5.0, kd=0.0, Tf=0.1,
+                                          limited=True, y_min=0.0, y_max=1.0,
+                                          Ni=1.0, y_start=0.0))
+
+        def declare_equations(self):
+            self.connect(self['r'].ports['y'], self['pid'].ports['reference'])
+            self.connect(self['m'].ports['y'], self['pid'].ports['feedback'])
+            return []
+
+    _, trace = _solve(S(), steps=40, dt=0.1)
+    y = trace('.pid.y')
+    x_i = trace('.pid.x_i')
+    # Output never exceeds the upper limit (bar the tiny smoothing width) and
+    # settles right at it.
+    assert np.all(y <= 1.0 + 1e-3)
+    assert y[-1] == pytest.approx(1.0, abs=1e-2)
+    # Anti-windup: the integral state CONVERGES (der(x_i)=0 at saturation gives
+    # e + Ni*(y - v) = 0 -> v = y_max + e/Ni = 11, x_i = v - kp*e = 1) instead
+    # of ramping away (a windup PID would reach ki*e*t ~ 50*4 = 200 here).
+    assert x_i[-1] == pytest.approx(1.0, abs=0.3)
+    diffs = np.abs(np.diff(x_i))
+    assert diffs[-1] < 0.1 * diffs[0]
+
+
+def test_pid_pure_p_with_limits_no_integral_drift():
+    """With ki=0 the integrator (and its anti-windup) must be inert: a pure-P
+    loop driven hard into saturation clamps at y_max and x_i never drifts, so
+    the output is exactly clamp(kp*e, y_min, y_max) and stays well-scaled."""
+    class S(Model):
+        def declare_components(self):
+            self.add_component('r', Constant(k=1.0e6))
+            self.add_component('m', Constant(k=0.0))     # e = 1e6 (constant)
+            self.add_component('pid', PID(kp=1.0e-3, ki=0.0, kd=0.0, Tf=0.1,
+                                          limited=True, y_min=0.0, y_max=0.01,
+                                          Ni=1.0, y_start=0.0))
+
+        def declare_equations(self):
+            self.connect(self['r'].ports['y'], self['pid'].ports['reference'])
+            self.connect(self['m'].ports['y'], self['pid'].ports['feedback'])
+            return []
+
+    _, trace = _solve(S(), steps=20, dt=0.1)
+    y = trace('.pid.y')
+    x_i = trace('.pid.x_i')
+    # kp*e = 1e-3 * 1e6 = 1000 >> y_max, so output pins at the 0.01 limit.
+    assert np.allclose(y, 0.01, atol=1e-4)
+    # No integrator dynamics at ki=0: x_i stays put at y_start (no windup, no
+    # ill-scaled drift toward y_max - kp*e).
+    assert np.allclose(x_i, 0.0, atol=1e-9)
+
+
+def test_pid_limited_large_gain_nonlinear_plant_stays_feasible():
+    """Regression: a limited PID with a huge kp*e must not let the (clipped)
+    output overshoot the limit *during the Newton solve*.
+
+    The output clamp saturates the LIVE command expression `v_expr`, which at the
+    very first iterate is already deep in saturation (slope ~ 0), so the command
+    decouples and pins at `y_max` immediately.  Here it drives a nonlinear plant
+    whose 'head' = P0 - R*y goes NEGATIVE and whose feedback `sqrt(head)` becomes
+    non-real if the command overshoots even transiently.  With the old code the
+    clamp read the stale leaf command (init at the clip corner, slope ~ 0.5),
+    which leaked ~0.5*kp*e into the first step, drove head < 0 and produced NaNs.
+    """
+    import sympy as sp
+
+    from hydrogen.components.control.control_components import RealSignal
+    from hydrogen.model import Variable
+
+    class Plant(Model):
+        """head = P0 - R*cmd (negative if cmd overshoots ~0.1); fb = sqrt(head)."""
+
+        def declare_components(self):
+            self.add_component('cmd', Variable(0.0))
+            self.add_component('head', Variable(1.0e5))
+            self.add_component('fb', Variable(0.0))
+            self.add_port('cmd', RealSignal.as_input(
+                self, self['cmd'], name='cmd'))
+            self.add_port('fb', RealSignal.as_output(
+                self, self['fb'], name='fb'))
+
+        def declare_equations(self):
+            head = self['head'].symbol
+            eq_head = head - (1.0e5 - 1.0e6 * self['cmd'].symbol)
+            eq_fb = self['fb'].symbol - sp.sqrt(head)
+            return [eq_head, eq_fb]
+
+    class S(Model):
+        def declare_components(self):
+            self.add_component('r', Constant(k=1.0e6))
+            self.add_component('pid', PID(kp=1.0e-6, ki=0.0, kd=0.0, Tf=0.1,
+                                          limited=True, y_min=0.0, y_max=0.01,
+                                          Ni=1.0, y_start=0.0))
+            self.add_component('plant', Plant())
+
+        def declare_equations(self):
+            self.connect(self['r'].ports['y'], self['pid'].ports['reference'])
+            self.connect(self['plant'].ports['fb'], self['pid'].ports['feedback'])
+            self.connect(self['pid'].ports['y'], self['plant'].ports['cmd'])
+            return []
+
+    _, trace = _solve(S(), steps=3, dt=0.1)
+    y = trace('.pid.y')
+    head = trace('.plant.head')
+    # Output pinned at the limit and the plant never went non-physical (a leaked
+    # overshoot would have made head < 0 and sqrt(head) NaN).
+    assert np.all(np.isfinite(y)) and np.all(np.isfinite(head))
+    assert np.all(y <= 0.01 + 1e-3)
+    assert np.all(head > 0.0)
+    assert y[-1] == pytest.approx(0.01, abs=1e-3)
 
 
 # --- wiring rules -----------------------------------------------------------

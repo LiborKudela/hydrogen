@@ -733,7 +733,12 @@ class MainWindow(QtWidgets.QMainWindow):
             live_sim_only=live)
         if exec_(dlg):
             self._sim_options = dlg.options()
-            if live:
+            # Push the live simulate knobs (chiefly stop_time) to the host for any
+            # built run that is paused OR idle-but-continuable (finished/stopped).
+            # For a finished run this is what re-enables continuation: the host
+            # recomputes continuable = (t < stop_time), so extending stop_time
+            # makes the Resume button reappear.
+            if self._session.built and phase in ("paused", "finished", "stopped"):
                 patch = run_config_patch(self._sim_options)
                 self._session.push_run_config(
                     patch, log=lambda m, level="status": self._record_log(m, level))

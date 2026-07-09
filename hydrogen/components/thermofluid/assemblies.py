@@ -35,6 +35,7 @@ import sympy as sp
 from ...medium import CoolPropMedium
 from ...model import Model, Parameter, Variable
 from ...paramspec import ParamSpec
+from ..control.control_components import RealSignal
 from ..materials import WallMaterial
 from .flow import PressureVessel, SegmentedChannel, StraightPipe
 from .permeation import FixedPartialPressure, PermeationFlux
@@ -767,6 +768,11 @@ class Tank(Model):
         Initial wall temperature [K].
     p_init, T_init : float
         Initial vessel pressure [Pa] / temperature [K].
+    expose_pressure : bool
+        If true, expose a `control.RealSignal` output port `pressure` carrying
+        the vessel gas pressure [Pa] (bound directly to the internal
+        `PressureVessel`'s `p`), so it can feed a controller's feedback without
+        an inline sensor.  False (default) omits the port.
     """
 
     _OUTER_MODES = _OUTER_THERMAL_MODES
@@ -832,6 +838,11 @@ class Tank(Model):
                 = 101325.0,
         T_init: Annotated[float, ParamSpec("Initial vessel temperature.",
                          unit="K")] = 293.15,
+        expose_pressure: Annotated[bool, ParamSpec("If true, expose a "
+                        "`control.RealSignal` output port `pressure` carrying "
+                        "the vessel gas pressure [Pa] (e.g. to feed a PID "
+                        "feedback); if false the port is omitted.",
+                        structural=True)] = False,
     ):
         if outer_thermal not in self._OUTER_MODES:
             raise ValueError(
@@ -885,6 +896,7 @@ class Tank(Model):
         self.T_wall_init = T_wall_init
         self.p_init = p_init
         self.T_init = T_init
+        self.expose_pressure = bool(expose_pressure)
         self.n_leaky = n_leaky
         self.any_leaky = n_leaky > 0
         self.L_cyl = L_cyl
@@ -1012,6 +1024,14 @@ class Tank(Model):
             flow_orientation='in',
             medium=self.medium,
         ))
+
+        # Optionally publish the vessel gas pressure on a control signal port so
+        # it can drive a controller (e.g. a `control.PID` feedback) directly,
+        # without an inline sensor.  Bound straight to the vessel's `p` variable
+        # (no extra equation), fanning out to any number of signal inputs.
+        if self.expose_pressure:
+            self.add_port('pressure', RealSignal.as_output(
+                self, self['gas']['p'], name='pressure'))
 
     def declare_equations(self):
         K = len(self.layers)
