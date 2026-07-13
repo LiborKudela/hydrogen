@@ -846,6 +846,23 @@ class SystemProxy:
         """Lifecycle phase + last-solve diagnostics."""
         return self._conn.call("status", system_id=self.system_id)
 
+    def diagnose(self, top_k: int = 12, fresh: bool = False) -> dict:
+        """Solver post-mortem: why aren't the residuals converging?
+
+        Returns a report (see :meth:`hydrogen.Model.diagnose`) describing the
+        Newton/Jacobian failure at the current (or last-failed) state and, most
+        usefully, the component(s) it traces back to: non-finite residuals /
+        variables, a structurally or numerically singular Jacobian (with the
+        near-null-space variables named), the largest residual rows, and a
+        per-component ranking plus a human-readable ``summary``.
+
+        After a failed run the report captured AT the failing state is returned;
+        pass ``fresh=True`` to force a new evaluation against the current state.
+        Callable any time after ``instantiate`` (also mid-run while paused).
+        """
+        return self._conn.call(
+            "diagnose", system_id=self.system_id, top_k=top_k, fresh=fresh)
+
     def list_vars(self) -> list:
         """Full names of every recorded variable (available post-instantiate)."""
         return self._conn.call("list_vars", system_id=self.system_id)

@@ -356,7 +356,9 @@ def _resolved_hints(func) -> dict:
 def _object_descriptor(cls_or_name) -> dict:
     """Type descriptor for a value-object annotation.  When the annotation is an
     abstract base (e.g. ``PermeationFlux``), the concrete serializable subtypes
-    are listed under ``value_types``."""
+    are listed (alphabetically, for a stable UI order) under ``value_types``.
+    Which of them is the *default* is decided separately and explicitly -- see
+    :func:`_concrete_value_type` -- so this ordering never fixes the default."""
     vmap = _value_class_map()
     if isinstance(cls_or_name, type):
         name = cls_or_name.__name__
@@ -733,8 +735,14 @@ def value_object_spec(value_type: str) -> dict:
 
 
 def _concrete_value_type(value_type: str) -> str:
-    """Resolve an abstract value-object name to a concrete serializable one
-    (the first registered subtype); concrete names pass through."""
+    """Resolve an abstract value-object name to the concrete serializable one a
+    UI should pre-fill by default; concrete names pass through.
+
+    The default is chosen by an EXPLICIT opt-in flag (a subtype sets the class
+    attribute ``_catalog_default = True``), NOT by list position -- so adding a
+    new subtype later never silently changes the default just because of where
+    it sorts.  When no subtype opts in, fall back to the alphabetically-first for
+    determinism."""
     vmap = _value_class_map()
     if value_type in vmap:
         return value_type
@@ -742,7 +750,8 @@ def _concrete_value_type(value_type: str) -> str:
                   if value_type in {b.__name__ for b in c.__mro__})
     if not subs:
         raise KeyError(f"no serializable value type for {value_type!r}")
-    return subs[0]
+    flagged = [n for n in subs if getattr(vmap[n], "_catalog_default", False)]
+    return (flagged[0] if flagged else subs[0])
 
 
 def _lookup_component(type_name: str) -> type:

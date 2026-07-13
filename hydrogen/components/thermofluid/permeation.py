@@ -295,6 +295,27 @@ class PermeationFlux:
     #: since `p**0.5` vs `p**1` are structurally different residuals).
     cache_key: tuple = ()
 
+    #: Whether this flux models a single *lumped* leak PATH (a calibrated
+    #: orifice / crack) rather than a distributed material property.  A lumped
+    #: flux must be the SOLE leaky layer in a wall stack -- stacking it with
+    #: another leaky layer has no clear physical meaning (and, for a
+    #: pressure-independent lumped flux, would be singular) -- so the assemblies
+    #: enforce that.  The physics fluxes (Richardson / diffusion) ARE distributed
+    #: material properties, so they leave this False and compose freely in series.
+    lumped: bool = False
+
+    def split_over(self, n: int) -> "PermeationFlux":
+        """Return the flux to inject into ONE of `n` parallel leak sites (pipe
+        segments / tank shells) when the *total* leak is distributed across them.
+
+        Geometry-derived fluxes already scale per site through their own
+        conductance `K` (a shorter segment / smaller shell leaks proportionally
+        less), so summing the sites reproduces the whole component -- the default
+        is a no-op.  A *lumped*, geometry-agnostic specified-rate flux has no such
+        per-site scaling, so it overrides this to hand each site an equal share
+        (see `SpecifiedFlux`)."""
+        return self
+
     def declare(self, wall):
         """Register any extra components (Arrhenius `Parameter`s, transient
         state variables) the correlation needs, onto `wall`."""
@@ -353,6 +374,11 @@ class SteadyRichardson(PermeationFlux):
     cylindrical, `4*pi*r_in*r_out/(r_out-r_in)` spherical).
     """
 
+    #: The default `PermeationFlux` a UI pre-fills when adding a permeable layer
+    #: (an explicit opt-in so the default never depends on catalog ordering --
+    #: see `serialization.registry._concrete_value_type`).
+    _catalog_default = True
+
     def __init__(self, transport_fit: Annotated[TransportFit, ParamSpec(
             "Arrhenius transport (permeant + material).")]):
         self.fit = transport_fit
@@ -381,6 +407,152 @@ class SteadyRichardson(PermeationFlux):
             wall['m_dot_a_leak'].symbol - M * N_dot,
             wall['m_dot_b_leak'].symbol + M * N_dot,
         ]
+
+
+class SpecifiedFlux(PermeationFlux):
+    """A specified (lumped, single-path) leak, constant or Δp-proportional.
+
+    Unlike `SteadyRichardson` / `TransientDiffusion`, this ignores the wall's
+    transport physics and geometry: you give the leak as a pV-throughput (the
+    vacuum-engineering `mbar*l/s` unit), converted to a mass flow via the
+    ideal-gas law `pV = nRT`::
+
+        m_dot_ref [kg/s] = leak_rate[mbar*l/s] * 0.1 * M / (R_GAS * T_ref)
+
+    where `0.1` converts `mbar*l/s -> Pa*m^3/s`, `M` is the permeant molar mass,
+    and `T_ref` is the temperature the throughput is quoted at (pV-throughput is
+    only proportional to moles at a fixed temperature).
+
+    The `scaling` flag chooses how the leak responds to the wall's actual
+    partial-pressure difference `Δp = p_partial_a - p_partial_b`:
+
+      * ``"constant"`` -- the leak is fixed at `m_dot_ref` regardless of Δp
+        (only `T_ref` is used).
+      * ``"linear"``   -- `leak_rate` is the leak quoted at a reference
+        difference `dp_ref`, and the model rescales it linearly with the
+        operating Δp (a leak conductance, the molecular-flow assumption)::
+
+            m_dot = m_dot_ref * Δp / dp_ref
+
+        so at `Δp == dp_ref` the leak equals exactly `leak_rate`.
+
+    Inner uptake == outer venting either way, so mass is conserved exactly (the
+    fluid side loses `m_dot`, the environment boundary gains it) -- the same
+    balance shape as `SteadyRichardson`.
+
+    `lumped` -- this represents a single lumped leak PATH (not a distributed
+    material property), so it must be the SOLE leaky layer in a wall stack; the
+    `Pipe` / `Tank` assemblies enforce this, keeping the "leak_rate is the leak
+    across this one barrier" meaning unambiguous.
+
+    Total-over-sites semantics.  `leak_rate` is the TOTAL leak of the whole
+    component.  A multi-segment `Pipe` (or the barrel+cap of a `Tank`) builds
+    one leaky wall per site and sums their vents, so the assembly hands each
+    site an equal share via `split_over()`; the shares add back up to
+    `leak_rate` (times the parallel `count`).
+    """
+
+    #: Represents a single lumped leak path (not a distributed material
+    #: property), so it must be the sole leaky layer -- see the class docstring
+    #: and the `Pipe` / `Tank` validation.
+    lumped = True
+
+    #: Allowed pressure-scaling modes (see the class docstring).
+    _SCALING_MODES = ("constant", "linear")
+
+    #: mbar*l/s -> Pa*m^3/s.
+    _MBAR_L_S_TO_SI = 0.1
+
+    def __init__(
+        self,
+        permeant: Annotated[Permeant, ParamSpec("Leaking species (sets the "
+                           "molar mass M used to convert the throughput to a "
+                           "mass flow).")],
+        leak_rate: Annotated[float, ParamSpec("Total gas leak of the whole "
+                            "component as a pV-throughput (split equally across "
+                            "the segments / shells internally); for "
+                            "scaling='linear' it is the leak quoted at "
+                            "`dp_ref`.", unit="mbar*l/s")] = 0.0,
+        scaling: Annotated[str, ParamSpec("How the leak responds to the wall's "
+                          "partial-pressure difference Δp: 'linear' scales the "
+                          "quoted rate by Δp / dp_ref (a leak conductance); "
+                          "'constant' holds the quoted rate regardless of Δp.",
+                          choices=("constant", "linear"),
+                          structural=True)] = "linear",
+        dp_ref: Annotated[float, ParamSpec("Reference partial-pressure "
+                         "difference the quoted `leak_rate` is measured at "
+                         "(only used when scaling='linear'); the leak scales "
+                         "with the actual Δp / dp_ref.", unit="Pa",
+                         relevant_when={"scaling": "linear"})] = 1.0e5,
+        T_ref: Annotated[float, ParamSpec("Reference temperature the "
+                        "pV-throughput is quoted at (standard conditions are "
+                        "typically 273.15 K).", unit="K")] = 273.15,
+    ):
+        if scaling not in self._SCALING_MODES:
+            raise ValueError(
+                f"SpecifiedFlux scaling must be one of {self._SCALING_MODES}, "
+                f"got {scaling!r}")
+        self._permeant = permeant
+        self.leak_rate = leak_rate
+        self.scaling = scaling
+        self.dp_ref = dp_ref
+        self.T_ref = T_ref
+        # `scaling` changes the residual structure (constant vs linear-in-Δp),
+        # so it -- with the baked-in M and T_ref -- keys the equation-template
+        # cache; `leak_rate` and `dp_ref` are live Parameters (symbols), so
+        # walls differing only in those share a cached template.
+        self.cache_key = ("specified", self.scaling, self.permeant.M, self.T_ref)
+
+    @property
+    def permeant(self) -> Permeant:
+        return self._permeant
+
+    def split_over(self, n: int) -> "SpecifiedFlux":
+        if n <= 1:
+            return self
+        return SpecifiedFlux(self._permeant, self.leak_rate / n,
+                             self.scaling, self.dp_ref, self.T_ref)
+
+    def _m_dot(self, wall):
+        """Symbolic leak mass-flow [kg/s] for this (already per-site) rate."""
+        m_dot = (wall['leak_rate'].symbol * self._MBAR_L_S_TO_SI
+                 * self.permeant.M / (R_GAS * self.T_ref))
+        if self.scaling == "linear":
+            # Rescale from the reference Δp to the wall's actual Δp.
+            dp = wall['p_partial_a'].symbol - wall['p_partial_b'].symbol
+            m_dot = m_dot * dp / wall['dp_ref'].symbol
+        # Scale with the wall's parallel multiplicity when it carries one
+        # (cylindrical / spherical walls do; a bare FlatWall does not), so N
+        # identical parallel components leak N times the total -- matching how
+        # the physics fluxes scale through the wall's `count` in `K`.
+        if 'count' in wall.components:
+            m_dot = m_dot * wall['count'].symbol
+        return m_dot
+
+    def declare(self, wall):
+        wall.add_component('leak_rate', Parameter(self.leak_rate, "mbar*l/s"))
+        if self.scaling == "linear":
+            wall.add_component('dp_ref', Parameter(self.dp_ref, "Pa"))
+
+    def equations(self, wall):
+        m_dot = self._m_dot(wall)
+        # Inner surface takes up `+m_dot`; the outer surface vents the same, so
+        # `-m_dot` flows INTO the wall there (mirrors `SteadyRichardson`).
+        return [
+            wall['m_dot_a_leak'].symbol - m_dot,
+            wall['m_dot_b_leak'].symbol + m_dot,
+        ]
+
+    def to_spec(self) -> dict:
+        return {"__type__": "SpecifiedFlux", "permeant": self.permeant.to_spec(),
+                "leak_rate": self.leak_rate, "scaling": self.scaling,
+                "dp_ref": self.dp_ref, "T_ref": self.T_ref}
+
+    @classmethod
+    def from_spec(cls, d: dict) -> "SpecifiedFlux":
+        return cls(Permeant.from_spec(d["permeant"]), d["leak_rate"],
+                   d.get("scaling", "linear"), d.get("dp_ref", 1.0e5),
+                   d.get("T_ref", 273.15))
 
 
 class TransientDiffusion(PermeationFlux):
@@ -517,6 +689,7 @@ class FixedPartialPressure(Model):
 _FLUX_SPECS = {
     "SteadyRichardson": SteadyRichardson,
     "TransientDiffusion": TransientDiffusion,
+    "SpecifiedFlux": SpecifiedFlux,
 }
 
 
@@ -545,6 +718,7 @@ __all__ = [
     "PermeationFlux",
     "SteadyRichardson",
     "TransientDiffusion",
+    "SpecifiedFlux",
     "permeation_flux_from_spec",
     "FixedPartialPressure",
 ]

@@ -830,6 +830,7 @@ class Canvas(QtWidgets.QGraphicsView):
             return
         menu = QtWidgets.QMenu(self)
         act_props = menu.addAction("Properties…")
+        act_vars = menu.addAction("Variables…")
 
         act_warn = None
         if node.has_warnings:
@@ -857,6 +858,8 @@ class Canvas(QtWidgets.QGraphicsView):
         chosen = exec_(menu, event.globalPos())
         if chosen == act_props:
             self.open_properties(node)
+        elif chosen == act_vars:
+            self.open_variables(node)
         elif act_warn is not None and chosen == act_warn:
             self.show_warnings(node)
         elif chosen == act_cw:

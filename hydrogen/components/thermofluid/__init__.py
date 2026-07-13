@@ -16,14 +16,20 @@ component, not three).  Organised into submodules:
     `CylindricalWall`, `SphericalWall` (any `leaky=True` for gas permeation),
     plus thermal boundary conditions.
   * `permeation`  -- gas-permeation materials (`Permeant`, `TransportFit`),
-    flux models (`SteadyRichardson`, `TransientDiffusion`) injected into a
-    leaky wall, and the `FixedPartialPressure` boundary.  A leaky flow volume
+    flux models (`SteadyRichardson`, `TransientDiffusion`, `SpecifiedFlux`)
+    injected into a leaky wall, and the `FixedPartialPressure` boundary.  A leaky flow volume
     is just `PressureVessel(leaky=True)` / `StraightPipe(leaky=True)`.
+  * `local_loss`  -- pluggable local- (minor-) pressure-loss correlations
+    (`FixedK`, `SuddenExpansion`, `SuddenContraction`, ...) supplying the
+    dimensionless coefficient `K` a `flow.LocalResistance` / `assemblies.LocalLoss`
+    consumes; a UI offers them as a dropdown.
 
   * `assemblies`  -- batteries-included composites: `Pipe` (a flowing pipe
-    wrapped per-segment in a `WallLayer` stack, optionally permeable) and `Tank`
-    (a lumped-gas pressure vessel with a cylindrical barrel + spherical caps,
-    conjugate heat, and optional permeation) built from the modules above.
+    wrapped per-segment in a `WallLayer` stack, optionally permeable), `Valve` /
+    `LocalLoss` (a single-cell throttle / minor loss wrapped in an equivalent
+    cylindrical `WallLayer` stack) and `Tank` (a lumped-gas pressure vessel with
+    a cylindrical barrel + spherical caps, conjugate heat, and optional
+    permeation) built from the modules above.
 
 See `README.md` in this folder for the full domain overview.
 

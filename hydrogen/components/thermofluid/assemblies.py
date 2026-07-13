@@ -10,6 +10,18 @@ module wires them into ready-to-use objects so a user model collapses to
     cylindrical metal `WallLayer`s, with the wall outer surfaces terminated by
     internal thermal / partial-pressure boundaries.  The fluid `inlet` / `outlet`
     are the only ports the user wires.
+  * `Valve` -- a single-cell control-valve throttle wrapped, like a one-segment
+    `Pipe`, in an equivalent cylindrical metal `WallLayer` stack, so the valve
+    can exchange heat (conjugate wall thermal mass) and gas permeation while
+    sizing flow by the liquid Kv or gas expansion-factor law.  The fluid
+    `inlet` / `outlet` and the `opening` signal are the only ports the user
+    wires.
+  * `LocalLoss` -- a single-cell local (minor) pressure loss wrapped, like a
+    one-segment `Pipe`, in an equivalent cylindrical metal `WallLayer` stack,
+    so a fitting can exchange heat and gas permeation.  Its drop is set by a
+    pluggable `local_loss.LocalLossModel` correlation (`FixedK` /
+    `SuddenExpansion` / `SuddenContraction` / ...).  The fluid `inlet` /
+    `outlet` are the only ports the user wires.
   * `Tank` -- a lumped-gas pressure vessel whose shell is a cylindrical barrel
     plus a (combined) spherical end cap, both wrapped in `WallLayer` stacks with
     conjugate convective heat transfer and optional gas permeation.  The barrel
@@ -37,7 +49,15 @@ from ...model import Model, Parameter, Variable
 from ...paramspec import ParamSpec
 from ..control.control_components import RealSignal
 from ..materials import WallMaterial
-from .flow import PressureVessel, SegmentedChannel, StraightPipe
+from .flow import (
+    CompressibleValve,
+    IncompressibleValve,
+    LocalResistance,
+    PressureVessel,
+    SegmentedChannel,
+    StraightPipe,
+)
+from .local_loss import LocalLossModel
 from .permeation import FixedPartialPressure, PermeationFlux
 from .ports import FluidPort_phm, ThermalPort_TQ
 from .walls import (
@@ -389,6 +409,15 @@ class Pipe(Model):
                 "Pipe: permeable layers must be contiguous starting at the bore "
                 "(layer 0); a non-permeable layer cannot sit between two "
                 f"permeable ones. Got permeable flags {leaky}.")
+        # A lumped (specified-rate) leak has no partial-pressure dependence, so
+        # it cannot sit in series with another leaky layer -- the intermediate
+        # partial pressure would be undetermined (singular).  Require it solo.
+        if any(getattr(layer.permeation, "lumped", False)
+               for layer in layers) and n_leaky > 1:
+            raise ValueError(
+                "Pipe: a lumped/specified leak (SpecifiedFlux) must be the ONLY "
+                "leaky layer; it cannot be stacked in series with another "
+                "permeable layer.")
 
         self.medium = medium
         self.D = D
@@ -566,6 +595,12 @@ class Pipe(Model):
 
         for i in range(self.n_segments):
             for k, layer in enumerate(self.layers):
+                # A lumped specified-rate leak is a TOTAL over the pipe, so each
+                # of the `n_segments` identical segment walls gets an equal
+                # share (`split_over`); the geometry-derived fluxes already scale
+                # per segment through their conductance and return themselves.
+                seg_flux = (layer.permeation.split_over(self.n_segments)
+                            if layer.permeation is not None else None)
                 self.add_component(f'wall_{i}_{k}', CylindricalWall(
                     layer.material.rho, layer.material.cp, layer.material.k,
                     r[k], r[k + 1], self.L_segment,
@@ -573,7 +608,7 @@ class Pipe(Model):
                     capacity_split=layer.capacity_split,
                     count=N,
                     leaky=layer.permeation is not None,
-                    permeation_flux=layer.permeation,
+                    permeation_flux=seg_flux,
                     p_in_init=self.p_init, p_out_init=self.p_ext))
 
             # Outer-surface thermal termination (on the outermost layer, or
@@ -675,6 +710,678 @@ class Pipe(Model):
             total = sum(self[f'env_{i}']['m_dot_leak'].symbol
                         for i in range(self.n_segments))
             eqs.append(self['m_dot_leak_env'].symbol + total)
+        return eqs
+
+
+#: Allowed `Valve.flow_law` sizing formulations.
+_VALVE_FLOW_LAWS = ("incompressible", "compressible")
+
+
+class Valve(Model):
+    """A control valve wrapped in an equivalent cylindrical wall stack.
+
+    The fluid side is a single-cell throttle (`flow.IncompressibleValve` for
+    the liquid / low-Mach Kv law, or `flow.CompressibleValve` for the IEC
+    gas expansion-factor law -- picked by `flow_law`).  Its body is modelled as
+    an equivalent short cylinder of bore `D` and length `L_body`, wrapped -- as
+    in `Pipe`, but with a single segment -- in a radial stack of
+    `CylindricalWall` `WallLayer`s so the throttle can exchange heat (conjugate
+    wall thermal mass) and, per leaky layer, gas permeation.  Only the fluid
+    `inlet` / `outlet` and the `opening` signal port are exposed::
+
+        fluid:  ===[ valve body ]===
+                      | wall  | leak (if permeable)
+                   port_a   leak_a
+        metal:   [ wall_0 ]--[ wall_1 ]-- ... --[ wall_{K-1} ]
+                                                  | port_b  | leak_b
+                                              outer        env
+
+    Thermal coupling (always conjugate)
+    -----------------------------------
+    The throttle cell is built ``heat_port=True``; its ``wall_0`` port is wired
+    to the innermost layer.  A bare valve (no layers) with the default
+    ``outer_thermal="adiabatic"`` reproduces the classic adiabatic (isenthalpic)
+    throttle.  The outermost surface is terminated exactly as for `Pipe`
+    (``adiabatic`` / ``convective`` / ``fixed`` / ``expose``).
+
+    Gas permeation (optional, per layer)
+    ------------------------------------
+    Give a `WallLayer` a `permeation` flux model to make it leaky, exactly as
+    for `Pipe` (a lumped `SpecifiedFlux` must be the sole leaky layer).  Gas
+    permeates from the body through the leaky stack and vents at the outer
+    surface into an internal `FixedPartialPressure(p_ext)`.
+
+    Compressible vs incompressible, and body dynamics
+    -------------------------------------------------
+    ``flow_law`` selects the sizing formulation (liquid Kv vs gas expansion
+    factor).  Orthogonally, ``dynamic`` sets the body cell's storage level:
+    ``"static"`` (default -- a pure throttle) or a mass/energy-storing level
+    (``"advective"``/``"compressible"``/``"acoustic"``) that turns the body into
+    a small volume bounded by the throttle (single-volume fill-up dynamics).
+    Non-static levels require the plain (non-choked) liquid law.
+
+    Parameters
+    ----------
+    medium : CoolPropMedium
+        Working fluid.
+    D : float
+        Connecting / bore diameter [m]; inner radius of layer 0 is ``D/2``.
+    Kv : float
+        Metric flow coefficient (m^3/h of water at 1 bar).
+    flow_law : str
+        ``"incompressible"`` (liquid Kv law) or ``"compressible"`` (IEC gas
+        expansion factor + choking).
+    L_body : float
+        Equivalent valve-body length [m] setting the wall / permeation area and
+        (dynamic levels) the holdup volume.
+    opening : float
+        Initial opening fraction (0 shut .. 1 open); driven at runtime by the
+        `opening` signal port.
+    layers : list[WallLayer]
+        Radial wall stack, innermost first (empty = a bare valve body).
+    dynamic : str
+        Body-cell dynamic level (see above).
+    trim_exp, p_vap, FL, FF : float
+        Liquid-law trim / ISA cavitation parameters (``flow_law="incompressible"``).
+    xT, gamma : float
+        Gas pressure-differential-ratio factor / specific-heat ratio
+        (``flow_law="compressible"``).
+    dp_eps, p_eps : float
+        Flow-law regularisers (as for the underlying valve).
+    multiphase, outer_thermal, h_ext, T_ext, T_outer, p_ext, T_wall_init,
+    p_init :
+        As for `Pipe`.
+    """
+
+    _OUTER_MODES = _OUTER_THERMAL_MODES
+    _FLOW_LAWS = _VALVE_FLOW_LAWS
+
+    UI_ICON = "valve.svg"
+    UI_ICON_ONLY = True
+
+    CONDITIONS = {
+        "any_layer_permeable": "at least one WallLayer has a `permeation` model",
+    }
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        D: Annotated[float, ParamSpec("Connecting / bore diameter; inner "
+                    "radius of layer 0 is D/2.", unit="m", default=0.01,
+                    ui_label=True, structural=True)],
+        Kv: Annotated[float, ParamSpec("Metric flow coefficient (m^3/h of "
+                     "water at 1 bar pressure drop).", unit="m^3/h",
+                     default=1.0, ui_label=True)],
+        flow_law: Annotated[str, ParamSpec("Sizing formulation: "
+                           "'incompressible' (liquid Kv law) or 'compressible' "
+                           "(IEC gas expansion factor + choking).",
+                           choices=_VALVE_FLOW_LAWS, structural=True)]
+                           = "incompressible",
+        L_body: Annotated[float, ParamSpec("Equivalent valve-body length "
+                         "setting the wall / permeation area and (dynamic "
+                         "levels) the holdup volume.", unit="m",
+                         default=0.1, structural=True)] = 0.1,
+        opening: Annotated[float, ParamSpec("Initial opening fraction "
+                          "(0 = shut, 1 = full open); driven at runtime by the "
+                          "`opening` signal port.")] = 1.0,
+        layers: Annotated[list[WallLayer], ParamSpec("Radial wall stack, "
+                         "innermost first; inner radius of layer 0 is D/2.  "
+                         "Empty (no layers) = a bare valve body: the chosen "
+                         "`outer_thermal` boundary acts directly on the fluid "
+                         "surface and permeation is disabled.")] = None,
+        dynamic: Annotated[str, ParamSpec("Body-cell dynamic level: 'static' "
+                          "(pure throttle, default) or a mass/energy-storing "
+                          "level ('advective'/'compressible') for a valve-body "
+                          "volume bounded by the throttle.  Non-static levels "
+                          "require flow_law='incompressible' without choking "
+                          "(p_vap=None); 'acoustic' is unsupported (a throttle "
+                          "has no per-face momentum inertia).",
+                          choices=("static", "advective", "compressible"),
+                          structural=True)] = "static",
+        trim_exp: Annotated[float, ParamSpec("Liquid-law inherent trim "
+                           "exponent n in Kv_eff = Kv*theta^n (1 = linear).",
+                           structural=True,
+                           relevant_when={"flow_law": "incompressible"})] = 1.0,
+        p_vap: Annotated[float, ParamSpec("Liquid vapor pressure [Pa]; enables "
+                        "the ISA liquid-choking clamp.  None = no choking.",
+                        unit="Pa",
+                        relevant_when={"flow_law": "incompressible"})] = None,
+        FL: Annotated[float, ParamSpec("Liquid pressure-recovery factor "
+                     "(ISA 75.01).",
+                     relevant_when={"flow_law": "incompressible"})] = 0.9,
+        FF: Annotated[float, ParamSpec("Liquid critical-pressure-ratio factor.",
+                     relevant_when={"flow_law": "incompressible"})] = 0.96,
+        xT: Annotated[float, ParamSpec("Gas pressure-differential-ratio factor "
+                     "(~0.7 for many globe valves); sets the choke point.",
+                     relevant_when={"flow_law": "compressible"})] = 0.7,
+        gamma: Annotated[float, ParamSpec("Gas specific-heat ratio cp/cv.",
+                        relevant_when={"flow_law": "compressible"})] = 1.4,
+        dp_eps: Annotated[float, ParamSpec("Pressure-drop regulariser keeping "
+                         "the sign*sqrt(|dp|) flow law smooth through dp = 0.",
+                         unit="Pa")] = 1.0,
+        p_eps: Annotated[float, ParamSpec("Smoothing scale [Pa] on pressures "
+                        "for the upstream selection / choke clamp.",
+                        unit="Pa")] = 1.0,
+        multiphase: Annotated[str, ParamSpec("Thermodynamic-property mode of "
+                             "the flow.", choices=("single", "HEM"),
+                             structural=True)] = "single",
+        outer_thermal: Annotated[str, ParamSpec("Thermal termination of the "
+                                "outermost wall surface.",
+                                choices=_OUTER_THERMAL_MODES,
+                                structural=True)] = "adiabatic",
+        h_ext: Annotated[float, ParamSpec("External convection coefficient.",
+                        unit="W/(m^2*K)",
+                        relevant_when={"outer_thermal": "convective"})] = 10.0,
+        T_ext: Annotated[float, ParamSpec("Far-field external temperature.",
+                        unit="K",
+                        relevant_when={"outer_thermal": "convective"})] = 293.15,
+        T_outer: Annotated[float, ParamSpec("Prescribed outer-surface "
+                          "temperature.", unit="K",
+                          relevant_when={"outer_thermal": "fixed"})] = 293.15,
+        p_ext: Annotated[float, ParamSpec("Vent partial pressure at the outer "
+                        "leaky surface.", unit="Pa",
+                        relevant_when="any_layer_permeable")] = 1.0,
+        T_wall_init: Annotated[float, ParamSpec("Initial wall temperature.",
+                              unit="K")] = 293.15,
+        p_init: Annotated[float, ParamSpec("Initial fluid pressure (and "
+                         "leaky-wall inner partial pressure).", unit="Pa")]
+                         = 101325.0,
+    ):
+        if flow_law not in self._FLOW_LAWS:
+            raise ValueError(
+                f"Valve: flow_law must be one of {self._FLOW_LAWS}, "
+                f"got {flow_law!r}")
+        if outer_thermal not in self._OUTER_MODES:
+            raise ValueError(
+                f"Valve: outer_thermal must be one of {self._OUTER_MODES}, "
+                f"got {outer_thermal!r}")
+        if float(L_body) <= 0:
+            raise ValueError(f"Valve: L_body must be > 0; got {L_body!r}")
+        if flow_law == "compressible" and dynamic != "static":
+            raise ValueError(
+                "Valve: flow_law='compressible' supports dynamic='static' only "
+                "(the gas expansion-factor / choke law has no series-composable "
+                "per-face form).")
+        if (flow_law == "incompressible" and p_vap is not None
+                and dynamic != "static"):
+            raise ValueError(
+                "Valve: a choked liquid law (p_vap given) supports "
+                "dynamic='static' only; drop p_vap for a dynamic body cell.")
+        layers = list(layers) if layers else []
+        for k, layer in enumerate(layers):
+            if layer.thickness <= 0:
+                raise ValueError(
+                    f"Valve: layer {k} thickness must be > 0; got "
+                    f"{layer.thickness}")
+        # Same leaky-stack rules as Pipe: permeable layers contiguous from the
+        # bore, and a lumped SpecifiedFlux must be the sole leaky layer.
+        leaky = [layer.permeation is not None for layer in layers]
+        n_leaky = sum(leaky)
+        if leaky[:n_leaky] != [True] * n_leaky or any(leaky[n_leaky:]):
+            raise ValueError(
+                "Valve: permeable layers must be contiguous starting at the "
+                f"bore (layer 0). Got permeable flags {leaky}.")
+        if any(getattr(layer.permeation, "lumped", False)
+               for layer in layers) and n_leaky > 1:
+            raise ValueError(
+                "Valve: a lumped/specified leak (SpecifiedFlux) must be the "
+                "ONLY leaky layer; it cannot be stacked in series with another "
+                "permeable layer.")
+
+        self.medium = medium
+        self.D = D
+        self.Kv = Kv
+        self.flow_law = flow_law
+        self.L_body = float(L_body)
+        self.opening = opening
+        self.layers = layers
+        self.dynamic = dynamic
+        self.trim_exp = trim_exp
+        self.p_vap = p_vap
+        self.FL = FL
+        self.FF = FF
+        self.xT = xT
+        self.gamma = gamma
+        self.dp_eps = dp_eps
+        self.p_eps = p_eps
+        self.multiphase = multiphase
+        self.outer_thermal = outer_thermal
+        self.h_ext = h_ext
+        self.T_ext = T_ext
+        self.T_outer = T_outer
+        self.p_ext = p_ext
+        self.T_wall_init = T_wall_init
+        self.p_init = p_init
+        self.n_leaky = n_leaky
+        self.any_leaky = n_leaky > 0
+        # Radial geometry: cumulative radii r[0]=D/2, r[k+1]=r[k]+thickness_k.
+        r = [D / 2.0]
+        for layer in layers:
+            r.append(r[-1] + layer.thickness)
+        self.radii = r
+        super().__init__()
+
+    def _build_valve(self):
+        """Construct the single-cell throttle for the chosen `flow_law`, built
+        heatable / leaky so the body wall can wrap it."""
+        if self.flow_law == "incompressible":
+            return IncompressibleValve(
+                self.medium, Kv=self.Kv, D=self.D, opening=self.opening,
+                dp_eps=self.dp_eps, trim_exp=self.trim_exp, p_vap=self.p_vap,
+                FL=self.FL, FF=self.FF, p_eps=self.p_eps,
+                multiphase=self.multiphase, heat_port=True,
+                leaky=self.any_leaky, dynamic=self.dynamic, L_body=self.L_body,
+                p_init=self.p_init)
+        return CompressibleValve(
+            self.medium, Kv=self.Kv, D=self.D, xT=self.xT, gamma=self.gamma,
+            opening=self.opening, dp_eps=self.dp_eps, p_eps=self.p_eps,
+            heat_port=True, leaky=self.any_leaky, L_body=self.L_body,
+            p_init=self.p_init)
+
+    def declare_components(self):
+        self.add_component('valve', self._build_valve())
+
+        K = len(self.layers)
+        r = self.radii
+        A_outer = 2.0 * np.pi * r[K] * self.L_body
+
+        def _surface():
+            """(T, Q_dot) of the outermost solid surface: the last layer's
+            outer face, or -- for a bare valve -- the body cell's inner-wall
+            node."""
+            if K > 0:
+                w = self[f'wall_{K - 1}']
+                return w['T_b'], w['Q_dot_b']
+            return self['valve']['T_wall_0'], self['valve']['q_inflow_0']
+
+        for k, layer in enumerate(self.layers):
+            seg_flux = (layer.permeation.split_over(1)
+                        if layer.permeation is not None else None)
+            self.add_component(f'wall_{k}', CylindricalWall(
+                layer.material.rho, layer.material.cp, layer.material.k,
+                r[k], r[k + 1], self.L_body,
+                T_init=self.T_wall_init, dynamic=layer.dynamic,
+                capacity_split=layer.capacity_split,
+                leaky=layer.permeation is not None,
+                permeation_flux=seg_flux,
+                p_in_init=self.p_init, p_out_init=self.p_ext))
+
+        # Outer-surface thermal termination (on the outermost layer, or directly
+        # on the fluid body when there are no layers).
+        if self.outer_thermal == 'adiabatic':
+            self.add_component('outer', FixedHeatFlow(0.0, T_init=self.T_wall_init))
+        elif self.outer_thermal == 'convective':
+            self.add_component('outer', ConvectiveBoundary(
+                self.h_ext, A_outer, T_inf=self.T_ext))
+        elif self.outer_thermal == 'fixed':
+            self.add_component('outer', FixedTemperature(T_set=self.T_outer))
+        else:  # 'expose'
+            if K == 0:
+                self['valve'].ports['wall_0'].require_connection = False
+            T_s, Q_s = _surface()
+            self.add_port('wall_outer', ThermalPort_TQ(
+                self,
+                channels={'T': T_s, 'Q_dot': Q_s},
+                flow_orientation='in',
+            ))
+
+        if self.any_leaky:
+            self.add_component('env', FixedPartialPressure(p_partial=self.p_ext))
+            self.add_component('m_dot_leak_env', Variable(0.0, "kg/s"))
+
+        # Re-expose the fluid inlet/outlet (single-cell faces p_0 / p_{1}).
+        in_p, in_h = self['valve']['p_0'], self['valve']['h_0']
+        out_p, out_h = self['valve']['p_1'], self['valve']['h_1']
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': in_p, 'h': in_h, 'm_dot': self['valve']['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': out_p, 'h': out_h,
+                      'm_dot': self['valve']['m_dot_out']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+        # Re-expose the opening signal on the assembly; the inner valve's own
+        # opening port is bound to the SAME variable and no longer needs its own
+        # wire (the parent drives the shared setpoint through this port).
+        self['valve'].ports['opening'].require_connection = False
+        self.add_port('opening', RealSignal.as_input(
+            self, self['valve']['opening'], name='opening'))
+
+    def declare_equations(self):
+        K = len(self.layers)
+        seg_wall = self['valve'].segment_wall_ports[0]
+
+        if K == 0:
+            if self.outer_thermal != 'expose':
+                self.connect(seg_wall, self['outer'].ports['heat'])
+            return []
+
+        # --- thermal chain: fluid -> layer 0 -> ... -> layer K-1 -> outer ---
+        self.connect(seg_wall, self['wall_0'].ports['port_a'])
+        for k in range(K - 1):
+            self.connect(self[f'wall_{k}'].ports['port_b'],
+                         self[f'wall_{k + 1}'].ports['port_a'])
+        if self.outer_thermal != 'expose':
+            self.connect(self[f'wall_{K - 1}'].ports['port_b'],
+                         self['outer'].ports['heat'])
+
+        # --- permeation chain: fluid -> leaky layers in series -> env ---
+        eqs = []
+        if self.any_leaky:
+            self.connect(self['valve'].segment_leak_ports[0],
+                         self['wall_0'].ports['leak_a'])
+            for k in range(self.n_leaky - 1):
+                self.connect(self[f'wall_{k}'].ports['leak_b'],
+                             self[f'wall_{k + 1}'].ports['leak_a'])
+            self.connect(self[f'wall_{self.n_leaky - 1}'].ports['leak_b'],
+                         self['env'].ports['leak'])
+            eqs.append(self['m_dot_leak_env'].symbol
+                       + self['env']['m_dot_leak'].symbol)
+        return eqs
+
+
+class LocalLoss(Model):
+    """A local (minor) pressure loss wrapped in an equivalent cylindrical wall
+    stack -- a fitting (bend / area change / orifice / ...) with conjugate heat
+    and gas permeation.
+
+    The fluid side is a single-cell `flow.LocalResistance`: an adiabatic
+    throttle whose drop is set by a *pluggable* loss coefficient ``K`` (``zeta``)
+    from a `local_loss.LocalLossModel` correlation, referenced to the bore
+    velocity head (``Δp = K * rho * v**2 / 2``).  Its body is modelled as an
+    equivalent short cylinder of bore ``D`` and length ``L_body``, wrapped -- as
+    in `Pipe`, but with a single segment -- in a radial stack of
+    `CylindricalWall` `WallLayer`s so the fitting can exchange heat (conjugate
+    wall thermal mass) and, per leaky layer, gas permeation.  Only the fluid
+    ``inlet`` / ``outlet`` ports are exposed::
+
+        fluid:  ===[ fitting body ]===
+                       | wall  | leak (if permeable)
+                    port_a   leak_a
+        metal:   [ wall_0 ]--[ wall_1 ]-- ... --[ wall_{K-1} ]
+                                                   | port_b  | leak_b
+                                               outer        env
+
+    Pluggable correlation (the UI dropdown)
+    ---------------------------------------
+    ``loss_model`` is a value object; a UI offers the available
+    `LocalLossModel` subtypes as a dropdown and auto-prompts for the chosen
+    one's fields.  Three ship to start (Idelchik): `FixedK` (a constant ``K``),
+    `SuddenExpansion` (Borda-Carnot ``(1 - beta)**2``) and `SuddenContraction`
+    (``0.5*(1 - beta)**0.75``).  More correlations drop in as further subtypes
+    with no change here.
+
+    Thermal coupling / gas permeation
+    ---------------------------------
+    Identical to `Valve`: the body cell is built ``heat_port=True`` and wired to
+    the innermost layer; a bare fitting (no layers) with the default
+    ``outer_thermal="adiabatic"`` is the classic adiabatic (isenthalpic) local
+    loss.  Give a `WallLayer` a `permeation` flux model to make it leaky (a
+    lumped `SpecifiedFlux` must be the sole leaky layer); gas permeates from the
+    body through the leaky stack and vents into an internal
+    `FixedPartialPressure(p_ext)`.
+
+    Body dynamics
+    -------------
+    ``dynamic`` sets the body cell's storage level: ``"static"`` (default -- a
+    pure throttle) or a mass/energy-storing level
+    (``"advective"``/``"compressible"``) that turns the body into a small volume
+    bounded by the loss (single-volume fill-up dynamics).  ``"acoustic"`` is
+    unsupported (an algebraic loss carries no per-face inertia).
+
+    Parameters
+    ----------
+    medium : CoolPropMedium
+        Working fluid.
+    D : float
+        Connecting / bore diameter [m]; inner radius of layer 0 is ``D/2`` and
+        the reference velocity head is taken at ``A = pi*D**2/4``.
+    loss_model : LocalLossModel
+        Local-loss correlation supplying ``K`` (defaults to ``FixedK()``).
+    L_body : float
+        Equivalent fitting-body length [m] setting the wall / permeation area
+        and (dynamic levels) the holdup volume.
+    layers : list[WallLayer]
+        Radial wall stack, innermost first (empty = a bare fitting body).
+    dynamic : str
+        Body-cell dynamic level (see above).
+    dp_eps : float
+        Flow-law regulariser (as for the underlying `LocalResistance`).
+    multiphase, outer_thermal, h_ext, T_ext, T_outer, p_ext, T_wall_init,
+    p_init :
+        As for `Pipe` / `Valve`.
+    """
+
+    _OUTER_MODES = _OUTER_THERMAL_MODES
+
+    UI_ICON = "local_loss.svg"
+    UI_ICON_ONLY = True
+
+    CONDITIONS = {
+        "any_layer_permeable": "at least one WallLayer has a `permeation` model",
+    }
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        D: Annotated[float, ParamSpec("Connecting / bore diameter; inner "
+                    "radius of layer 0 is D/2, and the loss velocity head is "
+                    "taken at A = pi*D**2/4.", unit="m", default=0.01,
+                    ui_label=True, structural=True)],
+        loss_model: Annotated[LocalLossModel, ParamSpec(
+            "Local-loss correlation supplying the dimensionless coefficient K "
+            "(zeta) referenced to the bore velocity: FixedK, SuddenExpansion, "
+            "SuddenContraction, ...")] = None,
+        L_body: Annotated[float, ParamSpec("Equivalent fitting-body length "
+                         "setting the wall / permeation area and (dynamic "
+                         "levels) the holdup volume.", unit="m",
+                         default=0.1, structural=True)] = 0.1,
+        layers: Annotated[list[WallLayer], ParamSpec("Radial wall stack, "
+                         "innermost first; inner radius of layer 0 is D/2.  "
+                         "Empty (no layers) = a bare fitting body: the chosen "
+                         "`outer_thermal` boundary acts directly on the fluid "
+                         "surface and permeation is disabled.")] = None,
+        dynamic: Annotated[str, ParamSpec("Body-cell dynamic level: 'static' "
+                          "(pure throttle, default) or a mass/energy-storing "
+                          "level ('advective'/'compressible') for a fitting-body "
+                          "volume bounded by the loss.  'acoustic' is "
+                          "unsupported (a local loss has no per-face momentum "
+                          "inertia).",
+                          choices=("static", "advective", "compressible"),
+                          structural=True)] = "static",
+        dp_eps: Annotated[float, ParamSpec("Pressure-drop regulariser keeping "
+                         "the sign*sqrt(|dp|) flow law smooth through dp = 0.",
+                         unit="Pa")] = 1.0,
+        multiphase: Annotated[str, ParamSpec("Thermodynamic-property mode of "
+                             "the flow.", choices=("single", "HEM"),
+                             structural=True)] = "single",
+        outer_thermal: Annotated[str, ParamSpec("Thermal termination of the "
+                                "outermost wall surface.",
+                                choices=_OUTER_THERMAL_MODES,
+                                structural=True)] = "adiabatic",
+        h_ext: Annotated[float, ParamSpec("External convection coefficient.",
+                        unit="W/(m^2*K)",
+                        relevant_when={"outer_thermal": "convective"})] = 10.0,
+        T_ext: Annotated[float, ParamSpec("Far-field external temperature.",
+                        unit="K",
+                        relevant_when={"outer_thermal": "convective"})] = 293.15,
+        T_outer: Annotated[float, ParamSpec("Prescribed outer-surface "
+                          "temperature.", unit="K",
+                          relevant_when={"outer_thermal": "fixed"})] = 293.15,
+        p_ext: Annotated[float, ParamSpec("Vent partial pressure at the outer "
+                        "leaky surface.", unit="Pa",
+                        relevant_when="any_layer_permeable")] = 1.0,
+        T_wall_init: Annotated[float, ParamSpec("Initial wall temperature.",
+                              unit="K")] = 293.15,
+        p_init: Annotated[float, ParamSpec("Initial fluid pressure (and "
+                         "leaky-wall inner partial pressure).", unit="Pa")]
+                         = 101325.0,
+    ):
+        if loss_model is None:
+            from .local_loss import FixedK
+            loss_model = FixedK()
+        if not isinstance(loss_model, LocalLossModel):
+            raise TypeError(
+                f"LocalLoss: loss_model must be a LocalLossModel, got "
+                f"{type(loss_model).__name__}")
+        if outer_thermal not in self._OUTER_MODES:
+            raise ValueError(
+                f"LocalLoss: outer_thermal must be one of {self._OUTER_MODES}, "
+                f"got {outer_thermal!r}")
+        if float(L_body) <= 0:
+            raise ValueError(f"LocalLoss: L_body must be > 0; got {L_body!r}")
+        layers = list(layers) if layers else []
+        for k, layer in enumerate(layers):
+            if layer.thickness <= 0:
+                raise ValueError(
+                    f"LocalLoss: layer {k} thickness must be > 0; got "
+                    f"{layer.thickness}")
+        # Same leaky-stack rules as Pipe / Valve: permeable layers contiguous
+        # from the bore, and a lumped SpecifiedFlux must be the sole leaky layer.
+        leaky = [layer.permeation is not None for layer in layers]
+        n_leaky = sum(leaky)
+        if leaky[:n_leaky] != [True] * n_leaky or any(leaky[n_leaky:]):
+            raise ValueError(
+                "LocalLoss: permeable layers must be contiguous starting at the "
+                f"bore (layer 0). Got permeable flags {leaky}.")
+        if any(getattr(layer.permeation, "lumped", False)
+               for layer in layers) and n_leaky > 1:
+            raise ValueError(
+                "LocalLoss: a lumped/specified leak (SpecifiedFlux) must be the "
+                "ONLY leaky layer; it cannot be stacked in series with another "
+                "permeable layer.")
+
+        self.medium = medium
+        self.D = D
+        self.loss_model = loss_model
+        self.L_body = float(L_body)
+        self.layers = layers
+        self.dynamic = dynamic
+        self.dp_eps = dp_eps
+        self.multiphase = multiphase
+        self.outer_thermal = outer_thermal
+        self.h_ext = h_ext
+        self.T_ext = T_ext
+        self.T_outer = T_outer
+        self.p_ext = p_ext
+        self.T_wall_init = T_wall_init
+        self.p_init = p_init
+        self.n_leaky = n_leaky
+        self.any_leaky = n_leaky > 0
+        # Radial geometry: cumulative radii r[0]=D/2, r[k+1]=r[k]+thickness_k.
+        r = [D / 2.0]
+        for layer in layers:
+            r.append(r[-1] + layer.thickness)
+        self.radii = r
+        super().__init__()
+
+    def declare_components(self):
+        self.add_component('loss', LocalResistance(
+            self.medium, D=self.D, loss_model=self.loss_model,
+            dp_eps=self.dp_eps, multiphase=self.multiphase, heat_port=True,
+            leaky=self.any_leaky, dynamic=self.dynamic, L_body=self.L_body,
+            p_init=self.p_init))
+
+        K = len(self.layers)
+        r = self.radii
+        A_outer = 2.0 * np.pi * r[K] * self.L_body
+
+        def _surface():
+            """(T, Q_dot) of the outermost solid surface: the last layer's
+            outer face, or -- for a bare fitting -- the body cell's inner-wall
+            node."""
+            if K > 0:
+                w = self[f'wall_{K - 1}']
+                return w['T_b'], w['Q_dot_b']
+            return self['loss']['T_wall_0'], self['loss']['q_inflow_0']
+
+        for k, layer in enumerate(self.layers):
+            seg_flux = (layer.permeation.split_over(1)
+                        if layer.permeation is not None else None)
+            self.add_component(f'wall_{k}', CylindricalWall(
+                layer.material.rho, layer.material.cp, layer.material.k,
+                r[k], r[k + 1], self.L_body,
+                T_init=self.T_wall_init, dynamic=layer.dynamic,
+                capacity_split=layer.capacity_split,
+                leaky=layer.permeation is not None,
+                permeation_flux=seg_flux,
+                p_in_init=self.p_init, p_out_init=self.p_ext))
+
+        # Outer-surface thermal termination (on the outermost layer, or directly
+        # on the fluid body when there are no layers).
+        if self.outer_thermal == 'adiabatic':
+            self.add_component('outer', FixedHeatFlow(0.0, T_init=self.T_wall_init))
+        elif self.outer_thermal == 'convective':
+            self.add_component('outer', ConvectiveBoundary(
+                self.h_ext, A_outer, T_inf=self.T_ext))
+        elif self.outer_thermal == 'fixed':
+            self.add_component('outer', FixedTemperature(T_set=self.T_outer))
+        else:  # 'expose'
+            if K == 0:
+                self['loss'].ports['wall_0'].require_connection = False
+            T_s, Q_s = _surface()
+            self.add_port('wall_outer', ThermalPort_TQ(
+                self,
+                channels={'T': T_s, 'Q_dot': Q_s},
+                flow_orientation='in',
+            ))
+
+        if self.any_leaky:
+            self.add_component('env', FixedPartialPressure(p_partial=self.p_ext))
+            self.add_component('m_dot_leak_env', Variable(0.0, "kg/s"))
+
+        # Re-expose the fluid inlet/outlet (single-cell faces p_0 / p_1).
+        in_p, in_h = self['loss']['p_0'], self['loss']['h_0']
+        out_p, out_h = self['loss']['p_1'], self['loss']['h_1']
+        self.add_port('inlet', FluidPort_phm(
+            self,
+            channels={'p': in_p, 'h': in_h, 'm_dot': self['loss']['m_dot_in']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+        self.add_port('outlet', FluidPort_phm(
+            self,
+            channels={'p': out_p, 'h': out_h,
+                      'm_dot': self['loss']['m_dot_out']},
+            flow_orientation='in',
+            medium=self.medium,
+        ))
+
+    def declare_equations(self):
+        K = len(self.layers)
+        seg_wall = self['loss'].segment_wall_ports[0]
+
+        if K == 0:
+            if self.outer_thermal != 'expose':
+                self.connect(seg_wall, self['outer'].ports['heat'])
+            return []
+
+        # --- thermal chain: fluid -> layer 0 -> ... -> layer K-1 -> outer ---
+        self.connect(seg_wall, self['wall_0'].ports['port_a'])
+        for k in range(K - 1):
+            self.connect(self[f'wall_{k}'].ports['port_b'],
+                         self[f'wall_{k + 1}'].ports['port_a'])
+        if self.outer_thermal != 'expose':
+            self.connect(self[f'wall_{K - 1}'].ports['port_b'],
+                         self['outer'].ports['heat'])
+
+        # --- permeation chain: fluid -> leaky layers in series -> env ---
+        eqs = []
+        if self.any_leaky:
+            self.connect(self['loss'].segment_leak_ports[0],
+                         self['wall_0'].ports['leak_a'])
+            for k in range(self.n_leaky - 1):
+                self.connect(self[f'wall_{k}'].ports['leak_b'],
+                             self[f'wall_{k + 1}'].ports['leak_a'])
+            self.connect(self[f'wall_{self.n_leaky - 1}'].ports['leak_b'],
+                         self['env'].ports['leak'])
+            eqs.append(self['m_dot_leak_env'].symbol
+                       + self['env']['m_dot_leak'].symbol)
         return eqs
 
 
@@ -870,6 +1577,15 @@ class Tank(Model):
                 "Tank: permeable layers must be contiguous starting at the bore "
                 "(layer 0); a non-permeable layer cannot sit between two "
                 f"permeable ones. Got permeable flags {leaky}.")
+        # A lumped (specified-rate) leak has no partial-pressure dependence, so
+        # it cannot sit in series with another leaky layer (the intermediate
+        # partial pressure would be undetermined -- singular).  Require it solo.
+        if any(getattr(layer.permeation, "lumped", False)
+               for layer in layers) and n_leaky > 1:
+            raise ValueError(
+                "Tank: a lumped/specified leak (SpecifiedFlux) must be the ONLY "
+                "leaky layer; it cannot be stacked in series with another "
+                "permeable layer.")
 
         # --- geometry: solve the barrel length so the gas volume == `volume` ---
         r_in0 = diameter / 2.0
@@ -910,11 +1626,17 @@ class Tank(Model):
     def _make_wall(self, shape, k, r_in, r_out):
         """Build the radial-layer-`k` wall component for `shape` ('cyl'/'sph')."""
         layer = self.layers[k]
+        # A lumped specified-rate leak is a TOTAL over the whole tank, so the
+        # barrel and cap each carry an equal share (`split_over` the two shells);
+        # their vents then sum back to the specified total.  Geometry-derived
+        # fluxes already scale by each shell's conductance and return themselves.
+        shell_flux = (layer.permeation.split_over(len(self._SHAPES))
+                      if layer.permeation is not None else None)
         common = dict(
             T_init=self.T_wall_init, dynamic=layer.dynamic,
             angle_fraction=1.0, count=self['count'],
             leaky=layer.permeation is not None,
-            permeation_flux=layer.permeation,
+            permeation_flux=shell_flux,
             p_in_init=self.p_init, p_out_init=self.p_ext,
         )
         if shape == "cyl":

@@ -5,17 +5,55 @@
   "canvas": {
     "nodes": [
       {
-        "comp_id": "tank_3",
-        "type": "hydrogen.thermofluid.Tank",
-        "x": 1151.5669975617664,
-        "y": 372.2478315782223,
-        "rot": -90,
+        "comp_id": "pid_19",
+        "type": "hydrogen.control.PID",
+        "x": 557.9081833170137,
+        "y": 441.33921223130176,
+        "rot": 0,
+        "mirror_x": true,
+        "mirror_y": false,
+        "medium": null,
+        "params": {
+          "kp": 0.001,
+          "ki": 0.0,
+          "kd": 0.0,
+          "Tf": 0.1,
+          "y_start": 0.0,
+          "limited": true,
+          "y_min": 0.0,
+          "y_max": 1.0,
+          "Ni": 1.0,
+          "unit": "kg/s"
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            -3.2116857536175303,
+            0.0
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {},
+        "derived_variables": []
+      },
+      {
+        "comp_id": "valve_22",
+        "type": "hydrogen.thermofluid.Valve",
+        "x": 351.61983034838113,
+        "y": 582.0861134400461,
+        "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
         "medium": "Hydrogen",
         "params": {
-          "volume": 0.05,
-          "diameter": 0.3,
+          "D": 0.01,
+          "Kv": 0.1,
+          "flow_law": "incompressible",
+          "L_body": 0.1,
+          "opening": 1.0,
           "layers": [
             {
               "__type__": "WallLayer",
@@ -27,70 +65,93 @@
                 "k": 15.0
               },
               "thickness": 0.002,
-              "permeation": {
-                "__type__": "TransientDiffusion",
-                "transport_fit": {
-                  "__type__": "TransportFit",
-                  "permeant": {
-                    "__type__": "Permeant",
-                    "name": "H2",
-                    "M": 0.00201588,
-                    "solubility_exponent": 2.0
-                  },
-                  "Phi0": 5.285149e-08,
-                  "E_Phi": 59800.0,
-                  "D0": 6.180331e-07,
-                  "E_D": 53900.0,
-                  "name": "H2 in AISI 316"
-                },
-                "n_nodes": 5,
-                "C_init": 0.0
-              },
+              "permeation": null,
               "dynamic": true,
               "capacity_split": "uniform"
             }
           ],
-          "h_inner": 50.0,
-          "count": 2,
-          "outer_thermal": "convective",
+          "dynamic": "compressible",
+          "trim_exp": 1.0,
+          "p_vap": null,
+          "FL": 0.9,
+          "FF": 0.96,
+          "xT": 0.7,
+          "gamma": 1.4,
+          "dp_eps": 1.0,
+          "p_eps": 1.0,
+          "multiphase": "single",
+          "outer_thermal": "adiabatic",
           "h_ext": 10.0,
           "T_ext": 293.15,
           "T_outer": 293.15,
           "p_ext": 1.0,
           "T_wall_init": 293.15,
-          "p_init": 101325.0,
-          "T_init": 293.15
+          "p_init": 101325.0
         },
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            4.179366655922877,
-            18.394401989441633
+            0.0,
+            0.0
           ],
           "params": [
-            -85.71650801538749,
-            -171.2081417387884
+            0.0,
+            0.0
           ]
         },
         "ports": {},
-        "derived_variables": [
-          {
-            "agg": {
-              "axis": "time",
-              "op": "integral",
-              "sources": [
-                "tank_3.m_dot_leak_env"
-              ]
-            },
-            "description": "integral of tank_3.m_dot_leak_env",
-            "full": "__derived__:15a7eb2cfdd7",
-            "kind": "derived",
-            "label": "tank_3.m_dot_leak_env (integral)",
-            "name": "m_dot_leak_env (integral)",
-            "unit": "kg",
-            "value": null
-          }
-        ]
+        "derived_variables": []
+      },
+      {
+        "comp_id": "temperaturesensor_20",
+        "type": "hydrogen.thermofluid.TemperatureSensor",
+        "x": 1219.1403761662232,
+        "y": 576.8001179095124,
+        "rot": 0,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": null,
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            -28.905171782557773,
+            -8.02921438404394
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {},
+        "derived_variables": []
+      },
+      {
+        "comp_id": "constant_17",
+        "type": "hydrogen.control.Constant",
+        "x": 776.6293137373056,
+        "y": 353.6519704345531,
+        "rot": 0,
+        "mirror_x": true,
+        "mirror_y": false,
+        "medium": null,
+        "params": {
+          "k": 1001325.0,
+          "unit": "Pa"
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            -9.413207453961945,
+            2.246499916666778
+          ],
+          "params": [
+            0.0,
+            0.0
+          ]
+        },
+        "ports": {},
+        "derived_variables": []
       },
       {
         "comp_id": "pipe_2",
@@ -107,7 +168,7 @@
           "epsilon": 1e-06,
           "z_in": 0.0,
           "z_out": 0.0,
-          "n_segments": 100,
+          "n_segments": 10,
           "layers": [
             {
               "__type__": "WallLayer",
@@ -205,68 +266,6 @@
         ]
       },
       {
-        "comp_id": "pid_19",
-        "type": "hydrogen.control.PID",
-        "x": 337.8145605931139,
-        "y": 447.36917449770993,
-        "rot": 0,
-        "mirror_x": true,
-        "mirror_y": false,
-        "medium": null,
-        "params": {
-          "kp": 1e-07,
-          "ki": 0.0,
-          "kd": 0.0,
-          "Tf": 0.1,
-          "y_start": 0.0,
-          "limited": true,
-          "y_min": 0.0,
-          "y_max": 0.01,
-          "Ni": 1.0,
-          "unit": "kg/s"
-        },
-        "ports_locked": true,
-        "label_offsets": {
-          "title": [
-            -3.2116857536175303,
-            0.0
-          ],
-          "params": [
-            0.0,
-            0.0
-          ]
-        },
-        "ports": {},
-        "derived_variables": []
-      },
-      {
-        "comp_id": "constant_17",
-        "type": "hydrogen.control.Constant",
-        "x": 616.8353136774878,
-        "y": 368.72687610057363,
-        "rot": 0,
-        "mirror_x": true,
-        "mirror_y": false,
-        "medium": null,
-        "params": {
-          "k": 5001325.0,
-          "unit": "Pa"
-        },
-        "ports_locked": true,
-        "label_offsets": {
-          "title": [
-            -9.413207453961945,
-            2.246499916666778
-          ],
-          "params": [
-            0.0,
-            0.0
-          ]
-        },
-        "ports": {},
-        "derived_variables": []
-      },
-      {
         "comp_id": "pressuresensor_18",
         "type": "hydrogen.thermofluid.PressureSensor",
         "x": 795.7899727650159,
@@ -294,20 +293,113 @@
         "derived_variables": []
       },
       {
-        "comp_id": "temperaturesensor_20",
-        "type": "hydrogen.thermofluid.TemperatureSensor",
-        "x": 1026.044805399843,
-        "y": 578.7704808765163,
+        "comp_id": "tank_3",
+        "type": "hydrogen.thermofluid.Tank",
+        "x": 1344.6625683281463,
+        "y": 370.2774686112184,
+        "rot": -90,
+        "mirror_x": false,
+        "mirror_y": false,
+        "medium": "Hydrogen",
+        "params": {
+          "volume": 0.05,
+          "diameter": 0.3,
+          "layers": [
+            {
+              "__type__": "WallLayer",
+              "material": {
+                "__type__": "WallMaterial",
+                "name": "AISI 316/316L",
+                "rho": 7990.0,
+                "cp": 500.0,
+                "k": 15.0
+              },
+              "thickness": 0.002,
+              "permeation": {
+                "__type__": "TransientDiffusion",
+                "transport_fit": {
+                  "__type__": "TransportFit",
+                  "permeant": {
+                    "__type__": "Permeant",
+                    "name": "H2",
+                    "M": 0.00201588,
+                    "solubility_exponent": 2.0
+                  },
+                  "Phi0": 5.285149e-08,
+                  "E_Phi": 59800.0,
+                  "D0": 6.180331e-07,
+                  "E_D": 53900.0,
+                  "name": "H2 in AISI 316"
+                },
+                "n_nodes": 5,
+                "C_init": 0.0
+              },
+              "dynamic": true,
+              "capacity_split": "uniform"
+            }
+          ],
+          "h_inner": 50.0,
+          "count": 2,
+          "outer_thermal": "convective",
+          "h_ext": 10.0,
+          "T_ext": 293.15,
+          "T_outer": 293.15,
+          "p_ext": 1.0,
+          "T_wall_init": 293.15,
+          "p_init": 101325.0,
+          "T_init": 293.15
+        },
+        "ports_locked": true,
+        "label_offsets": {
+          "title": [
+            4.179366655922877,
+            18.394401989441633
+          ],
+          "params": [
+            -85.71650801538749,
+            -171.2081417387884
+          ]
+        },
+        "ports": {},
+        "derived_variables": [
+          {
+            "agg": {
+              "axis": "time",
+              "op": "integral",
+              "sources": [
+                "tank_3.m_dot_leak_env"
+              ]
+            },
+            "description": "integral of tank_3.m_dot_leak_env",
+            "full": "__derived__:15a7eb2cfdd7",
+            "kind": "derived",
+            "label": "tank_3.m_dot_leak_env (integral)",
+            "name": "m_dot_leak_env (integral)",
+            "unit": "kg",
+            "value": null
+          }
+        ]
+      },
+      {
+        "comp_id": "pressuresource_23",
+        "type": "hydrogen.thermofluid.PressureSource",
+        "x": 143.58613215729778,
+        "y": 583.5936040066481,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
         "medium": "Hydrogen",
-        "params": null,
+        "params": {
+          "p_source": 5001325.0,
+          "T_source": 293.15,
+          "A": 0.001,
+          "p_control": false
+        },
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            -28.905171782557773,
-            -8.02921438404394
+            0.0,
+            0.0
           ],
           "params": [
             0.0,
@@ -318,25 +410,62 @@
         "derived_variables": []
       },
       {
-        "comp_id": "masssource_9",
-        "type": "hydrogen.thermofluid.MassSource",
-        "x": 335.0096211903707,
-        "y": 577.8560448090194,
+        "comp_id": "localloss_24",
+        "type": "hydrogen.thermofluid.LocalLoss",
+        "x": 1005.1115996452579,
+        "y": 580.0958046033426,
         "rot": 0,
         "mirror_x": false,
         "mirror_y": false,
         "medium": "Hydrogen",
         "params": {
-          "m_flow": 0.1,
-          "T_source": 293.15,
-          "p_init": 101325.0,
-          "m_control": true
+          "D": 0.01,
+          "loss_model": null,
+          "L_body": 0.1,
+          "layers": [
+            {
+              "__type__": "WallLayer",
+              "material": {
+                "__type__": "WallMaterial",
+                "name": "AISI 316/316L",
+                "rho": 7990.0,
+                "cp": 500.0,
+                "k": 15.0
+              },
+              "thickness": 0.002,
+              "permeation": {
+                "__type__": "SpecifiedFlux",
+                "permeant": {
+                  "__type__": "Permeant",
+                  "name": "H2",
+                  "M": 0.00201588,
+                  "solubility_exponent": 2.0
+                },
+                "leak_rate": 0.0,
+                "scaling": "constant",
+                "dp_ref": 100000.0,
+                "T_ref": 273.15
+              },
+              "dynamic": true,
+              "capacity_split": "uniform"
+            }
+          ],
+          "dynamic": "static",
+          "dp_eps": 1.0,
+          "multiphase": "single",
+          "outer_thermal": "adiabatic",
+          "h_ext": 10.0,
+          "T_ext": 293.15,
+          "T_outer": 293.15,
+          "p_ext": 1.0,
+          "T_wall_init": 293.15,
+          "p_init": 101325.0
         },
         "ports_locked": true,
         "label_offsets": {
           "title": [
-            -4.3682286470929625,
-            -2.9898359467266573
+            0.0,
+            0.0
           ],
           "params": [
             0.0,
@@ -349,16 +478,8 @@
     ],
     "connections": [
       {
-        "from": "masssource_9.outlet",
-        "to": "pipe_2.inlet"
-      },
-      {
         "from": "pipe_2.outlet",
         "to": "pressuresensor_18.inlet"
-      },
-      {
-        "from": "pid_19.y",
-        "to": "masssource_9.m_set"
       },
       {
         "from": "pid_19.reference",
@@ -369,12 +490,28 @@
         "to": "pressuresensor_18.y"
       },
       {
-        "from": "pressuresensor_18.outlet",
-        "to": "temperaturesensor_20.inlet"
-      },
-      {
         "from": "temperaturesensor_20.outlet",
         "to": "tank_3.inlet"
+      },
+      {
+        "from": "valve_22.outlet",
+        "to": "pipe_2.inlet"
+      },
+      {
+        "from": "pid_19.y",
+        "to": "valve_22.opening"
+      },
+      {
+        "from": "pressuresource_23.outlet",
+        "to": "valve_22.inlet"
+      },
+      {
+        "from": "pressuresensor_18.outlet",
+        "to": "localloss_24.inlet"
+      },
+      {
+        "from": "localloss_24.outlet",
+        "to": "temperaturesensor_20.inlet"
       }
     ],
     "objects": [
@@ -605,6 +742,14 @@
               "width": 2.0,
               "dash": "solid",
               "visible": true
+            },
+            {
+              "full": "pid_19.reference",
+              "label": "pid_19.reference",
+              "color": "#d62728",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
             }
           ],
           "settings": {
@@ -620,10 +765,10 @@
       },
       {
         "kind": "pie",
-        "x": -495.1153697854391,
-        "y": 335.8062975834083,
-        "w": 607.8916946986392,
-        "h": 381.7717650059478,
+        "x": -491.1746438514313,
+        "y": 444.17626076862155,
+        "w": 536.9586278864996,
+        "h": 273.4018018207346,
         "content": {
           "title": "Pie chart",
           "entries": [
@@ -691,6 +836,35 @@
           ],
           "settings": {
             "title": "Timeseries",
+            "legend": true,
+            "legend_pos": "bottom",
+            "title_size": 12,
+            "axis_size": 9,
+            "x_title": "time [s]",
+            "y_title": ""
+          }
+        }
+      },
+      {
+        "kind": "timeseries",
+        "x": 99.69871217950458,
+        "y": 211.35526774948102,
+        "w": 397.977531322501,
+        "h": 261.3242664993124,
+        "content": {
+          "title": "Valve Opening",
+          "traces": [
+            {
+              "full": "valve_22.valve.opening",
+              "label": "valve_22.valve.opening",
+              "color": "#1f77b4",
+              "width": 2.0,
+              "dash": "solid",
+              "visible": true
+            }
+          ],
+          "settings": {
+            "title": "Valve Opening",
             "legend": true,
             "legend_pos": "bottom",
             "title_size": 12,

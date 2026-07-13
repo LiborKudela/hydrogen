@@ -36,9 +36,11 @@ from hydrogen.components.thermofluid.permeation import (
     H2_IN_AUSTENITIC,
     HELIUM,
     FixedPartialPressure,
+    SpecifiedFlux,
     SteadyRichardson,
     TransientDiffusion,
     TransportFit,
+    permeation_flux_from_spec,
 )
 from hydrogen.components.thermofluid.walls import CylindricalWall, FixedTemperature
 
@@ -451,6 +453,103 @@ class _WalledPipeRig(Model):
         self.connect(self["source"].ports["outlet"], self["pipe"].ports["inlet"])
         self.connect(self["pipe"].ports["outlet"], self["cap"].ports["inlet"])
         return []
+
+
+# -----------------------------------------------------------------------------
+# 8. SpecifiedFlux: a calibrated lumped leak that tracks the operating Δp
+# -----------------------------------------------------------------------------
+
+
+class _SpecifiedWallRig(Model):
+    """FixedPartialPressure(p_in) -> leaky CylindricalWall(SpecifiedFlux) ->
+    FixedPartialPressure(p_out); both thermal faces held at T_OP."""
+
+    def __init__(self, flux, p_in, p_out):
+        self._flux = flux
+        self._p_in = p_in
+        self._p_out = p_out
+        super().__init__()
+
+    def declare_components(self):
+        self.add_component("res", FixedPartialPressure(p_partial=self._p_in))
+        self.add_component("wall", CylindricalWall(
+            MAT.rho, MAT.cp, MAT.k, r_in=R_IN, r_out=R_OUT, length=L_PIPE,
+            T_init=T_OP, dynamic=False, leaky=True, permeation_flux=self._flux,
+            p_in_init=self._p_in, p_out_init=self._p_out))
+        self.add_component("env", FixedPartialPressure(p_partial=self._p_out))
+        self.add_component("T_in", FixedTemperature(T_set=T_OP))
+        self.add_component("T_out", FixedTemperature(T_set=T_OP))
+
+    def declare_equations(self):
+        self.connect(self["res"].ports["leak"], self["wall"].ports["leak_a"])
+        self.connect(self["env"].ports["leak"], self["wall"].ports["leak_b"])
+        self.connect(self["wall"].ports["port_a"], self["T_in"].ports["heat"])
+        self.connect(self["wall"].ports["port_b"], self["T_out"].ports["heat"])
+        return []
+
+
+def _specified_leak(flux, p_in, p_out):
+    sys = _SpecifiedWallRig(flux, p_in, p_out)
+    sys.instantiate()
+    sys.initialise(n=1, tol=1e-12, max_iter=100)
+    return _val(sys, "wall.m_dot_a_leak")
+
+
+def test_specified_flux_scales_linearly_with_pressure_difference():
+    Q, dp_ref, T_ref = 2.5e-3, 1.0e5, 273.15    # mbar*l/s at 1 bar, 0 C
+    m_dot_ref = Q * 0.1 * H2.M / (R_GAS * T_ref)   # kg/s at dp_ref
+
+    # At the calibration Δp the leak equals the quoted rate ...
+    at_ref = _specified_leak(SpecifiedFlux(H2, leak_rate=Q, dp_ref=dp_ref, T_ref=T_ref),
+                             p_in=dp_ref + 1.0, p_out=1.0)
+    assert at_ref == pytest.approx(m_dot_ref, rel=1e-9)
+
+    # ... and scales linearly with the actual Δp (3x here).
+    at_3x = _specified_leak(SpecifiedFlux(H2, leak_rate=Q, dp_ref=dp_ref, T_ref=T_ref),
+                            p_in=3 * dp_ref + 1.0, p_out=1.0)
+    assert at_3x == pytest.approx(3 * m_dot_ref, rel=1e-9)
+
+
+def test_specified_flux_constant_mode_ignores_pressure_difference():
+    Q, T_ref = 2.5e-3, 273.15
+    expected = Q * 0.1 * H2.M / (R_GAS * T_ref)    # kg/s, independent of Δp
+
+    lo = _specified_leak(SpecifiedFlux(H2, leak_rate=Q, scaling="constant", T_ref=T_ref),
+                         p_in=1.0e5, p_out=1.0)
+    hi = _specified_leak(SpecifiedFlux(H2, leak_rate=Q, scaling="constant", T_ref=T_ref),
+                         p_in=20.0e6, p_out=1.0)
+    # Same leak at 1 bar and at 200 bar -- constant, regardless of Δp.
+    assert lo == pytest.approx(expected, rel=1e-9)
+    assert hi == pytest.approx(expected, rel=1e-9)
+
+    # A bad scaling mode is rejected.
+    with pytest.raises(ValueError):
+        SpecifiedFlux(H2, leak_rate=Q, scaling="quadratic")
+
+
+def test_specified_flux_split_over_and_serialization():
+    f = SpecifiedFlux(H2, leak_rate=1.0, scaling="linear", dp_ref=2.0e5, T_ref=300.0)
+    assert f.split_over(1) is f
+    g = f.split_over(4)
+    assert g.leak_rate == pytest.approx(0.25)
+    assert g.dp_ref == pytest.approx(2.0e5) and g.T_ref == pytest.approx(300.0)
+    # Physics flux is a no-op under split_over (scales per site via geometry).
+    s = SteadyRichardson(FIT)
+    assert s.split_over(4) is s
+    # Round-trips through its value spec, including scaling + dp_ref.
+    f2 = permeation_flux_from_spec(f.to_spec())
+    assert f2.scaling == "linear"
+    assert (f2.leak_rate, f2.dp_ref, f2.T_ref) == pytest.approx((1.0, 2.0e5, 300.0))
+    assert f2.permeant.M == pytest.approx(H2.M)
+
+
+def test_specified_flux_must_be_sole_leaky_layer():
+    med = CoolPropMedium("Hydrogen", disable_warnings=True)
+    with pytest.raises(ValueError):
+        Pipe(med, D=2 * R_IN, L=L_PIPE, epsilon=1e-6, z_in=0.0, z_out=0.0,
+             n_segments=1,
+             layers=[WallLayer(MAT, 1e-3, permeation=SpecifiedFlux(H2, leak_rate=1e-3)),
+                     WallLayer(MAT, 1e-3, permeation=SteadyRichardson(FIT))])
 
 
 def test_walled_pipe_leaks_analytic_rate_and_conserves_mass():

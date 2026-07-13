@@ -2,7 +2,9 @@
 
 Components: AmbientInlet, AmbientOutlet, TwoPortSegment, AdiabaticPump,
 PressureOutlet, Splitter, PressureSource, MassSource, PressureVessel,
-MixingJunction, LoopBuffer, StraightPipe.
+MixingJunction, LoopBuffer, StraightPipe, SegmentedChannel, valves
+(IncompressibleValve / CompressibleValve) and LocalResistance (a
+correlation-driven local / minor pressure loss).
 
 The typed connectors (`FluidPort_phm`, `ThermalPort_TQ`, `PermeationPort_pN`)
 live in the sibling `ports` module; the leaky `TwoPortSegment` exposes a heat
@@ -23,6 +25,7 @@ from ...model import DifferentialVariable, Model, Parameter, Variable
 from ...numerics import G_const, smooth_max, smooth_min
 from ...paramspec import ParamSpec, merged_param_specs
 from ..control.control_components import RealSignal
+from .local_loss import LocalLossModel, LossFlowState
 from .ports import FluidPort_phm, PermeationPort_pN, ThermalPort_TQ
 
 import math as _math
@@ -1069,7 +1072,7 @@ class SegmentedChannel(Model):
     interface closures), the channel owns **one** set of closures per shared
     face:
 
-        per face j (0..N):   M_j = count*rho_j*A*w_j        (axial mass flow)
+        per face j (0..N):   M_j = count*rho_j*A_j*w_j       (axial mass flow)
                              T_j  = T_ph(p_j, h_j)
                              rho_j = rho_ph(p_j, h_j)
                              mu_j  = mu_ph(p_j, h_j)
@@ -1091,6 +1094,25 @@ class SegmentedChannel(Model):
 
     With `N=1` and `dynamic="static"` the equation set is identical to a single
     `TwoPortSegment`.
+
+    Variable area (``A_faces``):
+
+    By default the bore is uniform (flow area ``A = pi*D^2/4`` on every face).
+    Pass ``A_faces`` (a per-face flow-area profile of length ``N+1``, inlet..
+    outlet) to make the duct a **variable-area** element -- a nozzle, diffuser,
+    conical transition, or a Bernoulli injector.  Each face ``j`` then carries
+    its own area ``A_j`` in the mass-flow closure ``M_j = count*rho_j*A_j*w_j``,
+    each cell derives its volume / wetted area / hydraulic diameter from its two
+    bounding faces, and the STATIC momentum balance gains the axial wall-pressure
+    force ``p_avg*(A_out - A_in)`` -- turning ``p_in*A_in - p_out*A_out`` into
+    the reversible ``(p_in - p_out)*A_avg`` (Bernoulli) area-change relation, so
+    a diffuser recovers pressure and a nozzle accelerates the flow (exact in the
+    differential limit -- refine ``N`` for a strong taper).  Perimeters are taken
+    circular, so the area profile alone fixes ``Dh``.  A uniform ``A_faces``
+    (all equal) reproduces the single-``D`` element exactly.  The transient
+    levels see the varying area in the mass / storage / friction terms; adding
+    the convective (area-change) pressure-recovery term to the staggered
+    transient momentum is a documented follow-up.
 
     Dynamic levels (``dynamic=``):
 
@@ -1159,7 +1181,7 @@ class SegmentedChannel(Model):
     _cache_key_flags = ("multiphase", "heat_port", "leaky", "dynamic", "N",
                         "advection_scheme", "wall_elasticity",
                         "unsteady_friction", "viscoelastic_wall",
-                        "cavitation")
+                        "cavitation", "_variable_area")
 
     def __init__(
         self,
@@ -1271,6 +1293,15 @@ class SegmentedChannel(Model):
             "RESERVED: full fluid-structure interaction (axial pipe motion, "
             "junction coupling).  Not implemented -- raises.",
             structural=True)] = False,
+        A_faces: Annotated[list, ParamSpec(
+            "Per-face flow area profile [m^2], length N+1 (one value per shared "
+            "face, inlet..outlet).  When given, the channel becomes a "
+            "variable-area duct and `D` is used only as a reference scale; the "
+            "perimeter of each face is taken circular (Dh_j = sqrt(4*A_j/pi)).  "
+            "`None` (default) is a uniform bore of diameter `D`.  A tapering "
+            "profile turns the STATIC momentum balance into the full "
+            "reversible (Bernoulli) area-change relation; the transient levels "
+            "see the varying area in the mass / storage / friction terms.")] = None,
         count: Annotated[float, _SPEC_COUNT] = 1.0,
     ):
         self.medium = medium
@@ -1369,6 +1400,31 @@ class SegmentedChannel(Model):
         # consumers that read `.n_segments` and per-cell port lists.
         self.n_segments = self.N
         self.D = D
+        # --- variable per-face area (conical / injector / area change) -------
+        # `A_faces` (length N+1) turns the uniform-bore duct into a duct whose
+        # flow area varies station-to-station.  When it is `None` the channel is
+        # exactly the previous uniform element (same single-`A` templates, so
+        # `StraightPipe`/`Pipe`/valve behaviour is byte-identical); all
+        # variable-area code lives behind `self._variable_area`.  Perimeters are
+        # taken circular so a single areas-only input fully determines Dh.
+        self._variable_area = A_faces is not None
+        if self._variable_area:
+            A_faces = [float(a) for a in A_faces]
+            if len(A_faces) != self.N + 1:
+                raise ValueError(
+                    f"SegmentedChannel(A_faces): expected N+1 = {self.N + 1} "
+                    f"per-face areas (one per shared face), got {len(A_faces)}")
+            if any(a <= 0.0 for a in A_faces):
+                raise ValueError(
+                    f"SegmentedChannel(A_faces): all face areas must be > 0, "
+                    f"got {A_faces!r}")
+            self.A_faces = A_faces
+            self._D_faces = [_math.sqrt(4.0 * a / _math.pi) for a in A_faces]
+            self._P_faces = [_math.pi * d for d in self._D_faces]
+        else:
+            self.A_faces = None
+            self._D_faces = None
+            self._P_faces = None
         self.L = L
         self.epsilon = epsilon
         self.z_in = z_in
@@ -1685,30 +1741,55 @@ class SegmentedChannel(Model):
         return m.T_ph, m.rho_ph, m.mu_ph, m.k_ph
 
     def _momentum_eq(self, cell, *, p_in, p_out, A_in, A_out, A_avg, rho_avg,
-                     w_in, w_out, w_avg, m_dot_avg, f_avg, Dh_avg, L, z_in, z_out):
+                     w_in, w_out, w_avg, m_dot_avg, f_avg, Dh_avg, L, z_in, z_out,
+                     mu_avg=None):
         """Default per-cell momentum residual (distributed duct balance).
 
         Identical to `TwoPortSegment._momentum_eq`, but parameterised on the
         cell's own segment length `L` and station elevations `z_in`/`z_out` so a
         single channel can carry many cells.  Subclasses (valves / pumps)
-        override to substitute a different pressure/flow relation.
+        override to substitute a different pressure/flow relation.  ``mu_avg`` is
+        supplied for overrides whose closure is Reynolds-dependent (a
+        velocity-dependent local-loss ``K``); the base duct balance ignores it.
+
+        The ``p_avg*(A_out - A_in)`` term is the axial component of the pressure
+        force the (tapered) wall exerts on the control volume.  It is identically
+        zero for a uniform cell (``A_in == A_out``), so a constant-area duct is
+        unchanged; for a variable-area cell it turns the end-face pressure force
+        ``p_in*A_in - p_out*A_out`` into ``(p_in - p_out)*A_avg``, i.e. the
+        REVERSIBLE (Bernoulli) area-change balance -- a diffuser recovers
+        pressure, a nozzle accelerates the flow -- exact in the differential
+        limit (refine ``N`` for a strong taper).
         """
         delta_P_friction = f_avg * (L / Dh_avg) * (rho_avg * abs(w_avg) * w_avg / 2)
         momentum_flux = m_dot_avg * (w_out - w_in)
         buoyancy_force = -G_const * (z_out - z_in) * A_avg * rho_avg
-        return p_in * A_in - p_out * A_out - delta_P_friction * A_avg - momentum_flux + buoyancy_force
+        p_avg = (p_in + p_out) / 2
+        wall_pressure_force = p_avg * (A_out - A_in)
+        return (p_in * A_in - p_out * A_out + wall_pressure_force
+                - delta_P_friction * A_avg - momentum_flux + buoyancy_force)
 
     def declare_components(self):
         spec = merged_param_specs(type(self))
         N = self.N
-        A_value = np.pi * self.D ** 2 / 4
-        P_value = np.pi * self.D
+        if self._variable_area:
+            # `A`/`P` stay as (mean) reference-scale aliases for consumers that
+            # read them; the equations use the per-face `A_face_j`/`P_face_j`.
+            A_value = float(np.mean(self.A_faces))
+            P_value = float(np.mean(self._P_faces))
+        else:
+            A_value = np.pi * self.D ** 2 / 4
+            P_value = np.pi * self.D
         L_segment_value = self.L / N
 
         self.add_component('count', Parameter(self.count, **spec['count'].param_kwargs()))
         self.add_component('A', Parameter(A_value, "m^2"))
         self.add_component('P', Parameter(P_value, "m"))
         self.add_component('L_segment', Parameter(L_segment_value, "m"))
+        if self._variable_area:
+            for j in range(N + 1):
+                self.add_component(f'A_face_{j}', Parameter(self.A_faces[j], "m^2"))
+                self.add_component(f'P_face_{j}', Parameter(self._P_faces[j], "m"))
 
         # N+1 station elevations shared between adjacent cells.
         dz = (self.z_out - self.z_in) / N
@@ -2083,8 +2164,21 @@ class SegmentedChannel(Model):
         return d
 
     def _primitive_mom_residual(self, *, w, rho, mu, pL, pR, zL, zR, L_mom, Dh,
-                                der_w=None, w_prev=None, w_next=None, c_ref=None):
-        """Staggered face momentum balance (pressure units)."""
+                                der_w=None, w_prev=None, w_next=None, c_ref=None,
+                                j=None, N=None):
+        """Staggered face momentum balance (pressure units).
+
+        This is the pluggable momentum closure for the primitive (dynamic)
+        levels: it returns the residual that closes the face velocity ``w`` of
+        face ``j`` of an ``N``-cell channel.  The base implementation is the
+        distributed duct balance; lumped single-segment devices (valves, pumps)
+        override it to substitute a device pressure/flow law on the boundary
+        faces (the face index ``j`` and cell count ``N`` are supplied so an
+        override can identify the face and reach ``self[f'M_{j}']``).  ``j`` /
+        ``N`` are unused by the base duct balance.  Interior faces reuse a
+        single template, so a ``j``-dependent override must be restricted to
+        ``N == 1`` devices (whose only faces are the two directly-built end
+        faces)."""
         Re = rho * abs(w) * Dh / mu + 1
         f = self._corr_template(self.f_factor_func, 'f', (Re, self.epsilon, Dh))
         dp_fric = f * (L_mom / Dh) * (rho * abs(w) * w / 2)
@@ -2183,7 +2277,7 @@ class SegmentedChannel(Model):
             eqs.append(T_wall - Tci)
         return eqs
 
-    def _declare_primitive(self, eqs, N, count, A, P, L_seg, Dh,
+    def _declare_primitive(self, eqs, N, count, A_face, P_face, L_seg,
                            T_ph, rho_ph, mu_ph, k_ph):
         """Unified primitive-``(p, h)`` residuals for the three dynamic levels.
 
@@ -2250,9 +2344,26 @@ class SegmentedChannel(Model):
         hc = [self[f'hc_{i}'].symbol for i in range(N)]
         pc = [self[f'pc_{i}'].symbol for i in range(N)]
         z = [self[f'z_{j}'].symbol for j in range(N + 1)]
-        V_cell = count * A * L_seg
         cp = self._cp_std
-        area_conv = count * P * L_seg
+        # Per-cell / per-face geometry.  Uniform bore: single shared symbols
+        # (so the templates below stay byte-identical to the historical
+        # single-`A` element).  Variable area: each cell's volume / wetted
+        # area / hydraulic diameter is the mean of its two bounding faces, and
+        # the interior diffusion / momentum faces use the shared-face area and
+        # Dh directly.
+        if self._variable_area:
+            cell_A = [(A_face[i] + A_face[i + 1]) / 2 for i in range(N)]
+            cell_P = [(P_face[i] + P_face[i + 1]) / 2 for i in range(N)]
+            cell_Dh = [4 * cell_A[i] / cell_P[i] for i in range(N)]
+            V_cell_i = [count * cell_A[i] * L_seg for i in range(N)]
+            area_conv_i = [count * cell_P[i] * L_seg for i in range(N)]
+            face_Dh = [4 * A_face[j] / P_face[j] for j in range(N + 1)]
+        else:
+            A = A_face[0]
+            P = P_face[0]
+            Dh = 4 * A / P
+            V_cell = count * A * L_seg
+            area_conv = count * P * L_seg
         # Symbolic density partials for the primitive chain rule (HEM-smoothed
         # variants inside the dome).  Both `rho_p` and `rho_h` expose consistent
         # second derivatives, so the Newton Jacobian of the cell balances is
@@ -2291,7 +2402,15 @@ class SegmentedChannel(Model):
         for j in range(N + 1):
             if j == 0 or j == N:
                 eqs.append(self[f'F_diff_{j}'].symbol)
-        if N > 1:
+        if N > 1 and self._variable_area:
+            # Interior face j carries its own shared-face area / Dh (no shared
+            # template -- variable-area ducts are short).
+            for j in range(1, N):
+                real = self._primitive_diff_real_syms(j)
+                eqs.append(self._primitive_diff_residual(
+                    count=count, A=A_face[j], L_seg=L_seg, Dh=face_Dh[j],
+                    cp=cp, **real))
+        elif N > 1:
             diff_ref = self._primitive_diff_placeholder_syms()
             diff_tpl = [self._primitive_diff_residual(
                 count=count, A=A, L_seg=L_seg, Dh=Dh, cp=cp, **diff_ref)]
@@ -2305,16 +2424,24 @@ class SegmentedChannel(Model):
 
         # Per-cell EoS closures + energy (+ optional mass) balances.
         cell_kw = dict(
-            V_cell=V_cell, area_conv=area_conv, Dh=Dh, count=count, cp=cp,
+            count=count, cp=cp,
             T_ph=T_ph, rho_ph=rho_ph, mu_ph=mu_ph, k_ph=k_ph,
             drho_dp=drho_dp, drho_dh=drho_dh,
             S_mass=S_mass, S_energy=S_energy, c_ref=c_ref, N=N)
-        if N == 1:
+        if self._variable_area:
+            for i in range(N):
+                real = self._primitive_cell_real_syms(i)
+                eqs.extend(self._primitive_cell_residuals(
+                    **real, V_cell=V_cell_i[i], area_conv=area_conv_i[i],
+                    Dh=cell_Dh[i], **cell_kw))
+        elif N == 1:
             real = self._primitive_cell_real_syms(0)
-            eqs.extend(self._primitive_cell_residuals(**real, **cell_kw))
+            eqs.extend(self._primitive_cell_residuals(
+                **real, V_cell=V_cell, area_conv=area_conv, Dh=Dh, **cell_kw))
         else:
             ref = self._primitive_cell_placeholder_syms()
-            cell_tpl = self._primitive_cell_residuals(**ref, **cell_kw)
+            cell_tpl = self._primitive_cell_residuals(
+                **ref, V_cell=V_cell, area_conv=area_conv, Dh=Dh, **cell_kw)
             with sp.evaluate(False):
                 for i in range(N):
                     real = self._primitive_cell_real_syms(i)
@@ -2353,8 +2480,10 @@ class SegmentedChannel(Model):
             w_j = self[f'w_{j}'].symbol
             rho_f = self[f'rho_{j}'].symbol
             mu_f = self[f'mu_{j}'].symbol
+            Dh_j = face_Dh[j] if self._variable_area else Dh
             mom_kw = dict(w=w_j, rho=rho_f, mu=mu_f, pL=pL, pR=pR,
-                          zL=zL, zR=zR, L_mom=L_mom, Dh=Dh, c_ref=c_ref)
+                          zL=zL, zR=zR, L_mom=L_mom, Dh=Dh_j, c_ref=c_ref,
+                          j=j, N=N)
             if self._momentum_inertia:
                 mom_kw['der_w'] = self[f'der_w_{j}'].symbol
                 if self.unsteady_friction:
@@ -2365,8 +2494,14 @@ class SegmentedChannel(Model):
                         mom_kw['w_prev'] = self[f'w_{N - 1}'].symbol
                         mom_kw['w_next'] = w_j
             eqs.append(self._primitive_mom_residual(**mom_kw))
-        # Interior faces: one template, rename leaves per face.
-        if N > 1:
+        # Interior faces.
+        if N > 1 and self._variable_area:
+            for j in range(1, N):
+                real = self._primitive_mom_interior_real_syms(j, z)
+                eqs.append(self._primitive_mom_residual(
+                    L_mom=L_seg, Dh=face_Dh[j], c_ref=c_ref, j=j, N=N, **real))
+        elif N > 1:
+            # One template, rename leaves per face.
             mom_ref = self._primitive_mom_interior_placeholder_syms()
             mom_tpl = [self._primitive_mom_residual(
                 L_mom=L_seg, Dh=Dh, c_ref=c_ref, **mom_ref)]
@@ -2386,10 +2521,21 @@ class SegmentedChannel(Model):
         P = self['P'].symbol
         L_seg = self['L_segment'].symbol
         Dh = 4 * A / P
+        # Per-face flow area / perimeter.  Uniform bore: every face is the same
+        # `A`/`P` symbol (so the templates below are byte-identical to the
+        # historical single-`A` element).  Variable area: each face carries its
+        # own `A_face_j`/`P_face_j`, so the mass-flow closure, cell volumes,
+        # wetted areas and hydraulic diameters all follow the taper.
+        if self._variable_area:
+            A_face = [self[f'A_face_{j}'].symbol for j in range(N + 1)]
+            P_face = [self[f'P_face_{j}'].symbol for j in range(N + 1)]
+        else:
+            A_face = [A] * (N + 1)
+            P_face = [P] * (N + 1)
         T_ph, rho_ph, mu_ph, k_ph = self._property_funcs()
         eqs = []
 
-        # --- per-face closures (ONE sept per shared face) -------------------
+        # --- per-face closures (ONE set per shared face) --------------------
         for j in range(N + 1):
             p = self[f'p_{j}'].symbol
             h = self[f'h_{j}'].symbol
@@ -2402,7 +2548,7 @@ class SegmentedChannel(Model):
             # Face EoS lookups get the same (cavitation-only) smooth pressure
             # floor as the cells (`_p_eos_cav`; identity otherwise).
             pe = self._p_eos_cav(p)
-            eqs.append(M - count * rho * A * w)
+            eqs.append(M - count * rho * A_face[j] * w)
             eqs.append(T - T_ph(pe, h))
             eqs.append(rho - rho_ph(pe, h))
             eqs.append(mu - mu_ph(pe, h))
@@ -2423,7 +2569,23 @@ class SegmentedChannel(Model):
         # mirroring the static-level template path.
         if self._cell_centered:
             return self._declare_primitive(
-                eqs, N, count, A, P, L_seg, Dh, T_ph, rho_ph, mu_ph, k_ph)
+                eqs, N, count, A_face, P_face, L_seg, T_ph, rho_ph, mu_ph, k_ph)
+
+        # --- variable-area static path ------------------------------------
+        # Each cell carries its own inlet/outlet face areas (a taper), so there
+        # is no shared template to amortise -- build the cells directly.  These
+        # elements are short (a fitting / nozzle / injector), so this is cheap
+        # and keeps the uniform template path below untouched.
+        if self._variable_area:
+            for i in range(N):
+                A_in = A_face[i]
+                A_out = A_face[i + 1]
+                P_avg = (P_face[i] + P_face[i + 1]) / 2
+                Dh_cell = 4 * ((A_in + A_out) / 2) / P_avg
+                eqs.extend(self._cell_residuals(
+                    i, A_in=A_in, A_out=A_out, P_avg=P_avg, L_seg=L_seg,
+                    count=count, Dh=Dh_cell, **self._cell_real_syms(i)))
+            return eqs
 
         # --- per-cell balances (static level only) ------------------------
         # The N cells are structurally identical -- same correlations, only the
@@ -2442,13 +2604,13 @@ class SegmentedChannel(Model):
         # build the single cell normally.
         if N == 1:
             eqs.extend(self._cell_residuals(
-                0, A=A, P=P, L_seg=L_seg, count=count, Dh=Dh,
+                0, A_in=A, A_out=A, P_avg=P, L_seg=L_seg, count=count, Dh=Dh,
                 **self._cell_real_syms(0)))
             return eqs
 
         ref = self._cell_placeholder_syms()
         template = self._cell_residuals(
-            0, A=A, P=P, L_seg=L_seg, count=count, Dh=Dh, **ref)
+            0, A_in=A, A_out=A, P_avg=P, L_seg=L_seg, count=count, Dh=Dh, **ref)
         with sp.evaluate(False):
             for i in range(N):
                 real = self._cell_real_syms(i)
@@ -2500,7 +2662,7 @@ class SegmentedChannel(Model):
     def _cell_residuals(self, cell, *, p_in, p_out, h_in, h_out, w_in, w_out,
                         rho_in, rho_out, mu_in, mu_out, k_in, k_out, T_in, T_out,
                         M_in, M_out, z_in, z_out, T_wall, q_inflow, m_dot_leak,
-                        A, P, L_seg, count, Dh):
+                        A_in, A_out, P_avg, L_seg, count, Dh):
         """Static-level residuals for a single cell as a pure function of its
         symbols.
 
@@ -2510,6 +2672,12 @@ class SegmentedChannel(Model):
         `q_inflow_func`, `_momentum_eq`) must be pure functions of their
         arguments for the template rename to be valid (true for the base
         channel; the valve subclasses are N == 1 and take the direct path).
+
+        ``A_in``/``A_out`` are the inlet/outlet **face** flow areas: they are the
+        same symbol for a uniform bore (byte-identical to the historical single
+        ``A``) and differ for a variable-area cell, where the momentum balance
+        ``p_in*A_in - p_out*A_out - m_dot*(w_out-w_in) - ...`` then carries the
+        full reversible (Bernoulli) area-change relation.
         """
         w_eps = 1e-4
         m_eps = 1e-6
@@ -2522,12 +2690,11 @@ class SegmentedChannel(Model):
         mu_avg = (mu_in + mu_out) / 2
         k_avg = (k_in + k_out) / 2
         w_avg = (w_in + w_out) / 2
-        A_avg = A
+        A_avg = (A_in + A_out) / 2
         m_dot_avg = (m_dot_in - m_dot_out) / 2
         p_avg = (p_in + p_out) / 2
         h_avg = (h_in + h_out) / 2
         T_avg = (T_in + T_out) / 2
-        P_avg = P
         Dh_avg = Dh
         Re_avg = rho_avg * abs(w_avg) * Dh_avg / mu_avg + 1
 
@@ -2541,10 +2708,10 @@ class SegmentedChannel(Model):
         # momentum
         f_avg = self.f_factor_func(Re_avg, self.epsilon, Dh_avg)
         eqs.append(self._momentum_eq(
-            cell, p_in=p_in, p_out=p_out, A_in=A, A_out=A, A_avg=A_avg,
+            cell, p_in=p_in, p_out=p_out, A_in=A_in, A_out=A_out, A_avg=A_avg,
             rho_avg=rho_avg, w_in=w_in, w_out=w_out, w_avg=w_avg,
             m_dot_avg=m_dot_avg, f_avg=f_avg, Dh_avg=Dh_avg, L=L_seg,
-            z_in=z_in, z_out=z_out))
+            z_in=z_in, z_out=z_out, mu_avg=mu_avg))
 
         # energy (quasi-steady, static level)
         area_conv = count * P_avg * L_seg
@@ -2620,8 +2787,37 @@ class Valve(SegmentedChannel):
     unclosed (singular system), which `instantiate()` flags by name.
 
     Subclasses implement `_valve_flow(dp, rho_avg, theta) -> m_dot` (axial
-    mass flow [kg/s] for pressure drop ``dp = p_in - p_out``).
+    mass flow [kg/s] for pressure drop ``dp = p_in - p_out``).  That single
+    law is the *shared* momentum closure: the quasi-steady `static` level uses
+    it directly through the `_momentum_eq` hook, and the dynamic levels reuse
+    it per staggered face through `_primitive_mom_residual` (see below), so a
+    valve/pump author writes the pressure/flow relation once and it applies at
+    every dynamic level.
+
+    Thermal transfer / permeation (assembly use)
+    --------------------------------------------
+    A bare valve is adiabatic and non-leaky.  Passing ``heat_port=True`` and/or
+    ``leaky=True`` exposes the single cell's ``wall_0`` / ``leak_0`` ports (via
+    the `SegmentedChannel` base) so a parent assembly can wrap the valve body
+    in a conjugate wall stack (thermal mass + gas permeation).  ``L_body`` then
+    sets the physical body length that scales the wetted area / holdup volume
+    those closures use (it is inert for a bare, adiabatic valve).
+
+    Single-volume dynamics (`dynamic != "static"`)
+    ----------------------------------------------
+    On the dynamic levels the ``N = 1`` cell becomes a staggered triplet
+    ``p_in --(face 0)-- pc_0 --(face 1)-- p_out`` with mass/energy storage in
+    the central cell: physically a valve *body volume* bounded by two throttling
+    faces.  Each face carries a copy of the valve law scaled so the two-face
+    series reproduces the lumped device drop (see `_primitive_mom_residual`).
+    Only the plain (non-choked) `sqrt` law composes this way; choked / gas
+    expansion-factor laws are `static`-only and raise if a dynamic level is
+    requested.
     """
+
+    #: Abstract base -- only the concrete subclasses (`IncompressibleValve`,
+    #: `CompressibleValve`) are real, buildable catalog components.
+    _catalog_abstract = True
 
     #: P&ID-style SVG symbol for the UI canvas (a filename in
     #: ``hydrogen/components/icons/``; surfaced via the catalog as ``"icon"``).
@@ -2645,6 +2841,24 @@ class Valve(SegmentedChannel):
                          "the sign*sqrt(|dp|) flow law smooth through dp = 0.",
                          unit="Pa")] = 1.0,
         multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
+        heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        dynamic: Annotated[str, ParamSpec("Dynamic modelling level of the valve "
+                          "body cell: 'static' (quasi-steady throttle, the "
+                          "default) or a mass/energy-storing level "
+                          "('advective'/'compressible') for a valve body volume "
+                          "bounded by the throttle.  Non-static levels require "
+                          "the plain (non-choked) sqrt law; 'acoustic' is "
+                          "unsupported (a throttle has no per-face inertia).",
+                          choices=("static", "advective", "compressible"),
+                          structural=True)] = "static",
+        L_body: Annotated[float, ParamSpec("Physical valve-body length that "
+                         "sets the wetted area / holdup volume for the "
+                         "thermal / permeation / storage closures (inert for a "
+                         "bare adiabatic valve).", unit="m")] = 1.0,
+        p_init: Annotated[float, ParamSpec("Initial body-cell pressure [Pa]; "
+                         "seeds the storage states (dynamic levels).",
+                         unit="Pa")] = 101325.0,
     ):
         # Store the constructor scalars under their own names so the reflective
         # serializer can recover them (it maps each __init__ arg to a like-named
@@ -2652,15 +2866,47 @@ class Valve(SegmentedChannel):
         self.D = D
         self.opening = opening
         self.dp_eps = dp_eps
+        self.L_body = float(L_body)
+        # Dynamic single-volume behaviour reuses the valve law per staggered
+        # face; only the plain sqrt law composes correctly in series (choked /
+        # expansion-factor laws saturate and cannot be split), so guard early.
+        if dynamic != "static" and not self._dynamic_momentum_ok:
+            raise NotImplementedError(
+                f"{type(self).__name__}(dynamic={dynamic!r}): dynamic (mass-"
+                f"storing) valve-body levels are only supported for the plain "
+                f"non-choked sqrt law; this valve uses a choked / "
+                f"expansion-factor law that is valid at dynamic='static' only.")
+        # The `acoustic` level makes every face velocity a differential state
+        # (rho*L*dw/dt inertia); a throttle carries negligible fluid inertia, so
+        # its algebraic flow law would leave those der_w states unclosed.  The
+        # storing but inertia-free 'advective'/'compressible' levels are the
+        # supported single-volume-dynamics options.
+        if dynamic == "acoustic":
+            raise NotImplementedError(
+                f"{type(self).__name__}(dynamic='acoustic'): a lumped throttle "
+                f"has no per-face momentum inertia, so the acoustic level is "
+                f"unsupported; use 'compressible' (or 'advective') for "
+                f"valve-body single-volume dynamics, or 'static'.")
         # A single finite-volume cell; the channel computes A = pi*D^2/4 and
-        # P = pi*D from the connecting diameter.  Friction / heat are inert (the
-        # momentum hook is replaced by the valve flow law), so a nominal L and
-        # zero roughness are passed.  `multiphase="HEM"` makes the face/cell
-        # property closures dome-safe -- needed when the valve discharges a
-        # flashing (cavitating) liquid whose outlet state is two-phase.
-        super().__init__(medium, D=D, L=1.0, epsilon=0.0, z_in=z_in,
+        # P = pi*D from the connecting diameter.  Friction is inert (the
+        # momentum hook is replaced by the valve flow law); heat is off unless
+        # a wall is attached (`heat_port=True`), in which case the base's
+        # convective closure carries it.  A nominal `L_body` and zero roughness
+        # are passed.  `multiphase="HEM"` makes the face/cell property closures
+        # dome-safe -- needed when the valve discharges a flashing (cavitating)
+        # liquid whose outlet state is two-phase.
+        super().__init__(medium, D=D, L=self.L_body, epsilon=0.0, z_in=z_in,
                          z_out=z_out, N=1, f_factor_func=self._no_friction,
-                         q_inflow_func=self._no_heat, multiphase=multiphase)
+                         q_inflow_func=(None if heat_port else self._no_heat),
+                         multiphase=multiphase, heat_port=heat_port,
+                         leaky=leaky, dynamic=dynamic, p_init=p_init)
+
+    @property
+    def _dynamic_momentum_ok(self) -> bool:
+        """True if this valve's flow law can be used per-face on the dynamic
+        levels (only the plain, non-choked sqrt law composes in series).
+        Overridden by subclasses that support it."""
+        return False
 
     @staticmethod
     def _no_friction(Re, epsilon, Dh):
@@ -2685,6 +2931,29 @@ class Valve(SegmentedChannel):
         dp = p_in - p_out
         theta = self['opening'].symbol
         return m_dot_avg - self._valve_flow(dp, rho_avg, theta)
+
+    def _primitive_mom_residual(self, *, w, rho, mu, pL, pR, zL, zR, L_mom, Dh,
+                                der_w=None, w_prev=None, w_next=None, c_ref=None,
+                                j=None, N=None):
+        """Per-face valve momentum closure for the dynamic levels.
+
+        The lumped valve law is placed on every staggered face, with its flow
+        coefficient scaled by ``sqrt(n_faces)`` so that the ``n_faces = N + 1``
+        identical faces in series (each seeing ~``dp/n_faces``) reproduce the
+        single lumped drop ``m_dot = valve_flow(dp)`` -- exact for the plain
+        sqrt law, which is linear in the coefficient.  The face flow ``M_j``
+        (closed by ``M_j = count*rho*A*w_j`` elsewhere) is driven directly, so
+        each face is non-singular even with zero wall friction."""
+        if not self._dynamic_momentum_ok:  # pragma: no cover - guarded in __init__
+            raise NotImplementedError(
+                f"{type(self).__name__}: dynamic valve momentum is unsupported "
+                f"for this (choked / expansion-factor) law; use "
+                f"dynamic='static'.")
+        theta = self['opening'].symbol
+        dp = pL - pR
+        n_faces = (N + 1) if N is not None else 1
+        m_face = sp.sqrt(sp.Integer(n_faces)) * self._valve_flow(dp, rho, theta)
+        return self[f'M_{j}'].symbol - m_face
 
     def _valve_flow(self, dp, rho_avg, theta):  # pragma: no cover - abstract
         raise NotImplementedError
@@ -2764,6 +3033,11 @@ class IncompressibleValve(Valve):
             "selection.", unit="Pa",
             relevant_when={"choked": True})] = 1.0,
         multiphase: str = "single",
+        heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        dynamic: str = "static",
+        L_body: float = 1.0,
+        p_init: float = 101325.0,
     ):
         self.Kv = Kv
         self.trim_exp = float(trim_exp)
@@ -2781,8 +3055,16 @@ class IncompressibleValve(Valve):
         # restore the public attribute afterwards for the serializer.
         self._p_vap_valve = None if p_vap is None else float(p_vap)
         super().__init__(medium, D, opening=opening, z_in=z_in, z_out=z_out,
-                         dp_eps=dp_eps, multiphase=multiphase)
+                         dp_eps=dp_eps, multiphase=multiphase,
+                         heat_port=heat_port, leaky=leaky, dynamic=dynamic,
+                         L_body=L_body, p_init=p_init)
         self.p_vap = self._p_vap_valve
+
+    @property
+    def _dynamic_momentum_ok(self) -> bool:
+        # The plain sqrt law composes in series across the staggered faces; the
+        # ISA liquid-choking clamp saturates and does not, so it is static-only.
+        return not self.choked
 
     def declare_components(self):
         super().declare_components()
@@ -2880,13 +3162,21 @@ class CompressibleValve(Valve):
         p_eps: Annotated[float, ParamSpec("Smoothing scale on pressures for "
                         "the smooth min/max upstream selection and choke "
                         "clamp.", unit="Pa")] = 1.0,
+        heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        L_body: float = 1.0,
+        p_init: float = 101325.0,
     ):
         self.Kv = Kv
         self.xT = xT
         self.gamma = gamma
         self.p_eps = p_eps
+        # The gas expansion-factor / choke law saturates, so it has no
+        # series-composable per-face form: the compressible valve is
+        # `dynamic='static'` only (the base guards any other level).
         super().__init__(medium, D, opening=opening, z_in=z_in, z_out=z_out,
-                         dp_eps=dp_eps)
+                         dp_eps=dp_eps, heat_port=heat_port, leaky=leaky,
+                         L_body=L_body, p_init=p_init)
 
     def declare_components(self):
         super().declare_components()
@@ -2928,6 +3218,273 @@ class CompressibleValve(Valve):
         g = dp_used / (dp_used ** 2 + dp_eps ** 2) ** 0.25  # sign*sqrt(|dp_used|)
         C = Kv / 36000.0
         return C * theta * Y * sp.sqrt(rho_up) * g
+
+
+class LocalResistance(SegmentedChannel):
+    """A local (minor) pressure loss: a single-cell throttle whose drop is set
+    by a dimensionless loss coefficient ``K`` (``zeta``) from a *pluggable*
+    correlation, referenced to the connecting-bore velocity head::
+
+        Δp   = K * rho * v**2 / 2,          v = m_dot / (rho * A),  A = pi*D**2/4
+        m_dot = A * sign(Δp) * sqrt(2 * rho * |Δp| / K)     (regularised)
+
+    Built on `SegmentedChannel` (a single ``N = 1`` cell), like `Valve`, so it
+    reuses continuity, the adiabatic energy balance (an equal-area local loss is
+    isenthalpic -- the correct throttling physics) and the face-property
+    closures; only the momentum relation is swapped for the loss law, via the
+    `_momentum_eq` hook.  Wall friction is inert (the inherited ``L`` /
+    ``epsilon`` geometry is nominal); the flow area used by the
+    ``m_dot = rho*A*w`` closures comes from the connecting diameter ``D``.
+
+    The coefficient is supplied by a `local_loss.LocalLossModel` value object
+    (``FixedK`` / ``SuddenExpansion`` / ``SuddenContraction`` / ``LaminarTransitionK``
+    / ...), so a UI offers a dropdown that auto-prompts for the chosen
+    correlation's parameters.  Unlike a `Valve`, there is no ``opening`` signal
+    -- a local loss is passive.
+
+    Velocity- / Reynolds-dependent ``K``
+    ------------------------------------
+    ``K`` may depend on the flow: the loss model's `zeta` receives a
+    `local_loss.LossFlowState` (the local ``Re`` / velocity / density / viscosity
+    / hydraulic diameter / area, floored so ``1/Re`` is finite through zero
+    flow), so an Idelchik laminar / transition ``K = K_turb + K_lam/Re`` closes
+    correctly.  A velocity-dependent ``K`` just makes the momentum residual
+    implicit in the flow -- the DAE solver handles it.
+
+    Changing cross-section (``D_in`` != ``D_out``) and reference section
+    -------------------------------------------------------------------
+    Passing distinct inlet / outlet bore diameters (``D_in`` / ``D_out``) makes
+    the fitting a **variable-area** element (a contraction / enlargement /
+    conical transition): it is built on the variable-area `SegmentedChannel`
+    (``A_faces = [A_in, A_out]``), so its momentum balance is the REVERSIBLE
+    (Bernoulli) area-change relation PLUS the irreversible loss ``K*rho*v_ref**2/2``
+    -- a diffuser recovers pressure, then loses ``K`` velocity heads.  Because
+    the two ends now have different velocities, ``reference`` selects which
+    section's velocity head ``K`` is quoted against (``'inlet'`` or ``'outlet'``
+    -- many handbook coefficients are referenced to one specific end).  For the
+    default equal-area element (``D_in == D_out``) the two velocities coincide
+    and ``reference`` is immaterial (``K`` is the bore velocity head, exactly as
+    before).  Area change is only defined on the ``static`` level (the transient
+    staggered momentum does not yet carry the convective area-change term).
+
+    Thermal transfer / permeation (assembly use)
+    --------------------------------------------
+    A bare local resistance is adiabatic and non-leaky.  ``heat_port=True`` /
+    ``leaky=True`` expose the cell's ``wall_0`` / ``leak_0`` ports so a parent
+    assembly (`assemblies.LocalLoss`) can wrap the body in a conjugate wall
+    stack (thermal mass + gas permeation); ``L_body`` then sets the physical
+    body length scaling the wetted area / holdup volume those closures use.
+
+    Single-volume dynamics (``dynamic != "static"``)
+    -----------------------------------------------
+    As for the non-choked valve, the plain sqrt law is linear in the flow
+    coefficient, so it composes across the staggered faces of the ``N = 1``
+    dynamic triplet (``p_in --face0-- pc_0 --face1-- p_out``): each face carries
+    the law scaled by ``sqrt(n_faces)`` so the two-face series reproduces the
+    lumped drop, giving a small mass/energy-storing body volume bounded by the
+    loss.  ``acoustic`` is unsupported (an algebraic loss carries no per-face
+    inertia to close ``der_w``).
+    """
+
+    #: The chosen correlation contributes its structural identity to the
+    #: equation-template cache key; numeric parameter values stay live symbols.
+    #: The reference section (`reference`, structural) and ``_variable_area``
+    #: (inherited from `SegmentedChannel`) are keyed automatically, so equal-
+    #: and variable-area / inlet- and outlet-referenced fittings never collide.
+    _cache_key_flags = SegmentedChannel._cache_key_flags + ("_loss_key",)
+
+    def __init__(
+        self,
+        medium: CoolPropMedium,
+        D: Annotated[float, ParamSpec("Connecting bore diameter setting the "
+                    "m_dot = rho*A*w flow area / reference velocity head.  For "
+                    "an area-changing fitting it is the nominal (reference) "
+                    "scale; the actual end areas come from D_in / D_out.",
+                    unit="m", default=0.01)],
+        loss_model: Annotated[LocalLossModel, ParamSpec(
+            "Local-loss correlation supplying the dimensionless coefficient K "
+            "(zeta) referenced to the reference-section velocity: FixedK, "
+            "SuddenExpansion, SuddenContraction, LaminarTransitionK, ...")] = None,
+        D_in: Annotated[float, ParamSpec(
+            "Inlet bore diameter [m] for an area-changing fitting; None (the "
+            "default) uses D (equal-area).", unit="m")] = None,
+        D_out: Annotated[float, ParamSpec(
+            "Outlet bore diameter [m] for an area-changing fitting; None (the "
+            "default) uses D (equal-area).", unit="m")] = None,
+        reference: Annotated[str, ParamSpec(
+            "Which end's velocity head the loss coefficient K is referenced to "
+            "when D_in != D_out ('inlet' or 'outlet'); immaterial for an "
+            "equal-area fitting.", choices=("inlet", "outlet"),
+            structural=True)] = "inlet",
+        z_in=0.0,
+        z_out=0.0,
+        dp_eps: Annotated[float, ParamSpec("Pressure-drop regulariser keeping "
+                         "the sign*sqrt(|dp|) flow law smooth through dp = 0.",
+                         unit="Pa")] = 1.0,
+        multiphase: Annotated[str, _SPEC_MULTIPHASE] = "single",
+        heat_port: Annotated[bool, _SPEC_HEAT_PORT] = False,
+        leaky: Annotated[bool, _SPEC_LEAKY] = False,
+        dynamic: Annotated[str, ParamSpec("Dynamic modelling level of the body "
+                          "cell: 'static' (quasi-steady loss, the default) or a "
+                          "mass/energy-storing level ('advective'/'compressible')"
+                          " for a fitting body volume bounded by the loss.  "
+                          "'acoustic' is unsupported (an algebraic loss has no "
+                          "per-face inertia).",
+                          choices=("static", "advective", "compressible"),
+                          structural=True)] = "static",
+        L_body: Annotated[float, ParamSpec("Physical fitting-body length that "
+                         "sets the wetted area / holdup volume for the thermal "
+                         "/ permeation / storage closures (inert for a bare "
+                         "adiabatic loss).", unit="m")] = 1.0,
+        p_init: Annotated[float, ParamSpec("Initial body-cell pressure [Pa]; "
+                         "seeds the storage states (dynamic levels).",
+                         unit="Pa")] = 101325.0,
+    ):
+        if loss_model is None:
+            from .local_loss import FixedK
+            loss_model = FixedK()
+        if not isinstance(loss_model, LocalLossModel):
+            raise TypeError(
+                f"LocalResistance: loss_model must be a LocalLossModel, got "
+                f"{type(loss_model).__name__}")
+        if reference not in ("inlet", "outlet"):
+            raise ValueError(
+                f"LocalResistance: reference must be 'inlet' or 'outlet', got "
+                f"{reference!r}")
+        self.D = D
+        self.D_in = float(D_in) if D_in is not None else float(D)
+        self.D_out = float(D_out) if D_out is not None else float(D)
+        if self.D_in <= 0 or self.D_out <= 0:
+            raise ValueError(
+                f"LocalResistance: D_in / D_out must be > 0, got "
+                f"{self.D_in!r} / {self.D_out!r}")
+        self.reference = reference
+        self.loss_model = loss_model
+        self.dp_eps = dp_eps
+        self.L_body = float(L_body)
+        # Structural identity of the coefficient expression (which correlation);
+        # numeric parameters stay live symbols and never enter the cache key.
+        self._loss_key = loss_model.cache_key
+        # A changing cross-section (D_in != D_out) makes this a variable-area
+        # fitting: reversible (Bernoulli) area change + irreversible loss.  That
+        # reversible term lives in the STATIC duct momentum only -- the transient
+        # staggered momentum is pressure-form and does not yet carry the
+        # convective area-change term -- so restrict area change to 'static'.
+        area_change = abs(self.D_in - self.D_out) > 0.0
+        A_faces = None
+        if area_change:
+            if dynamic != "static":
+                raise NotImplementedError(
+                    f"{type(self).__name__}(D_in != D_out): an area-changing "
+                    f"fitting is only defined on dynamic='static' (the reversible "
+                    f"Bernoulli area-change term is not in the transient "
+                    f"staggered momentum yet); got dynamic={dynamic!r}.")
+            A_faces = [np.pi * self.D_in ** 2 / 4, np.pi * self.D_out ** 2 / 4]
+        # The plain sqrt law composes per staggered face, so mass-storing
+        # 'advective'/'compressible' body levels are fine; the 'acoustic' level
+        # would make every face velocity a differential state (rho*L*dw/dt),
+        # which the algebraic loss law cannot close (no fitting inertia).
+        if dynamic == "acoustic":
+            raise NotImplementedError(
+                f"{type(self).__name__}(dynamic='acoustic'): a lumped local "
+                f"loss has no per-face momentum inertia, so the acoustic level "
+                f"is unsupported; use 'compressible' (or 'advective') for "
+                f"body single-volume dynamics, or 'static'.")
+        super().__init__(medium, D=D, L=self.L_body, epsilon=0.0, z_in=z_in,
+                         z_out=z_out, N=1, A_faces=A_faces,
+                         f_factor_func=self._no_friction,
+                         q_inflow_func=(None if heat_port else self._no_heat),
+                         multiphase=multiphase, heat_port=heat_port,
+                         leaky=leaky, dynamic=dynamic, p_init=p_init)
+
+    @staticmethod
+    def _no_friction(Re, epsilon, Dh):
+        return 0.0
+
+    @staticmethod
+    def _no_heat(w, p, h, rho, T, mu, k, fr, T_wall, Dh, area):
+        return 0.0
+
+    def declare_components(self):
+        super().declare_components()
+        self.add_component('dp_eps', Parameter(
+            self.dp_eps,
+            **merged_param_specs(type(self))['dp_eps'].param_kwargs()))
+        # The correlation registers its own live Parameters (e.g. `zeta` /
+        # `area_ratio`) that `zeta()` reads; they are leaf symbols, so the
+        # equation template stays instance-invariant / cache-safe.
+        self.loss_model.declare(self)
+
+    def _loss_state(self, w, rho, mu, Dh, A):
+        """Assemble the `LossFlowState` a (possibly Reynolds-dependent)
+        correlation reads, with ``Re = rho*|w|*Dh/mu + 1`` floored at 1."""
+        Re = rho * sp.Abs(w) * Dh / mu + 1
+        return LossFlowState(Re=Re, w=w, rho=rho, mu=mu, Dh=Dh, A=A)
+
+    def _loss_flow(self, dp, rho, flow):
+        """Axial mass flow [kg/s] for the pressure drop ``dp = p_in - p_out``,
+        inverting ``Δp = K * rho * v**2 / 2`` (regularised through dp = 0).
+
+        The flow coefficient ``C = A*sqrt(2/K)`` is factored out of the density
+        so the residual is ``C * sqrt(rho) * sign(dp)*sqrt(|dp|)`` -- the same
+        expression shape as the non-choked valve law it mirrors on the dynamic
+        staggered faces.  ``flow`` carries the local `LossFlowState` so a
+        velocity- / Reynolds-dependent ``K`` closes; constant models ignore it.
+        This equal-area inversion assumes the whole drop is the loss (inlet
+        velocity == outlet velocity); the area-changing branch splits reversible
+        and irreversible parts explicitly in `_momentum_eq`."""
+        K = self.loss_model.zeta(self, flow)
+        A = self['A'].symbol
+        dp_eps = self['dp_eps'].symbol
+        C = A * sp.sqrt(2 / K)
+        return C * sp.sqrt(rho) * dp / (dp ** 2 + dp_eps ** 2) ** 0.25
+
+    def _momentum_eq(self, cell=None, *, p_in, p_out, A_in, A_out, A_avg,
+                     rho_avg, w_in, w_out, w_avg, m_dot_avg, f_avg=0.0,
+                     Dh_avg=None, L=None, z_in=None, z_out=None, mu_avg=None,
+                     **_):
+        if not self._variable_area:
+            # Equal-area throttle: the whole drop is the (bore-referenced) loss.
+            flow = self._loss_state(w_avg, rho_avg, mu_avg, Dh_avg,
+                                    self['A'].symbol)
+            return m_dot_avg - self._loss_flow(p_in - p_out, rho_avg, flow)
+        # Area-changing fitting: reversible (Bernoulli) area change from the
+        # base frictionless duct balance, PLUS the irreversible loss quoted
+        # against the chosen reference-section velocity head, expressed as a
+        # pressure drop over the mean area.
+        reversible = SegmentedChannel._momentum_eq(
+            self, cell, p_in=p_in, p_out=p_out, A_in=A_in, A_out=A_out,
+            A_avg=A_avg, rho_avg=rho_avg, w_in=w_in, w_out=w_out, w_avg=w_avg,
+            m_dot_avg=m_dot_avg, f_avg=0.0, Dh_avg=Dh_avg, L=L,
+            z_in=z_in, z_out=z_out)
+        if self.reference == "inlet":
+            v_ref, A_ref = w_in, A_in
+        else:
+            v_ref, A_ref = w_out, A_out
+        Dh_ref = sp.sqrt(4 * A_ref / sp.pi)
+        flow = self._loss_state(v_ref, rho_avg, mu_avg, Dh_ref, A_ref)
+        K = self.loss_model.zeta(self, flow)
+        dp_loss = K * rho_avg * v_ref * sp.Abs(v_ref) / 2
+        return reversible - dp_loss * A_avg
+
+    def _primitive_mom_residual(self, *, w, rho, mu, pL, pR, zL, zR, L_mom, Dh,
+                                der_w=None, w_prev=None, w_next=None, c_ref=None,
+                                j=None, N=None):
+        """Per-face loss momentum closure for the dynamic levels.
+
+        The lumped loss law is placed on every staggered face with its flow
+        coefficient scaled by ``sqrt(n_faces)`` so the ``n_faces = N + 1``
+        identical faces in series (each seeing ~``dp/n_faces``) reproduce the
+        single lumped drop -- exact for the sqrt law, which is linear in the
+        coefficient.  The face flow ``M_j`` is driven directly, so each face is
+        non-singular even with zero wall friction.  (The dynamic levels are
+        equal-area: area change is a static-only feature, enforced in
+        ``__init__``.)"""
+        dp = pL - pR
+        n_faces = (N + 1) if N is not None else 1
+        flow = self._loss_state(w, rho, mu, Dh, self['A'].symbol)
+        m_face = sp.sqrt(sp.Integer(n_faces)) * self._loss_flow(dp, rho, flow)
+        return self[f'M_{j}'].symbol - m_face
 
 
 class PressureOutlet(Model):

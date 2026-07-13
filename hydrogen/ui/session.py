@@ -91,6 +91,10 @@ class SimulationSession:
         self._run_wall_t0: float | None = None
         self._run_wall_elapsed = 0.0
         self._continuable = False
+        # Compact solver post-mortem carried by the host's `error` event
+        # (summary + culprit components); the full report is fetched on demand
+        # via :meth:`diagnose`.  Reset when a new run starts.
+        self._last_error: dict | None = None
         # Snapshot of the canvas model when the current run started / was paused;
         # resume/continue is only offered while this still matches.
         self._run_checkpoint: dict | None = None
@@ -146,6 +150,20 @@ class SimulationSession:
     @property
     def sysp(self):
         return self._sysp
+
+    @property
+    def last_error(self) -> dict | None:
+        """Compact info from the most recent run failure: ``{kind, message,
+        diagnostic_summary, diagnostic_components, has_diagnostic}``.  ``None``
+        until a run fails (cleared when a new run starts)."""
+        return self._last_error
+
+    def diagnose(self, top_k: int = 12, fresh: bool = False) -> dict | None:
+        """Fetch the solver post-mortem from the host (blocking host call --
+        run it off the GUI thread).  Returns ``None`` if no model is built."""
+        if self._sysp is None:
+            return None
+        return self._sysp.diagnose(top_k=top_k, fresh=fresh)
 
     @property
     def run_phase(self) -> str | None:
@@ -433,6 +451,7 @@ class SimulationSession:
         stream_kw.setdefault("every", 20)
         self._stopping = False
         self._run_phase = "running"
+        self._last_error = None
         # Reset run-status tracking so step/progress restart for this run.
         self._run_step = 0
         self._run_t = 0.0
@@ -646,6 +665,19 @@ class SimulationSession:
                 log(f"  [host error] {ev.get('kind')}: {ev.get('message')}",
                     "error")
                 self._run_phase = "error"
+                self._last_error = {
+                    "kind": ev.get("kind"),
+                    "message": ev.get("message"),
+                    "diagnostic_summary": ev.get("diagnostic_summary"),
+                    "diagnostic_components": ev.get("diagnostic_components"),
+                    "has_diagnostic": bool(ev.get("has_diagnostic")),
+                }
+                summary = ev.get("diagnostic_summary")
+                if summary:
+                    log(f"  [diagnosis] {summary}", "error")
+                    log("  [diagnosis] Open Diagnostics (or the toolbar "
+                        "'Diagnose' button) for the full Jacobian post-mortem.",
+                        "host")
             elif etype == "status":
                 phase = ev.get("phase")
                 if phase:

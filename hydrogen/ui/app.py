@@ -16,12 +16,13 @@ from hydrogen.serialization import SCHEMA_VERSION
 
 from .canvas import Canvas
 from .catalog import ComponentTree
+from .diagnostics import DiagnosticWindow
 from .home import HomeScreen
 from .items import NodeItem
 from .live import LiveController
 from .media import MediaManagerDialog, default_media_spec
 from .project import is_project, make_project
-from .qt import QtCore, QtGui, QtSvg, QtWidgets, exec_
+from .qt import QtCore, QtGui, QtSvg, QtWidgets, exec_, install_wheel_guard
 from .recent import add_recent_file, recent_files, remove_recent_file
 from .session import SimulationSession
 from . import theme
@@ -207,6 +208,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # closed, so these stay meaningful. Driven by the pump's phaseChanged.
         self._starting = False              # a toolbar-launched run is building
         self._run_worker = None             # keep the launch worker alive
+        self._diag_window = None            # solver diagnostics viewer (singleton)
+        self._diag_worker = None            # keep the diagnose fetch worker alive
         self._runctl_btn = QtWidgets.QPushButton("Run")
         self._runctl_btn.setToolTip(
             "Run the model (build if needed, then simulate) — no window needed. "
@@ -258,6 +261,14 @@ class MainWindow(QtWidgets.QMainWindow):
         variables.clicked.connect(self._canvas.open_system_variables)
         self._variables_btn = variables
 
+        diagnose = QtWidgets.QPushButton("Diagnose")
+        diagnose.setToolTip(
+            "Solver post-mortem: when a run fails or stalls, show why the "
+            "residuals are not converging (singular/non-finite Jacobian) and "
+            "which component it traces back to.")
+        diagnose.clicked.connect(self.open_diagnostics)
+        self._diagnose_btn = diagnose
+
         right = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(right)
         rl.setContentsMargins(6, 6, 6, 6)
@@ -266,6 +277,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(fit)
         bar.addWidget(self._markers_btn)
         bar.addWidget(self._variables_btn)
+        bar.addWidget(self._diagnose_btn)
         bar.addStretch(1)
         bar.addWidget(media_btn)
         bar.addWidget(sim_settings)
@@ -823,7 +835,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_run_phase(self, phase: str):
         """React to a streaming run's phase change (driven by the live pump)."""
         self._update_runctl()
-        if phase:
+        if phase == "error":
+            err = self._session.last_error or {}
+            if err.get("diagnostic_summary"):
+                self._set_status("Simulation error — press 'Diagnose' for the "
+                                 "solver post-mortem.")
+            else:
+                self._set_status("Simulation error.")
+            # If the diagnostics window is open, refresh it with the failure.
+            if self._diag_window is not None:
+                self._fetch_diagnostic(fresh=False)
+        elif phase:
             self._set_status(f"Simulation {phase}.")
 
     def _refresh_component_warnings(self):
@@ -925,6 +947,58 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(f"Run failed: {kind}: {message}")
         self._update_runctl()
 
+    # --- solver diagnostics ----------------------------------------------- #
+
+    def open_diagnostics(self):
+        """Open (or focus) the solver-diagnostics window and fetch a report.
+
+        The report is fetched off the GUI thread (a blocking host call); the
+        window renders whatever comes back -- the post-mortem captured at the
+        last failure, or a fresh evaluation of the current state."""
+        win = self._diag_window
+        if win is None:
+            win = DiagnosticWindow(parent=self)
+            win.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+            win.refreshRequested.connect(lambda: self._fetch_diagnostic(fresh=True))
+            win.destroyed.connect(lambda *_: setattr(self, "_diag_window", None))
+            self._diag_window = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        if not self._session.built:
+            win.set_report(None)
+            return
+        self._fetch_diagnostic(fresh=False)
+
+    def _fetch_diagnostic(self, fresh: bool = False):
+        """Run `session.diagnose()` on a worker so the GUI stays responsive."""
+        if self._diag_window is None or not self._session.built:
+            return
+        if self._diag_worker is not None:
+            return                              # a fetch is already in flight
+        self._diag_window.set_pending()
+
+        def task(log):
+            return self._session.diagnose(fresh=fresh)
+
+        worker = _SessionWorker(task)
+        worker.done.connect(self._on_diagnostic_ready)
+        worker.failed.connect(self._on_diagnostic_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._diag_worker = worker
+        worker.start()
+
+    def _on_diagnostic_ready(self, report):
+        self._diag_worker = None
+        if self._diag_window is not None:
+            self._diag_window.set_report(report)
+
+    def _on_diagnostic_failed(self, kind: str, message: str):
+        self._diag_worker = None
+        if self._diag_window is not None:
+            self._diag_window.set_report(None)
+        self._set_status(f"Diagnosis failed: {kind}: {message}")
+
     def _continue_run_from_toolbar(self):
         """Continue a finished/stopped run without re-initialising."""
         if self._session.run_active or self._starting:
@@ -964,6 +1038,8 @@ class MainWindow(QtWidgets.QMainWindow):
             overlay.dispose()
         for win in list(getattr(self._canvas, "_var_windows", {}).values()):
             win.close()
+        if self._diag_window is not None:
+            self._diag_window.close()
         super().closeEvent(event)
         # This is the application's main window: closing it ends the session.
         # Quit explicitly rather than relying on quitOnLastWindowClosed, which
@@ -974,6 +1050,7 @@ class MainWindow(QtWidgets.QMainWindow):
 def main(argv: list[str] | None = None):
     argv = list(sys.argv if argv is None else argv)
     app = QtWidgets.QApplication(argv)
+    install_wheel_guard(app)
     apply_theme(app)
     app.setOrganizationName("hydrogen")
     app.setApplicationName("hydrogen-ui")

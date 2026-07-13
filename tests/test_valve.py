@@ -14,16 +14,26 @@ import pytest
 
 from hydrogen import CoolPropMedium, Model, from_dict, to_dict
 from hydrogen.components.control.control_components import Constant
+from hydrogen.components.materials import WallMaterial
+from hydrogen.components.thermofluid.assemblies import Valve, WallLayer
 from hydrogen.components.thermofluid.flow import (
     CompressibleValve,
     IncompressibleValve,
     PressureOutlet,
     PressureSource,
 )
+from hydrogen.components.thermofluid.permeation import (
+    H2,
+    H2_IN_AUSTENITIC,
+    SpecifiedFlux,
+    SteadyRichardson,
+)
 from hydrogen.ports import PortNotConnectedWarning
 
 _WATER = CoolPropMedium('water', disable_warnings=True)
 _AIR = CoolPropMedium('air', disable_warnings=True)
+_H2 = CoolPropMedium('hydrogen', disable_warnings=True)
+_STEEL = WallMaterial(name="steel", rho=7850.0, cp=500.0, k=15.0)
 
 
 def _solve(model, medium):
@@ -239,3 +249,155 @@ def test_valve_serialization_round_trip():
     assert vspec['params']['D'] == 0.02
     rebuilt = from_dict(d)
     assert 'v' in rebuilt.components
+
+
+# --- pluggable dynamic-level momentum (single-volume valve body) -------------
+
+def _solve_n(model, medium, dt, n):
+    model.instantiate(aditional_modules=medium.modules, max_remove_trival_passes=5)
+    model.initialise(n=1)
+    for _ in range(n):
+        model.solve_dae_step(dt)
+    names = list(model.record['vars_names'])
+    last = np.asarray(model.record['state'])[-1]
+
+    def val(suffix):
+        return last[next(i for i, nm in enumerate(names) if nm.endswith(suffix))]
+
+    return val
+
+
+class _DynValveRig(Model):
+    """Bare (wall-less) incompressible valve at a chosen dynamic level, seeded
+    at the mid pressure so the body cell starts near its steady state."""
+
+    def __init__(self, dynamic, p_in=3e5, p_out=2e5):
+        self._dynamic = dynamic
+        self._p_in = p_in
+        self._p_out = p_out
+        super().__init__()
+
+    def declare_components(self):
+        self.add_component('src', PressureSource(_AIR, p_source=self._p_in, T_source=300.0, A=1e-2))
+        self.add_component('v', IncompressibleValve(
+            _AIR, Kv=10.0, D=0.02, opening=1.0, dynamic=self._dynamic,
+            L_body=0.05, p_init=0.5 * (self._p_in + self._p_out)))
+        self.add_component('out', PressureOutlet(_AIR, p_ambient=self._p_out, T_ambient=300.0))
+        self.add_component('cmd', Constant(k=1.0))
+
+    def declare_equations(self):
+        self.connect(self['src'].ports['outlet'], self['v'].ports['inlet'])
+        self.connect(self['v'].ports['outlet'], self['out'].ports['inlet'])
+        self.connect(self['cmd'].ports['y'], self['v'].ports['opening'])
+        return []
+
+
+@pytest.mark.parametrize("dynamic,dt,n", [("advective", 1e-2, 60),
+                                          ("compressible", 1e-3, 300)])
+def test_dynamic_valve_body_matches_static_steady_flow(dynamic, dt, n):
+    """The dynamic single-volume valve (two staggered throttle faces around a
+    storing body cell) reproduces the static single-throttle steady flow: the
+    per-face law is scaled so the series stack composes to the lumped drop."""
+    stat = _solve_n(_DynValveRig("static"), _AIR, 1.0, 1)('.v.m_dot_in')
+    dyn = _solve_n(_DynValveRig(dynamic), _AIR, dt, n)('.v.m_dot_in')
+    assert dyn == pytest.approx(stat, rel=0.12)
+
+
+def test_dynamic_valve_body_pressure_equilibrates():
+    """At steady state the body-cell pressure sits between the two ports (equal
+    split across the two throttle faces)."""
+    val = _solve_n(_DynValveRig("compressible"), _AIR, 1e-3, 300)
+    pc = val('.v.pc_0')
+    assert val('.v.p_1') < pc < val('.v.p_0')
+
+
+def test_acoustic_valve_rejected():
+    with pytest.raises(NotImplementedError, match="acoustic"):
+        IncompressibleValve(_WATER, Kv=5.0, D=0.02, dynamic="acoustic")
+
+
+def test_choked_valve_rejects_dynamic():
+    with pytest.raises(NotImplementedError):
+        IncompressibleValve(_WATER, Kv=5.0, D=0.02, p_vap=3000.0,
+                            dynamic="compressible")
+
+
+# --- Valve assembly: equivalent cylindrical wall (thermal + permeation) ------
+
+class _AssemblyRig(Model):
+    def __init__(self, layers, medium=_WATER, flow_law="incompressible",
+                 outer_thermal="convective", p_in=3e5, p_out=2e5, dynamic="static"):
+        self._layers = layers
+        self._medium = medium
+        self._flow_law = flow_law
+        self._outer = outer_thermal
+        self._p_in = p_in
+        self._p_out = p_out
+        self._dynamic = dynamic
+        super().__init__()
+
+    def declare_components(self):
+        self.add_component('src', PressureSource(self._medium, p_source=self._p_in, T_source=320.0, A=1e-2))
+        self.add_component('v', Valve(
+            self._medium, D=0.02, Kv=10.0, flow_law=self._flow_law,
+            L_body=0.08, layers=self._layers, outer_thermal=self._outer,
+            h_ext=25.0, T_ext=290.0, dynamic=self._dynamic, T_wall_init=320.0,
+            p_init=self._p_in,
+            multiphase=("HEM" if self._medium is _WATER else "single")))
+        self.add_component('out', PressureOutlet(self._medium, p_ambient=self._p_out, T_ambient=320.0))
+        self.add_component('cmd', Constant(k=1.0))
+
+    def declare_equations(self):
+        self.connect(self['src'].ports['outlet'], self['v'].ports['inlet'])
+        self.connect(self['v'].ports['outlet'], self['out'].ports['inlet'])
+        self.connect(self['cmd'].ports['y'], self['v'].ports['opening'])
+        return []
+
+
+def test_valve_assembly_is_the_catalog_valve():
+    from hydrogen.serialization.registry import builtin_registry
+    assert builtin_registry()['hydrogen.thermofluid.Valve'] is Valve
+
+
+def test_valve_assembly_thermal_wall_passes_kv_flow():
+    layers = [WallLayer(material=_STEEL, thickness=0.003, dynamic=True)]
+    val = _solve_n(_AssemblyRig(layers), _WATER, 1.0, 1)
+    dp = val('.v.valve.p_0') - val('.v.valve.p_1')
+    m = val('.v.valve.m_dot_in')
+    rho = 0.5 * (val('.v.valve.rho_0') + val('.v.valve.rho_1'))
+    g = dp / (dp ** 2 + 1.0 ** 2) ** 0.25
+    assert m == pytest.approx((10.0 / 36000.0) * np.sqrt(rho) * g, rel=1e-5)
+    assert m > 0 and dp > 0
+
+
+def test_valve_assembly_specified_permeation_leaks():
+    perm = SpecifiedFlux(H2, leak_rate=5.0, scaling="linear")
+    layers = [WallLayer(material=_STEEL, thickness=0.003, permeation=perm)]
+    val = _solve_n(_AssemblyRig(layers, medium=_H2, p_in=5e5, p_out=3e5), _H2, 1.0, 1)
+    assert abs(val('.v.m_dot_leak_env')) > 0.0
+
+
+def test_valve_assembly_physics_permeation_builds():
+    layers = [WallLayer(material=_STEEL, thickness=0.003,
+                        permeation=SteadyRichardson(H2_IN_AUSTENITIC))]
+    val = _solve_n(_AssemblyRig(layers, medium=_H2, p_in=5e5, p_out=3e5), _H2, 1.0, 1)
+    # Leak is finite (austenitic steel at moderate T => tiny but well-defined).
+    assert np.isfinite(val('.v.m_dot_leak_env'))
+
+
+def test_valve_assembly_serialization_round_trip():
+    perm = SpecifiedFlux(H2, leak_rate=5.0, scaling="linear")
+    layers = [WallLayer(material=_STEEL, thickness=0.003, permeation=perm)]
+    rig = _AssemblyRig(layers, medium=_H2)
+    rig.declare_equations()
+    d = to_dict(rig)
+    assert d['components']['v']['type'] == 'hydrogen.thermofluid.Valve'
+    rebuilt = from_dict(d)
+    assert 'v' in rebuilt.components
+
+
+def test_valve_assembly_compressible_flow_law():
+    layers = [WallLayer(material=_STEEL, thickness=0.003)]
+    val = _solve_n(_AssemblyRig(layers, medium=_AIR, flow_law="compressible",
+                                p_in=8e5, p_out=5e5), _AIR, 1.0, 1)
+    assert val('.v.valve.m_dot_in') > 0.0

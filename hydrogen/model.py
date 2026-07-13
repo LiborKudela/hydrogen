@@ -41,6 +41,17 @@ from .numerics import (fast_error_norm, fast_linear_solve, fast_sparse_solve,
 from .paramspec import cache_key_flag_names
 
 
+def _json_num(x):
+    """Coerce a numpy/py scalar to a JSON-safe float, mapping any non-finite
+    value (NaN/Inf) to ``None`` so the diagnostic report survives strict JSON
+    serialisation over the service socket."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def _cheap_minmax_is_connected(cls, x, y):
     """Drop-in for `MinMaxBase._is_connected` that omits the expensive
     `factor_terms(x - y)` symbolic-domination retry.
@@ -4557,6 +4568,515 @@ class Model:
              for v in self.active_vars_references],
             dtype=float,
         )
+
+    # --- solver diagnostics --------------------------------------------------
+    #
+    # `diagnose()` is a read-only post-mortem of the CURRENT solver state: it
+    # re-evaluates the residual and Jacobian where the last (failed) solve left
+    # the model and works out WHY Newton could not make progress -- non-finite
+    # (out-of-domain) residuals, a structurally/numerically singular Jacobian,
+    # an unconstrained variable, or simply a large-but-finite residual that is
+    # stalling.  Every finding is traced back to the owning component via the
+    # variable's dotted `full_name`, and rolled up into a per-component ranking
+    # so a UI can point the user straight at the offending block instead of a
+    # bare `last_err=inf`.
+
+    def _decompose_var_name(self, full_name):
+        """Split a dotted variable `full_name` into (component_id, owner_path,
+        leaf).  `component_id` is the top-level user-facing component (the
+        segment just below the root composite, e.g. ``valve_22``); `owner_path`
+        is everything but the leaf variable name."""
+        parts = str(full_name).split(".")
+        leaf = parts[-1]
+        owner = ".".join(parts[:-1]) if len(parts) > 1 else ""
+        if len(parts) >= 3:
+            comp = parts[1]              # skip the root composite prefix
+        elif len(parts) == 2:
+            comp = parts[0]
+        else:
+            comp = str(full_name)
+        return comp, owner, leaf
+
+    def diagnose(self, top_k=12):
+        """Read-only Newton/Jacobian post-mortem at the current state.
+
+        Returns a JSON-serialisable report describing why the residuals are not
+        converging and, crucially, WHICH component(s) the trouble traces back
+        to.  Safe to call any time after `instantiate()`; it does not mutate the
+        solver state (residual/Jacobian evaluation only re-reads the current
+        variable values).
+
+        The report groups findings so a caller can act on them:
+
+        * ``nonfinite_residuals`` / ``nonfinite_vars`` -- rows/variables that
+          evaluate to NaN/Inf (an out-of-model-domain thermodynamic state).
+          This is the usual cause of a first-iteration ``err=inf`` failure.
+        * ``singular_rows`` / ``singular_cols`` -- an equation that depends on
+          no variable, or a variable that appears in no equation (structural
+          rank deficiency -> a component is under/over-determined).
+        * ``worst_residuals`` -- the largest finite residual rows.
+        * ``worst_steps`` -- the variables Newton wants to move the most (from a
+          guarded solve of ``J dx = F``), i.e. where the step is blowing up.
+        * ``components`` -- a per-component ranking combining the above.
+        * ``summary`` -- ONE brief human-readable line; ``likely_causes`` --
+          concise per-issue explanations.
+        * ``severity`` (``ok``/``warning``/``error``) and ``cause_codes`` --
+          stable machine-readable labels an agent can branch on; ``conditioning``
+          -- the equilibrated condition number with its ``band`` and thresholds
+          so the number is self-interpreting.
+
+        Variable / equation names are reported WITHOUT the root-composite prefix
+        (e.g. ``valve_22.wall.T_a``, not ``_SpecComposite.valve_22.wall.T_a``).
+        """
+        n_v = int(getattr(self, "n_v", 0) or 0)
+        report = {
+            "ok": False,
+            "n_v": n_v,
+            "n_eq": int(getattr(self, "_n_eq", n_v) or n_v),
+            "t": float(self.get_t_value()) if n_v else float("nan"),
+            "dt": float(self.get_dt_value()) if n_v else float("nan"),
+            "last_residual": float(getattr(self, "_last_solve_error_norm",
+                                            float("nan"))),
+            "last_iters": int(getattr(self, "_last_solve_iters", 0) or 0),
+            "residual_norm": float("nan"),
+            "residual_finite": False,
+            "jacobian_finite": False,
+            "structurally_singular": False,
+            "condition_estimate": None,
+            "worst_residuals": [],
+            "nonfinite_residuals": [],
+            "worst_steps": [],
+            "nonfinite_vars": [],
+            "singular_rows": [],
+            "singular_cols": [],
+            "components": [],
+            "likely_causes": [],
+            "cause_codes": [],
+            "severity": "ok",
+            "conditioning": None,
+            "summary": "",
+        }
+        if n_v == 0:
+            report["summary"] = "Model is not instantiated; nothing to diagnose."
+            return report
+
+        refs = list(getattr(self, "active_vars_references", []) or [])
+        names = [getattr(refs[i], "full_name", f"var[{i}]") if i < len(refs)
+                 else f"var[{i}]" for i in range(n_v)]
+        var_meta = [self._decompose_var_name(nm) for nm in names]
+
+        # User-facing display names: drop the root-composite prefix (the model
+        # this method runs on -- e.g. ``_SpecComposite.`` for a system loaded
+        # from JSON, whose class name leaks into every full_name).  That prefix
+        # is constant across all variables and carries no information, so it
+        # just adds noise in the UI and for an LLM reader.  The `component`
+        # field (already ``parts[1]``) is unaffected; only the reported `name`
+        # / `variables` strings are shortened.
+        root_pfx = f"{getattr(self, 'name', None) or type(self).__name__}."
+        def _disp(nm):
+            s = str(nm)
+            return s[len(root_pfx):] if s.startswith(root_pfx) else s
+        names_disp = [_disp(nm) for nm in names]
+
+        vals = np.asarray(self.get_vars_values(), dtype=float)
+
+        # A non-square system (equations != unknowns) is under/over-determined
+        # by construction -- there is no unique Newton step regardless of the
+        # numbers.  Flag it up front (the square-only structural checks below
+        # are skipped in that case).
+        n_eq0 = int(report["n_eq"])
+        if n_eq0 != n_v:
+            report["structurally_singular"] = True
+            report["shape_mismatch"] = {"n_eq": n_eq0, "n_v": n_v}
+
+        # Per-component accumulator.
+        comps: dict[str, dict] = {}
+
+        def _comp(cid):
+            d = comps.get(cid)
+            if d is None:
+                d = {"component": cid, "n_vars": 0, "n_nonfinite_vars": 0,
+                     "n_nonfinite_res": 0, "max_residual": 0.0,
+                     "max_step": 0.0, "n_singular": 0, "score": 0.0}
+                comps[cid] = d
+            return d
+
+        for i in range(n_v):
+            _comp(var_meta[i][0])["n_vars"] += 1
+
+        # ---- non-finite current variable values ----------------------------
+        nonfinite_var_idx = np.where(~np.isfinite(vals))[0]
+        for i in nonfinite_var_idx.tolist():
+            cid, owner, leaf = var_meta[i]
+            report["nonfinite_vars"].append(
+                {"var": int(i), "name": names_disp[i], "component": cid,
+                 "value": _json_num(vals[i])})
+            d = _comp(cid)
+            d["n_nonfinite_vars"] += 1
+            d["score"] += 100.0
+
+        # ---- residual -------------------------------------------------------
+        r = None
+        try:
+            r = np.asarray(self.eval_residuals(self.get_vars_values()),
+                           dtype=float).reshape(-1)
+        except Exception as exc:  # noqa: BLE001
+            report["residual_error"] = f"{type(exc).__name__}: {exc}"
+        n_eq = report["n_eq"]
+
+        # Row -> variable columns, from the (fixed) Jacobian sparsity pattern.
+        jr = getattr(self, "_jac_sparse_rows", None)
+        jc = getattr(self, "_jac_sparse_cols", None)
+        row_cols: dict[int, list[int]] = {}
+        if jr is not None and jc is not None:
+            jr = np.asarray(jr); jc = np.asarray(jc)
+            order = np.argsort(jr, kind="stable")
+            jr_s, jc_s = jr[order], jc[order]
+            bounds = np.searchsorted(jr_s, np.arange(n_eq + 1))
+            for e in range(n_eq):
+                row_cols[e] = jc_s[bounds[e]:bounds[e + 1]].tolist()
+
+        def _row_component(eq):
+            """Attribute an equation row to a component by majority vote of the
+            variables it couples (the Jacobian columns in that row)."""
+            cols = row_cols.get(eq, [])
+            if not cols:
+                return None, []
+            counts: dict[str, int] = {}
+            vnames = []
+            for c in cols:
+                if 0 <= c < n_v:
+                    cid = var_meta[c][0]
+                    counts[cid] = counts.get(cid, 0) + 1
+                    vnames.append(names_disp[c])
+            if not counts:
+                return None, vnames
+            best = max(counts.items(), key=lambda kv: kv[1])[0]
+            return best, vnames
+
+        if r is not None:
+            finite_mask = np.isfinite(r)
+            report["residual_finite"] = bool(finite_mask.all())
+            finite_r = r[finite_mask]
+            report["residual_norm"] = _json_num(
+                float(np.sqrt(np.sum(finite_r * finite_r))) if finite_r.size
+                else float("nan"))
+            # Non-finite residual rows.
+            for e in np.where(~finite_mask)[0].tolist():
+                cid, vnames = _row_component(e)
+                report["nonfinite_residuals"].append(
+                    {"eq": int(e), "component": cid,
+                     "variables": vnames[:8]})
+                if cid is not None:
+                    d = _comp(cid)
+                    d["n_nonfinite_res"] += 1
+                    d["score"] += 100.0
+            # Worst finite residual rows.
+            if finite_r.size:
+                abs_r = np.abs(r)
+                abs_r[~finite_mask] = -1.0        # keep non-finite out of top-k
+                worst = np.argsort(abs_r)[::-1][:top_k]
+                for e in worst.tolist():
+                    if abs_r[e] <= 0:
+                        continue
+                    cid, vnames = _row_component(e)
+                    report["worst_residuals"].append(
+                        {"eq": int(e), "residual": _json_num(r[e]),
+                         "component": cid, "variables": vnames[:6]})
+                    if cid is not None:
+                        d = _comp(cid)
+                        d["max_residual"] = max(d["max_residual"],
+                                                abs(_json_num(r[e]) or 0.0))
+
+        # ---- Jacobian -------------------------------------------------------
+        jac_vals = None
+        try:
+            jac_vals = np.asarray(
+                self._lambdified_jac_values(*self.values), dtype=float
+            ).reshape(-1)
+        except Exception as exc:  # noqa: BLE001
+            report["jacobian_error"] = f"{type(exc).__name__}: {exc}"
+
+        if jac_vals is not None and jr is not None and jc is not None:
+            report["jacobian_finite"] = bool(np.isfinite(jac_vals).all())
+            # Non-finite Jacobian entries -> attribute to the row's component.
+            bad = np.where(~np.isfinite(jac_vals))[0]
+            bad_rows = set()
+            for k in bad.tolist():
+                e = int(jr[k])
+                if e in bad_rows:
+                    continue
+                bad_rows.add(e)
+                cid, _ = _row_component(e)
+                if cid is not None:
+                    _comp(cid)["score"] += 50.0
+            if bad_rows:
+                report["nonfinite_jacobian_rows"] = sorted(bad_rows)[:top_k]
+
+            # Structural singularity: zero rows (eq depends on nothing) or zero
+            # columns (variable appears in nothing), numerically.
+            finite_vals = np.where(np.isfinite(jac_vals), jac_vals, 0.0)
+            nz = np.abs(finite_vals) > 0
+            if n_eq == n_v:
+                row_has = np.zeros(n_eq, dtype=bool)
+                col_has = np.zeros(n_v, dtype=bool)
+                np.logical_or.at(row_has, np.asarray(jr), nz)
+                np.logical_or.at(col_has, np.asarray(jc), nz)
+                for e in np.where(~row_has)[0].tolist():
+                    cid, vnames = _row_component(e)
+                    report["singular_rows"].append(
+                        {"eq": int(e), "component": cid})
+                    if cid is not None:
+                        _comp(cid)["n_singular"] += 1
+                        _comp(cid)["score"] += 80.0
+                for c in np.where(~col_has)[0].tolist():
+                    cid, owner, leaf = var_meta[c]
+                    report["singular_cols"].append(
+                        {"var": int(c), "name": names_disp[c], "component": cid})
+                    _comp(cid)["n_singular"] += 1
+                    _comp(cid)["score"] += 80.0
+                report["structurally_singular"] = bool(
+                    report["singular_rows"] or report["singular_cols"])
+
+        # ---- conditioning + near-null-space (equilibrated) ------------------
+        # The RAW condition number of the assembled Jacobian is a red herring
+        # here: this class of thermofluid model mixes Pa (~1e5), J/kg (~1e6),
+        # densities, velocities etc., so cond(J) is ~1e20 for a perfectly
+        # healthy system too.  What the solver actually factorises is the
+        # TWO-SIDED INFINITY-NORM EQUILIBRATED matrix (see
+        # `numerics._equilibrated_splu_solve`), whose conditioning is
+        # meaningful -- ~1e9 when solvable, ~1e16+ (machine-precision singular)
+        # when a genuine rank deficiency appears.  We reproduce that scaling
+        # here and SVD the result: the smallest singular value's right/left
+        # vectors then name the variables / equations forming the near
+        # linearly-dependent combination, which is what pins a "singular
+        # Jacobian" failure to a specific component.
+        #
+        # We evaluate the Jacobian at a REPRESENTATIVE dt (Crank-Nicolson), not
+        # the current one: after `initialise` dt is 0, and a struggling run
+        # drives dt toward `dt_min` (~1e-9); either way the CN derivative
+        # couplings (proportional to dt) shrink to nothing and inflate the
+        # condition number for a purely time-stepping reason that has nothing
+        # to do with the physics.  A nominal dt isolates the structural
+        # conditioning.
+        report["near_singular_vars"] = []
+        report["near_singular_eqs"] = []
+        report["conditioning_dt"] = None
+        if jr is not None and jc is not None and n_eq == n_v and n_v <= 1500:
+            base = 2 * self.n_v + self.n_p
+            saved_t_block = self.values[base:base + 7].copy()
+            dt_cur = float(self.get_dt_value())
+            dt_rep = dt_cur if (dt_cur and 1e-6 <= dt_cur <= 1e3) else 1e-3
+            jv2 = None
+            try:
+                self.set_scheme_coeffs(*_CN_COEFFS)
+                self.set_dt(dt_rep)
+                jv2 = np.asarray(self._lambdified_jac_values(*self.values),
+                                 dtype=float).reshape(-1)
+            except Exception:  # noqa: BLE001
+                jv2 = None
+            finally:
+                self.values[base:base + 7] = saved_t_block
+                self._refresh_inputs()
+            if jv2 is not None and np.isfinite(jv2).all():
+                try:
+                    J = np.zeros((n_v, n_v))
+                    J[np.asarray(jr), np.asarray(jc)] = jv2
+                    # Row then column max-norm equilibration (Dr J Dc).
+                    rmax = np.abs(J).max(axis=1)
+                    rmax[rmax == 0.0] = 1.0
+                    dr = 1.0 / rmax
+                    Js = J * dr[:, None]
+                    cmax = np.abs(Js).max(axis=0)
+                    cmax[cmax == 0.0] = 1.0
+                    dc = 1.0 / cmax
+                    Js = Js * dc[None, :]
+                    U, s, Vt = np.linalg.svd(Js)
+                    smax = float(s[0]) if s.size else 0.0
+                    smin = float(s[-1]) if s.size else 0.0
+                    cond = (smax / smin) if smin > 0 else float("inf")
+                    report["condition_estimate"] = (
+                        _json_num(cond) if math.isfinite(cond) else "inf")
+                    report["min_singular_value"] = _json_num(smin)
+                    report["conditioning_dt"] = _json_num(dt_rep)
+                    # Name the near-null-space only once it is genuinely
+                    # rank-deficient (well clear of a healthy ~1e9).
+                    if not math.isfinite(cond) or cond > 1e12:
+                        vdir = np.abs(Vt[-1] * dc)   # back to variable space
+                        if vdir.max() > 0:
+                            vdir = vdir / vdir.max()
+                        edir = np.abs(U[:, -1] * dr)
+                        if edir.max() > 0:
+                            edir = edir / edir.max()
+                        for i in np.argsort(vdir)[::-1][:top_k]:
+                            if vdir[i] < 5e-2:
+                                break
+                            cid, owner, leaf = var_meta[i]
+                            report["near_singular_vars"].append(
+                                {"var": int(i), "name": names_disp[i],
+                                 "component": cid,
+                                 "weight": _json_num(float(vdir[i]))})
+                            _comp(cid)["score"] += 60.0 * float(vdir[i])
+                        for e in np.argsort(edir)[::-1][:top_k]:
+                            if e >= n_eq or edir[e] < 5e-2:
+                                continue
+                            cid, vnames = _row_component(int(e))
+                            report["near_singular_eqs"].append(
+                                {"eq": int(e), "component": cid,
+                                 "weight": _json_num(float(edir[e]))})
+                except Exception:  # noqa: BLE001
+                    pass
+
+        cond_val = report.get("condition_estimate")
+        cond_bad = (cond_val == "inf") or (isinstance(cond_val, (int, float))
+                                           and cond_val is not None
+                                           and cond_val > 1e13)
+
+        # Self-interpreting conditioning band so a reader (LLM or human) need
+        # not memorise the 1e12 / 1e13 thresholds.
+        if cond_val is None:
+            band = "unknown"
+        elif cond_bad:
+            band = "singular"
+        elif isinstance(cond_val, (int, float)) and cond_val > 1e12:
+            band = "ill_conditioned"
+        else:
+            band = "healthy"
+        report["conditioning"] = {
+            "value": cond_val, "band": band,
+            "healthy_below": 1e12, "singular_above": 1e13,
+            "dt": report.get("conditioning_dt")}
+
+        # ---- overall verdict ------------------------------------------------
+        report["ok"] = bool(
+            report["residual_finite"] and report["jacobian_finite"]
+            and not report["structurally_singular"]
+            and not report["nonfinite_vars"]
+            and not cond_bad)
+
+        # Fold residual magnitude into each component's score.
+        for d in comps.values():
+            d["score"] += min(d["max_residual"], 1e9) * 1e-3
+            d["score"] += min(d["max_step"], 1e9) * 1.0
+            d["max_residual"] = _json_num(d["max_residual"])
+            d["max_step"] = _json_num(d["max_step"])
+            d["score"] = _json_num(d["score"])
+        ranked = sorted(comps.values(), key=lambda d: d["score"], reverse=True)
+        report["components"] = [d for d in ranked if d["score"] > 0][:top_k] \
+            or ranked[:top_k]
+
+        summary, causes, codes = self._diagnose_verdict(report)
+        report["summary"] = summary
+        report["likely_causes"] = causes
+        report["cause_codes"] = codes
+        report["severity"] = ("warning" if (report["ok"] and codes)
+                              else "ok" if report["ok"] else "error")
+        return report
+
+    #: One-line headline per machine cause code (drives the brief `summary`).
+    _CODE_HEADLINE = {
+        "NONFINITE_STATE": "Diverged to a NaN/Inf state",
+        "NONFINITE_RESIDUAL": "Out-of-domain state (NaN/Inf residual)",
+        "NONFINITE_JACOBIAN": "Non-finite Jacobian",
+        "SHAPE_MISMATCH": "System is not square",
+        "STRUCTURAL_SINGULAR": "Structurally singular Jacobian",
+        "NUMERICALLY_SINGULAR": "Numerically singular Jacobian",
+        "ILL_CONDITIONED": "Ill-conditioned Jacobian",
+        "STALLED": "Newton stalled",
+    }
+
+    @classmethod
+    def _diagnose_verdict(cls, report):
+        """Turn a raw diagnose() report into a verdict for both audiences.
+
+        Returns ``(summary, causes, codes)`` where `summary` is ONE brief
+        human-readable line, `causes` are concise one-sentence explanations,
+        and `codes` are stable machine cause codes (see ``_CODE_HEADLINE``) an
+        agent can branch on.  Codes and causes are index-aligned.
+        """
+        causes: list[str] = []
+        codes: list[str] = []
+        culprits = [c["component"] for c in report["components"][:3]
+                    if c.get("score", 0) > 0]
+        culprit_str = ", ".join(str(c) for c in culprits) or "unknown"
+
+        def add(code, text):
+            codes.append(code)
+            causes.append(text)
+
+        if report["nonfinite_vars"]:
+            who = ", ".join(dict.fromkeys(
+                v["component"] for v in report["nonfinite_vars"][:3]))
+            add("NONFINITE_STATE",
+                f"{len(report['nonfinite_vars'])} variable(s) hold NaN/Inf "
+                f"(in {who}); the solve diverged into an invalid state.")
+        if report["nonfinite_residuals"]:
+            who = ", ".join(dict.fromkeys(
+                str(v["component"]) for v in report["nonfinite_residuals"][:3]))
+            add("NONFINITE_RESIDUAL",
+                f"{len(report['nonfinite_residuals'])} residual(s) are NaN/Inf "
+                f"(in {who}) -- an out-of-domain thermodynamic state; a smaller "
+                f"dt will not help.")
+        if report.get("nonfinite_jacobian_rows"):
+            add("NONFINITE_JACOBIAN",
+                f"{len(report['nonfinite_jacobian_rows'])} Jacobian row(s) are "
+                f"non-finite; the linearisation is undefined here.")
+        mismatch = report.get("shape_mismatch")
+        if mismatch:
+            kind = "under" if mismatch["n_v"] > mismatch["n_eq"] else "over"
+            add("SHAPE_MISMATCH",
+                f"Not square: {mismatch['n_eq']} eq for {mismatch['n_v']} "
+                f"unknown(s) ({kind}-determined) -- a port is unconnected or a "
+                f"constraint is missing/duplicated.")
+        if report["structurally_singular"] and not mismatch:
+            bits = []
+            if report["singular_cols"]:
+                cols = ", ".join(v["name"] for v in report["singular_cols"][:3])
+                bits.append(f"{len(report['singular_cols'])} variable(s) in no "
+                            f"equation ({cols})")
+            if report["singular_rows"]:
+                bits.append(f"{len(report['singular_rows'])} equation(s) with "
+                            f"no variable")
+            add("STRUCTURAL_SINGULAR",
+                "Structurally singular: " + "; ".join(bits) +
+                " -- a component is under/over-determined.")
+        cond = report.get("condition_estimate")
+        nsv = report.get("near_singular_vars") or []
+        cond_bad = (cond == "inf") or (isinstance(cond, (int, float))
+                                       and cond is not None and cond > 1e13)
+        cond_ill = (not cond_bad) and isinstance(cond, (int, float)) \
+            and cond is not None and cond > 1e12
+        if cond_bad and "SHAPE_MISMATCH" not in codes \
+                and "STRUCTURAL_SINGULAR" not in codes:
+            cond_txt = "inf" if cond == "inf" else f"~{cond:.0e}"
+            detail = (" near-singular set: "
+                      + ", ".join(v["name"] for v in nsv[:3])) if nsv else ""
+            add("NUMERICALLY_SINGULAR",
+                f"Numerically singular Jacobian (equilibrated cond {cond_txt});"
+                f"{detail} -- a variable is unconstrained or two equations are "
+                f"redundant; a smaller dt will not help.")
+        elif cond_ill:
+            add("ILL_CONDITIONED",
+                f"Ill-conditioned Jacobian (equilibrated cond ~{cond:.0e}); "
+                f"solvable but sensitive around {culprit_str}.")
+        if (not causes) and (not report["ok"]) and report["residual_finite"] \
+                and report["residual_norm"] is not None:
+            add("STALLED",
+                f"Residuals are finite but not decreasing (dominant in "
+                f"{culprit_str}); Newton is stalling -- poor initial guess or a "
+                f"stiff parameter.")
+
+        if report["ok"] and not codes:
+            summary = "Healthy: the Jacobian is well-formed at this state."
+        elif report["ok"]:                       # advisory only (ill-cond.)
+            summary = causes[0]
+        elif codes:
+            head = cls._CODE_HEADLINE.get(codes[0], "Solve failed")
+            summary = (f"{head} (culprit: {culprit_str})."
+                       if culprit_str != "unknown" else f"{head}.")
+        else:
+            summary = "Unable to localise the failure."
+        return summary, causes, codes
 
     def _tr_bdf2_step(self, dt, snap, diff_state_idx, pair_state_idx, pair_der_idx,
                       relaxation, tol, max_iter, line_search):

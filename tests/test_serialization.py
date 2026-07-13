@@ -517,7 +517,10 @@ def test_value_object_catalog_and_spec():
     perm = fields["permeation"]
     assert perm["type"] == "object" and perm["nullable"] is True
     assert perm["value_type"] == "PermeationFlux"
-    assert perm["value_types"] == ["SteadyRichardson", "TransientDiffusion"]
+    # Options are listed alphabetically (a stable UI order); the DEFAULT is
+    # chosen separately by an explicit `_catalog_default` flag, not list order.
+    assert perm["value_types"] == [
+        "SpecifiedFlux", "SteadyRichardson", "TransientDiffusion"]
 
     # Scalars round-trip as before.
     assert fields["thickness"]["type"] == "float" and fields["thickness"]["required"]
@@ -610,7 +613,8 @@ def test_component_spec_expands_whole_tree_with_descriptions():
     # An abstract object field is expanded into `options` keyed by concrete
     # type, and recursion continues all the way down the tree.
     perm = by_name["permeation"]
-    assert set(perm["options"]) == {"SteadyRichardson", "TransientDiffusion"}
+    assert set(perm["options"]) == {
+        "SteadyRichardson", "TransientDiffusion", "SpecifiedFlux"}
     fit = perm["options"]["SteadyRichardson"]["fields"][0]
     assert fit["value_spec"]["value_type"] == "TransportFit"
     assert any(f["name"] == "permeant" for f in fit["value_spec"]["fields"])

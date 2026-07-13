@@ -383,8 +383,12 @@ class ListEditor(QtWidgets.QWidget):
         QtWidgets.QVBoxLayout(box).addWidget(editor)
         h.addWidget(box, 1)
 
-        rm = QtWidgets.QPushButton("x")
-        rm.setFixedWidth(26)
+        rm = QtWidgets.QPushButton("\u2715")           # ✕ multiplication x
+        rm.setToolTip("Remove this entry")
+        rm.setFixedSize(26, 26)
+        # The global QPushButton style adds 12px horizontal padding, which on a
+        # 26px-wide button clips the glyph out of view; zero it so the ✕ shows.
+        rm.setStyleSheet("QPushButton { padding: 0px; }")
         h.addWidget(rm, alignment=QtCore.Qt.AlignTop)
         self._rows.addWidget(row)
 

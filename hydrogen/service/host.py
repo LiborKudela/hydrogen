@@ -317,6 +317,10 @@ class _SystemRuntime:
         self.run_every = 1
         self.run_delay = 0.0
         self.continuable = False
+        # Cached solver post-mortem from the last failed run (see
+        # `Model.diagnose`), captured at the failing state so the UI can inspect
+        # it even after the model has moved on.
+        self.last_diagnostic: dict | None = None
         # Open variable streams, keyed by stream id (see `_StreamState`). Each
         # is flushed after every committed step in the run loop.
         self.streams: dict[str, _StreamState] = {}
@@ -805,6 +809,25 @@ class _Engine:
         rt = self._require(args["system_id"])
         self._reply(req_id, rt.status())
 
+    def _cmd_diagnose(self, req_id, args):
+        """Return a solver post-mortem (see `Model.diagnose`).
+
+        After a failed run we return the diagnostic captured AT the failing
+        state (highest fidelity).  Otherwise -- or when `fresh=True` is passed
+        -- we compute a new one against the current state so the command is
+        useful any time after `instantiate` (e.g. to inspect a stalling init).
+        """
+        rt = self._require(args["system_id"])
+        top_k = int(args.get("top_k", 12) or 12)
+        fresh = bool(args.get("fresh", False))
+        if not fresh and rt.phase == "error" and rt.last_diagnostic is not None:
+            self._reply(req_id, rt.last_diagnostic)
+            return
+        with _capture_logs(self._bus, rt.id, self._rank):
+            report = rt.model.diagnose(top_k=top_k)
+        rt.last_diagnostic = report
+        self._reply(req_id, report)
+
     def _cmd_get_state(self, req_id, args):
         rt = self._require(args["system_id"])
         row = rt.latest_row()
@@ -1091,6 +1114,7 @@ class _Engine:
         rt.stop_requested = False
         rt.pause_requested = False
         rt.continuable = False
+        rt.last_diagnostic = None
 
         # Persist for continue / live config edits after this loop exits.
         rt.run_dt = dt
@@ -1149,6 +1173,12 @@ class _Engine:
                     break
                 except Exception as exc:  # noqa: BLE001
                     rt.phase = "error"
+                    # Capture a solver post-mortem at the failing state (best
+                    # fidelity here -- later commands may have moved the model).
+                    try:
+                        rt.last_diagnostic = rt.model.diagnose()
+                    except Exception:  # noqa: BLE001 - diagnosis is best-effort
+                        rt.last_diagnostic = None
                     self._emit_error(rt, exc)
                     if stream:
                         return None
@@ -1203,6 +1233,18 @@ class _Engine:
                 self._reply(req_id, {"resuming": rt.id})
             elif cmd == "status":
                 self._reply(req_id, rt.status())
+            elif cmd == "diagnose":
+                # Safe at a step boundary (the run loop is parked here); state
+                # is frozen, so a fresh post-mortem is well-defined.  Handy to
+                # pause a struggling run and inspect the Jacobian live.
+                try:
+                    args = msg.get("args", {}) or {}
+                    report = rt.model.diagnose(
+                        top_k=int(args.get("top_k", 12) or 12))
+                    rt.last_diagnostic = report
+                    self._reply(req_id, report)
+                except Exception as exc:  # noqa: BLE001
+                    self._reply_error(req_id, exc, kind=type(exc).__name__)
             elif cmd == "list_vars":
                 # Read-only introspection of the recorded-variable names, which
                 # are fixed for the life of the model.  Servicing it mid-run lets
@@ -1239,7 +1281,7 @@ class _Engine:
                 self._reply_error(
                     req_id,
                     f"system {rt.id} is running; only 'stop'/'pause'/'resume'/"
-                    f"'status'/'list_vars'/'list_params'/'set_param'/"
+                    f"'status'/'diagnose'/'list_vars'/'list_params'/'set_param'/"
                     f"'update_run_config'/'vars_stream'/'add_stream_vars'/"
                     f"'close_stream' are accepted until it finishes",
                     kind="Busy",
@@ -1280,6 +1322,16 @@ class _Engine:
                     info[attr] = float(getattr(exc, attr))
                 except (TypeError, ValueError):
                     info[attr] = getattr(exc, attr)
+        # Attach a one-line solver post-mortem + the culprit components so the
+        # UI can surface "why" without a follow-up round-trip.
+        diag = getattr(rt, "last_diagnostic", None)
+        if diag:
+            info["diagnostic_summary"] = diag.get("summary")
+            info["diagnostic_severity"] = diag.get("severity")
+            info["diagnostic_cause_codes"] = diag.get("cause_codes") or []
+            info["diagnostic_components"] = [
+                c.get("component") for c in (diag.get("components") or [])[:3]]
+            info["has_diagnostic"] = True
         self._bus.emit(info)
 
     # --- MPI broadcast helpers (no-ops when SIZE == 1) --------------------

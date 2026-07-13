@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- P&ID-style local (minor) loss / orifice plate: inlet and outlet stubs on
+     the flow centreline with a concentric orifice plate (a top and a bottom
+     plate leaving a central bore the flow is squeezed through), the classic
+     restriction / minor-loss fitting symbol. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" fill="none"
+     stroke="#1b1b1b" stroke-width="3" stroke-linecap="round"
+     stroke-linejoin="round">
+  <!-- inlet / outlet connection stubs (on the centreline, like the ports) -->
+  <line x1="2" y1="30" x2="52" y2="30"/>
+  <line x1="68" y1="30" x2="118" y2="30"/>
+  <!-- concentric orifice plate: two plates leaving a central bore at y=30 -->
+  <rect x="55" y="7" width="10" height="17"/>
+  <rect x="55" y="36" width="10" height="17"/>
+</svg>

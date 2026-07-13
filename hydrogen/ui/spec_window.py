@@ -18,7 +18,7 @@ import hydrogen as hd
 from hydrogen.serialization import SCHEMA_VERSION
 
 from .forms import FieldsForm
-from .qt import QtWidgets, exec_
+from .qt import QtWidgets, exec_, install_wheel_guard
 from .theme import apply_theme
 
 __all__ = ["SpecWindow", "main"]
@@ -95,6 +95,7 @@ def main(argv: list[str] | None = None):
     argv = list(sys.argv if argv is None else argv)
     type_name = argv[1] if len(argv) > 1 else DEFAULT_COMPONENT
     app = QtWidgets.QApplication(argv[:1])
+    install_wheel_guard(app)
     apply_theme(app)
     win = SpecWindow(type_name)
     win.resize(680, 860)

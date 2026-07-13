@@ -33,8 +33,14 @@ def _value_classes() -> dict:
     """Lazy ``{__type__ name -> class}`` for every serializable value object."""
     from ..components.materials import WallMaterial
     from ..components.thermofluid.assemblies import WallLayer
+    from ..components.thermofluid.local_loss import (
+        FixedK,
+        SuddenContraction,
+        SuddenExpansion,
+    )
     from ..components.thermofluid.permeation import (
         Permeant,
+        SpecifiedFlux,
         SteadyRichardson,
         TransientDiffusion,
         TransportFit,
@@ -46,7 +52,11 @@ def _value_classes() -> dict:
         TransportFit,
         SteadyRichardson,
         TransientDiffusion,
+        SpecifiedFlux,
         WallLayer,
+        FixedK,
+        SuddenExpansion,
+        SuddenContraction,
     )
     return {c.__name__: c for c in classes}
 
